@@ -1,0 +1,24 @@
+# Gradle / Android Studio
+.gradle/
+build/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Android artifacts
+*.apk
+*.aab
+captures/
+
+# Rust
+target/
+
+# Native-library staging
+app/src/main/jniLibs/
+
+# Secrets and diagnostics
+*.keystore
+*.jks
+*.log
+mindchat-diagnostics-*.zip

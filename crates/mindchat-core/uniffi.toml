@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "com.mindchat.core"
+android = true
+generate_immutable_records = true

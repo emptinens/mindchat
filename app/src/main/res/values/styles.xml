@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.MindChat" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
