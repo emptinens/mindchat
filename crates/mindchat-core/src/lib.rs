@@ -49,6 +49,16 @@ pub enum ConnectionState {
     Failed,
 }
 
+/// Presence projected for one roster contact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ContactPresence {
+    Online,
+    Away,
+    DoNotDisturb,
+    #[default]
+    Offline,
+}
+
 /// Conversation transport topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationKind {
@@ -130,6 +140,16 @@ pub struct Account {
     pub capabilities: BTreeSet<ProtocolCapability>,
 }
 
+/// A roster contact projection owned by one account.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Contact {
+    pub account_id: AccountId,
+    pub jid: String,
+    pub display_name: String,
+    pub presence: ContactPresence,
+    pub status: Option<String>,
+}
+
 /// A local conversation projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Conversation {
@@ -180,6 +200,7 @@ pub struct Reaction {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoreSnapshot {
     pub accounts: Vec<Account>,
+    pub contacts: Vec<Contact>,
     pub conversations: Vec<Conversation>,
     pub messages: Vec<Message>,
     pub reactions: Vec<Reaction>,
@@ -190,6 +211,7 @@ pub struct CoreSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreEvent {
     AccountChanged(AccountId),
+    RosterChanged(AccountId),
     ConversationChanged(ConversationId),
     MessageAdded(MessageId),
     MessageChanged(MessageId),
@@ -319,6 +341,7 @@ pub struct MindChatCore {
     next_message_id: MessageId,
     next_reaction_id: ReactionId,
     accounts: HashMap<AccountId, Account>,
+    contacts: HashMap<(AccountId, String), Contact>,
     conversations: HashMap<ConversationId, Conversation>,
     messages: HashMap<MessageId, Message>,
     reactions: HashMap<ReactionId, Reaction>,
@@ -341,6 +364,11 @@ impl MindChatCore {
             next_message_id,
             next_reaction_id,
             accounts: snapshot.accounts.into_iter().map(|item| (item.id, item)).collect(),
+            contacts: snapshot
+                .contacts
+                .into_iter()
+                .map(|item| ((item.account_id, item.jid.clone()), item))
+                .collect(),
             conversations: snapshot.conversations.into_iter().map(|item| (item.id, item)).collect(),
             messages: snapshot.messages.into_iter().map(|item| (item.id, item)).collect(),
             reactions: snapshot.reactions.into_iter().map(|item| (item.id, item)).collect(),
@@ -352,14 +380,18 @@ impl MindChatCore {
     #[must_use]
     pub fn snapshot(&self) -> CoreSnapshot {
         let mut accounts = self.accounts.values().cloned().collect::<Vec<_>>();
+        let mut contacts = self.contacts.values().cloned().collect::<Vec<_>>();
         let mut conversations = self.conversations.values().cloned().collect::<Vec<_>>();
         let mut messages = self.messages.values().cloned().collect::<Vec<_>>();
         let mut reactions = self.reactions.values().cloned().collect::<Vec<_>>();
         accounts.sort_by_key(|item| item.id);
+        contacts.sort_by(|left, right| {
+            left.account_id.cmp(&right.account_id).then_with(|| left.jid.cmp(&right.jid))
+        });
         conversations.sort_by_key(|item| item.id);
         messages.sort_by_key(|item| item.id);
         reactions.sort_by_key(|item| item.id);
-        CoreSnapshot { accounts, conversations, messages, reactions }
+        CoreSnapshot { accounts, contacts, conversations, messages, reactions }
     }
 
     /// Configures an account in the local core.
@@ -406,6 +438,41 @@ impl MindChatCore {
             self.accounts.get_mut(&account_id).ok_or(CoreError::UnknownAccount(account_id))?;
         account.capabilities = capabilities.into_iter().collect();
         self.events.push(CoreEvent::AccountChanged(account_id));
+        Ok(())
+    }
+
+    /// Creates or updates one local roster projection for an existing account.
+    ///
+    /// A future XMPP roster adapter owns subscription negotiation and server
+    /// synchronization. This core stores only the normalized, UI-safe state.
+    pub fn upsert_contact(
+        &mut self,
+        account_id: AccountId,
+        jid: impl Into<String>,
+        display_name: impl Into<String>,
+        presence: ContactPresence,
+        status: Option<String>,
+    ) -> Result<(), CoreError> {
+        self.accounts
+            .contains_key(&account_id)
+            .then_some(())
+            .ok_or(CoreError::UnknownAccount(account_id))?;
+        let jid = jid.into();
+        validate_jid(&jid)?;
+        let display_name = display_name.into();
+        let display_name = match display_name.trim() {
+            "" => jid.split('@').next().unwrap_or(&jid).to_owned(),
+            value => value.to_owned(),
+        };
+        let status = status.and_then(|value| match value.trim() {
+            "" => None,
+            value => Some(value.to_owned()),
+        });
+        self.contacts.insert(
+            (account_id, jid.clone()),
+            Contact { account_id, jid, display_name, presence, status },
+        );
+        self.events.push(CoreEvent::RosterChanged(account_id));
         Ok(())
     }
 
@@ -753,6 +820,12 @@ impl MindChatCore {
             .collect()
     }
 
+    /// Returns roster contacts for an account sorted by JID.
+    #[must_use]
+    pub fn contacts(&self, account_id: AccountId) -> Vec<Contact> {
+        self.snapshot().contacts.into_iter().filter(|item| item.account_id == account_id).collect()
+    }
+
     /// Returns all messages in a conversation ordered by stable ID.
     #[must_use]
     pub fn messages(&self, conversation_id: ConversationId) -> Vec<Message> {
@@ -1056,6 +1129,73 @@ mod tests {
         let account_id = account(&mut core);
         assert_eq!(core.accounts()[0].id, account_id);
         assert!(core.accounts()[0].capabilities.is_empty());
+    }
+
+    #[test]
+    fn roster_contacts_are_account_scoped_normalized_and_snapshot_safe() {
+        let mut core = MindChatCore::default();
+        let alice = account(&mut core);
+        let mila = core
+            .add_account(AccountSetup::new("mila@example.net", "example.net", "Mila"))
+            .expect("second account");
+        core.drain_events();
+
+        core.upsert_contact(
+            alice,
+            "bob@example.org",
+            " Bob ",
+            ContactPresence::Online,
+            Some(" Ready ".to_owned()),
+        )
+        .expect("contact");
+        core.upsert_contact(
+            alice,
+            "bob@example.org",
+            "",
+            ContactPresence::Away,
+            Some("   ".to_owned()),
+        )
+        .expect("updated contact");
+        core.upsert_contact(mila, "bob@example.org", "Bobby", ContactPresence::Offline, None)
+            .expect("account-scoped contact");
+
+        assert_eq!(
+            core.contacts(alice),
+            vec![Contact {
+                account_id: alice,
+                jid: "bob@example.org".to_owned(),
+                display_name: "bob".to_owned(),
+                presence: ContactPresence::Away,
+                status: None,
+            }]
+        );
+        assert_eq!(core.contacts(mila)[0].display_name, "Bobby");
+        assert_eq!(
+            core.drain_events(),
+            vec![
+                CoreEvent::RosterChanged(alice),
+                CoreEvent::RosterChanged(alice),
+                CoreEvent::RosterChanged(mila),
+            ]
+        );
+
+        let restored = MindChatCore::from_snapshot(core.snapshot());
+        assert_eq!(restored.contacts(alice)[0].presence, ContactPresence::Away);
+        assert_eq!(restored.contacts(mila)[0].jid, "bob@example.org");
+    }
+
+    #[test]
+    fn roster_contact_rejects_unknown_accounts_and_invalid_jids() {
+        let mut core = MindChatCore::default();
+        assert_eq!(
+            core.upsert_contact(99, "bob@example.org", "Bob", ContactPresence::Offline, None),
+            Err(CoreError::UnknownAccount(99))
+        );
+        let account_id = account(&mut core);
+        assert_eq!(
+            core.upsert_contact(account_id, "not-a-jid", "Bob", ContactPresence::Offline, None),
+            Err(CoreError::InvalidJid)
+        );
     }
 
     #[test]

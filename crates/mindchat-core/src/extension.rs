@@ -22,6 +22,7 @@ const MAX_EXTENSION_VERSION_CHARS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ExtensionPermission {
     ObserveAccountChanges,
+    ObserveRosterChanges,
     ObserveConversationChanges,
     ObserveMessageChanges,
     SendMessages,
@@ -35,6 +36,7 @@ impl ExtensionPermission {
     pub const fn manifest_name(self) -> &'static str {
         match self {
             Self::ObserveAccountChanges => "observe_account_changes",
+            Self::ObserveRosterChanges => "observe_roster_changes",
             Self::ObserveConversationChanges => "observe_conversation_changes",
             Self::ObserveMessageChanges => "observe_message_changes",
             Self::SendMessages => "send_messages",
@@ -48,6 +50,7 @@ impl ExtensionPermission {
     pub fn from_manifest_name(value: &str) -> Option<Self> {
         match value {
             "observe_account_changes" => Some(Self::ObserveAccountChanges),
+            "observe_roster_changes" => Some(Self::ObserveRosterChanges),
             "observe_conversation_changes" => Some(Self::ObserveConversationChanges),
             "observe_message_changes" => Some(Self::ObserveMessageChanges),
             "send_messages" => Some(Self::SendMessages),
@@ -151,6 +154,7 @@ impl std::error::Error for ExtensionManifestError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExtensionEvent {
     AccountChanged { account_id: AccountId },
+    RosterChanged { account_id: AccountId },
     ConversationChanged { conversation_id: ConversationId },
     MessageAdded { message_id: MessageId },
     MessageChanged { message_id: MessageId },
@@ -221,6 +225,13 @@ impl ExtensionPolicy {
                         .contains(&ExtensionPermission::ObserveAccountChanges) =>
                 {
                     Some(ExtensionEvent::AccountChanged { account_id: *account_id })
+                }
+                CoreEvent::RosterChanged(account_id)
+                    if self
+                        .granted_permissions
+                        .contains(&ExtensionPermission::ObserveRosterChanges) =>
+                {
+                    Some(ExtensionEvent::RosterChanged { account_id: *account_id })
                 }
                 CoreEvent::ConversationChanged(conversation_id)
                     if self
@@ -388,9 +399,12 @@ mod tests {
                 "org.mindchat.status-dot",
                 "Status dot",
                 "1.0.0",
-                [ExtensionPermission::ObserveMessageChanges],
+                [
+                    ExtensionPermission::ObserveMessageChanges,
+                    ExtensionPermission::ObserveRosterChanges,
+                ],
             ),
-            [ExtensionPermission::ObserveMessageChanges],
+            [ExtensionPermission::ObserveMessageChanges, ExtensionPermission::ObserveRosterChanges],
         )
         .expect("manifest");
         let events = [
@@ -398,6 +412,7 @@ mod tests {
             CoreEvent::ConversationChanged(2),
             CoreEvent::MessageAdded(3),
             CoreEvent::MessageChanged(4),
+            CoreEvent::RosterChanged(5),
         ];
 
         assert_eq!(
@@ -405,6 +420,7 @@ mod tests {
             vec![
                 ExtensionEvent::MessageAdded { message_id: 3 },
                 ExtensionEvent::MessageChanged { message_id: 4 },
+                ExtensionEvent::RosterChanged { account_id: 5 },
             ]
         );
     }

@@ -43,6 +43,7 @@ silently ignored.
 | Permission | Grants |
 | --- | --- |
 | `observe_account_changes` | ID-only account-change events |
+| `observe_roster_changes` | ID-only roster-change events scoped by account ID |
 | `observe_conversation_changes` | ID-only conversation-change events |
 | `observe_message_changes` | ID-only message-added and message-changed events |
 | `send_messages` | `CoreCommand::SendText` |

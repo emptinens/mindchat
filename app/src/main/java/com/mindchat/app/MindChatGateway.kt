@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.Stable
 import com.mindchat.core.FfiConnectionState
+import com.mindchat.core.FfiContactPresence
 import com.mindchat.core.FfiConversationKind
 import com.mindchat.core.FfiDeliveryState
 import com.mindchat.core.FfiMessageDirection
@@ -16,7 +17,7 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-enum class Presence { ONLINE, OFFLINE }
+enum class Presence { ONLINE, AWAY, DO_NOT_DISTURB, OFFLINE }
 
 enum class MessageDelivery { PENDING, SENT, DELIVERED, READ, FAILED }
 
@@ -26,6 +27,14 @@ data class AccountUi(
     val displayName: String,
     val presence: Presence,
     val supportsGroupChats: Boolean = false,
+)
+
+data class ContactUi(
+    val accountId: Long,
+    val jid: String,
+    val displayName: String,
+    val presence: Presence,
+    val status: String? = null,
 )
 
 data class ConversationUi(
@@ -53,6 +62,7 @@ data class MessageUi(
 
 data class MindChatUiState(
     val accounts: List<AccountUi>,
+    val contacts: List<ContactUi>,
     val activeAccountId: Long,
     val conversations: List<ConversationUi>,
     val messagesByConversation: Map<Long, List<MessageUi>>,
@@ -66,7 +76,8 @@ interface MindChatGateway {
 
     fun selectAccount(accountId: Long)
     fun addLocalAccount(jid: String, server: String, displayName: String)
-    fun openConversation(address: String, title: String, group: Boolean)
+    fun addContact(jid: String, displayName: String)
+    fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
     fun toggleDynamicColor()
     fun toggleComfortableLayout()
@@ -122,6 +133,22 @@ class NativeMindChatGateway(
         }
     }
 
+    override fun addContact(jid: String, displayName: String) {
+        if (activeAccountId == 0L) return
+        try {
+            core.upsertContact(
+                activeAccountId.toULong(),
+                jid.trim(),
+                displayName.trim(),
+                FfiContactPresence.OFFLINE,
+                null,
+            )
+            refresh()
+        } catch (_: MindChatBindingException) {
+            // Domain validation owns contact-address rejection.
+        }
+    }
+
     override fun sendText(conversationId: Long, text: String) {
         val account = state.accounts.firstOrNull { it.id == activeAccountId } ?: return
         try {
@@ -138,9 +165,9 @@ class NativeMindChatGateway(
         }
     }
 
-    override fun openConversation(address: String, title: String, group: Boolean) {
-        if (activeAccountId == 0L) return
-        openLocalConversation(activeAccountId, address, title, group)
+    override fun openConversation(address: String, title: String, group: Boolean): Long? {
+        if (activeAccountId == 0L) return null
+        return openLocalConversation(activeAccountId, address, title, group)
     }
 
     override fun toggleDynamicColor() {
@@ -155,19 +182,26 @@ class NativeMindChatGateway(
         updateCustomization { it.copy(appLockEnabled = !it.appLockEnabled) }
     }
 
-    /** Test and development utility until roster-backed contact search lands. */
-    fun openLocalConversation(accountId: Long, address: String, title: String, group: Boolean = false) {
+    /** Test and development utility until server-backed contact search lands. */
+    fun openLocalConversation(
+        accountId: Long,
+        address: String,
+        title: String,
+        group: Boolean = false,
+    ): Long? {
         try {
-            core.openConversation(
+            val conversationId = core.openConversation(
                 accountId.toULong(),
                 if (group) FfiConversationKind.MULTI_USER_CHAT else FfiConversationKind.DIRECT,
                 address.trim(),
                 title.trim().ifBlank { address.substringBefore('@') },
                 System.currentTimeMillis().toULong(),
-            )
+            ).toLong()
             refresh()
+            return conversationId
         } catch (_: MindChatBindingException) {
             // A MUC action remains disabled by capability discovery in production.
+            return null
         }
     }
 
@@ -226,6 +260,21 @@ class NativeMindChatGateway(
                     )
                 }
             }
+        val contacts = snapshot.contacts.map { contact ->
+            ContactUi(
+                accountId = contact.accountId.toLong(),
+                jid = contact.jid,
+                displayName = contact.displayName,
+                presence = when (contact.presence) {
+                    FfiContactPresence.ONLINE -> Presence.ONLINE
+                    FfiContactPresence.AWAY -> Presence.AWAY
+                    FfiContactPresence.DO_NOT_DISTURB -> Presence.DO_NOT_DISTURB
+                    FfiContactPresence.OFFLINE,
+                    -> Presence.OFFLINE
+                },
+                status = contact.status,
+            )
+        }
         val conversations = snapshot.conversations.map { conversation ->
             val messages = messagesByConversation[conversation.id.toLong()].orEmpty()
             ConversationUi(
@@ -242,6 +291,7 @@ class NativeMindChatGateway(
         }
         return MindChatUiState(
             accounts = accounts,
+            contacts = contacts,
             activeAccountId = activeAccountId,
             conversations = conversations,
             messagesByConversation = messagesByConversation,
@@ -296,6 +346,23 @@ class PreviewMindChatGateway(
         )
     }
 
+    override fun addContact(jid: String, displayName: String) {
+        val address = jid.trim()
+        if ('@' !in address || state.activeAccountId == 0L) return
+        val contact = ContactUi(
+            accountId = state.activeAccountId,
+            jid = address,
+            displayName = displayName.trim().ifBlank { address.substringBefore('@') },
+            presence = Presence.OFFLINE,
+        )
+        state = state.copy(
+            contacts = state.contacts
+                .filterNot { it.accountId == contact.accountId && it.jid == contact.jid }
+                .plus(contact)
+                .sortedWith(compareBy(ContactUi::accountId, ContactUi::jid)),
+        )
+    }
+
     override fun sendText(conversationId: Long, text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
@@ -324,9 +391,16 @@ class PreviewMindChatGateway(
         )
     }
 
-    override fun openConversation(address: String, title: String, group: Boolean) {
+    override fun openConversation(address: String, title: String, group: Boolean): Long? {
         val addressValue = address.trim()
-        if (addressValue.isEmpty() || state.activeAccountId == 0L) return
+        if (addressValue.isEmpty() || state.activeAccountId == 0L) return null
+        state.conversations
+            .firstOrNull {
+                it.accountId == state.activeAccountId &&
+                    it.address == addressValue &&
+                    it.isGroup == group
+            }
+            ?.let { return it.id }
         val conversationId = (state.conversations.maxOfOrNull { it.id } ?: 0) + 1
         val conversation = ConversationUi(
             id = conversationId,
@@ -342,6 +416,7 @@ class PreviewMindChatGateway(
             conversations = state.conversations + conversation,
             messagesByConversation = state.messagesByConversation + (conversationId to emptyList()),
         )
+        return conversationId
     }
 
     override fun toggleDynamicColor() {
@@ -402,6 +477,27 @@ private fun seedState(): MindChatUiState {
     )
     return MindChatUiState(
         accounts = listOf(account),
+        contacts = listOf(
+            ContactUi(
+                accountId = account.id,
+                jid = "bob@example.org",
+                displayName = "Bob",
+                presence = Presence.ONLINE,
+                status = "Available",
+            ),
+            ContactUi(
+                accountId = account.id,
+                jid = "mila@example.org",
+                displayName = "Mila",
+                presence = Presence.OFFLINE,
+            ),
+            ContactUi(
+                accountId = account.id,
+                jid = "community@conference.example.org",
+                displayName = "MindChat community",
+                presence = Presence.ONLINE,
+            ),
+        ),
         activeAccountId = account.id,
         conversations = conversations,
         messagesByConversation = mapOf(

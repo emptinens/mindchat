@@ -6,8 +6,8 @@
 //! commands.
 
 use crate::{
-    AccountSetup, ConnectionState, ConversationKind, CoreError, CoreEvent, DeliveryState,
-    MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
+    AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
+    DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,6 +39,37 @@ impl From<FfiConnectionState> for ConnectionState {
             FfiConnectionState::Connecting => Self::Connecting,
             FfiConnectionState::Online => Self::Online,
             FfiConnectionState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Presence state displayed for one roster contact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum FfiContactPresence {
+    Online,
+    Away,
+    DoNotDisturb,
+    Offline,
+}
+
+impl From<ContactPresence> for FfiContactPresence {
+    fn from(value: ContactPresence) -> Self {
+        match value {
+            ContactPresence::Online => Self::Online,
+            ContactPresence::Away => Self::Away,
+            ContactPresence::DoNotDisturb => Self::DoNotDisturb,
+            ContactPresence::Offline => Self::Offline,
+        }
+    }
+}
+
+impl From<FfiContactPresence> for ContactPresence {
+    fn from(value: FfiContactPresence) -> Self {
+        match value {
+            FfiContactPresence::Online => Self::Online,
+            FfiContactPresence::Away => Self::Away,
+            FfiContactPresence::DoNotDisturb => Self::DoNotDisturb,
+            FfiContactPresence::Offline => Self::Offline,
         }
     }
 }
@@ -193,6 +224,16 @@ pub struct FfiAccount {
     pub capabilities: Vec<FfiProtocolCapability>,
 }
 
+/// A roster contact record safe for display in the Android UI.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct FfiContact {
+    pub account_id: u64,
+    pub jid: String,
+    pub display_name: String,
+    pub presence: FfiContactPresence,
+    pub status: Option<String>,
+}
+
 /// A direct chat or MUC projection safe for display in the Android UI.
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct FfiConversation {
@@ -244,6 +285,7 @@ pub struct FfiReaction {
 #[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
 pub struct FfiCoreSnapshot {
     pub accounts: Vec<FfiAccount>,
+    pub contacts: Vec<FfiContact>,
     pub conversations: Vec<FfiConversation>,
     pub messages: Vec<FfiMessage>,
     pub reactions: Vec<FfiReaction>,
@@ -254,6 +296,7 @@ pub struct FfiCoreSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
 pub enum FfiCoreEvent {
     AccountChanged { account_id: u64 },
+    RosterChanged { account_id: u64 },
     ConversationChanged { conversation_id: u64 },
     MessageAdded { message_id: u64 },
     MessageChanged { message_id: u64 },
@@ -361,6 +404,20 @@ impl MindChatCoreHandle {
             .map_err(Into::into)
     }
 
+    /// Creates or updates a local roster contact projection.
+    pub fn upsert_contact(
+        &self,
+        account_id: u64,
+        jid: String,
+        display_name: String,
+        presence: FfiContactPresence,
+        status: Option<String>,
+    ) -> Result<(), MindChatBindingError> {
+        self.lock()?
+            .upsert_contact(account_id, jid, display_name, presence.into(), status)
+            .map_err(Into::into)
+    }
+
     /// Opens a direct chat or MUC projection.
     pub fn open_conversation(
         &self,
@@ -437,6 +494,7 @@ impl From<crate::CoreSnapshot> for FfiCoreSnapshot {
     fn from(value: crate::CoreSnapshot) -> Self {
         Self {
             accounts: value.accounts.into_iter().map(Into::into).collect(),
+            contacts: value.contacts.into_iter().map(Into::into).collect(),
             conversations: value.conversations.into_iter().map(Into::into).collect(),
             messages: value.messages.into_iter().map(Into::into).collect(),
             reactions: value.reactions.into_iter().map(Into::into).collect(),
@@ -453,6 +511,18 @@ impl From<crate::Account> for FfiAccount {
             display_name: value.display_name,
             connection_state: value.connection_state.into(),
             capabilities: value.capabilities.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<crate::Contact> for FfiContact {
+    fn from(value: crate::Contact) -> Self {
+        Self {
+            account_id: value.account_id,
+            jid: value.jid,
+            display_name: value.display_name,
+            presence: value.presence.into(),
+            status: value.status,
         }
     }
 }
@@ -510,6 +580,7 @@ impl From<CoreEvent> for FfiCoreEvent {
     fn from(value: CoreEvent) -> Self {
         match value {
             CoreEvent::AccountChanged(account_id) => Self::AccountChanged { account_id },
+            CoreEvent::RosterChanged(account_id) => Self::RosterChanged { account_id },
             CoreEvent::ConversationChanged(conversation_id) => {
                 Self::ConversationChanged { conversation_id }
             }
@@ -564,6 +635,38 @@ mod tests {
                 FfiCoreEvent::ConversationChanged { conversation_id },
                 FfiCoreEvent::MessageAdded { message_id },
             ]
+        );
+    }
+
+    #[test]
+    fn bridge_exposes_roster_contacts_without_transport_or_secret_types() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        core.upsert_contact(
+            account_id,
+            "bob@example.org".to_owned(),
+            "Bob".to_owned(),
+            FfiContactPresence::Online,
+            Some("Available".to_owned()),
+        )
+        .expect("contact");
+
+        let snapshot = core.snapshot().expect("snapshot");
+        assert_eq!(snapshot.contacts.len(), 1);
+        assert_eq!(snapshot.contacts[0].jid, "bob@example.org");
+        assert_eq!(snapshot.contacts[0].presence, FfiContactPresence::Online);
+        assert_eq!(snapshot.contacts[0].status.as_deref(), Some("Available"));
+        assert_eq!(
+            core.drain_events().expect("events"),
+            vec![FfiCoreEvent::RosterChanged { account_id }]
         );
     }
 

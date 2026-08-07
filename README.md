@@ -10,8 +10,8 @@ This repository contains a runnable foundation:
 - Kotlin + Jetpack Compose Android shell targeting Android 8+;
 - Material 3 adaptive/chat/settings UI;
 - Rust domain core with typed account, conversation, message, reaction, receipt,
-  and capability models, a reconnect-safe outgoing projection, and an internal
-  transport coordinator boundary;
+  roster-contact, and capability models, a reconnect-safe outgoing projection,
+  and an internal transport coordinator boundary;
 - UniFFI-generated Kotlin contract and Android ABI build pipeline;
 - local persistence for non-sensitive appearance and interaction preferences;
 - optional biometric/device-credential app gate with secure-window handling;
@@ -22,7 +22,8 @@ This repository contains a runnable foundation:
 The XMPP transport implementation, encrypted SQLCipher persistence, OMEMO,
 UnifiedPush integration, and plugin runtime remain explicit follow-up milestones
 described in [PLAN.md](PLAN.md). The native core currently validates, queues,
-and projects local state; it does not yet connect to an XMPP server.
+and projects local state; it does not yet connect to an XMPP server or
+synchronize roster subscriptions.
 
 The pre-runtime extension contract is described in
 [docs/EXTENSIONS.md](docs/EXTENSIONS.md).

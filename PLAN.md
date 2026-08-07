@@ -36,8 +36,9 @@ layout density and navigation are retained.
    no-telemetry diagnostics policy.
 2. **Protocol and persistence** — validate a Rust XMPP transport behind an
    internal adapter; implement service discovery, account login/registration,
-   roster, MUC, MAM, Stream Management, encrypted database migrations, and
-   media storage. Do not leak transport crate types through FFI.
+   server-synchronized roster, MUC, MAM, Stream Management, encrypted database
+   migrations, and media storage. Do not leak transport crate types through
+   FFI.
 3. **Messaging** — HTTP upload, receipts, markers, typing, reactions,
    corrections/retractions, replies, capability-gated shared pins, and
    reconnection-safe outgoing queues.
@@ -63,6 +64,10 @@ layout density and navigation are retained.
   start unavailable and become usable only after service discovery projects
   them into the account. This is an internal adapter boundary, not an XMPP
   implementation yet.
+- The Rust snapshot and UniFFI contract include account-scoped local roster
+  contacts with normalized display names, presence/status projections, and
+  roster-change events. Android renders that roster and can add a local contact;
+  XMPP roster subscription and synchronization are still transport work.
 - Customization choices (system colors, layout density, and app-lock preference)
   are persisted locally as non-sensitive Android preferences. The optional app
   lock uses AndroidX `BiometricPrompt` with biometric or device-credential

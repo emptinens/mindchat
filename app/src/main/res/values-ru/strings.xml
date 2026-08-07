@@ -2,6 +2,10 @@
     <string name="app_name">MindChat</string>
     <string name="conversations">Чаты</string>
     <string name="contacts">Контакты</string>
+    <string name="add_contact">Добавить контакт</string>
+    <string name="contact_jid">JID контакта</string>
+    <string name="no_contacts">Контактов пока нет</string>
+    <string name="no_contacts_summary">Добавьте контакт локально, пока синхронизация списка контактов недоступна.</string>
     <string name="settings">Настройки</string>
     <string name="new_chat">Новый чат</string>
     <string name="conversation_address">Адрес контакта или комнаты</string>
@@ -39,5 +43,5 @@
     <string name="diagnostics_summary">Экспортируется только по вашему запросу</string>
     <string name="about">О MindChat</string>
     <string name="privacy_summary">Без аналитики и облачного аккаунта MindChat</string>
-    <string name="coming_soon">Подключение, синхронизация контактов и зашифрованное хранилище — следующие этапы ядра.</string>
+    <string name="coming_soon">Подключение, синхронизация списка контактов и зашифрованное хранилище — следующие этапы ядра.</string>
 </resources>

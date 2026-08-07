@@ -3,7 +3,8 @@
 The `mindchat-core` crate builds as both `rlib` and `cdylib`. The Android app
 uses generated UniFFI Kotlin bindings in the `com.mindchat.core` package. The
 public ABI contains only immutable DTOs, commands, typed errors, and a
-thread-safe `MindChatCoreHandle` object.
+thread-safe `MindChatCoreHandle` object. Snapshot DTOs include normalized
+account-scoped roster contacts but never roster XML or credentials.
 
 ## Build ABI artifacts
 
@@ -33,6 +34,10 @@ native binaries are committed to the repository.
   Android AAR required by UniFFI's generated bindings.
 - Kotlin receives `CoreEvent` notifications and refetches snapshots; it never
   receives XMPP XML, database connections, or cryptographic key material.
+- `FfiContact` and `FfiContactPresence` are UI-safe roster projections. Kotlin
+  can add/update a local projection through `upsert_contact`; subscription
+  negotiation and server roster synchronization stay behind a future transport
+  adapter.
 - Kotlin owns Android Keystore, biometric prompts, media pickers, system
   notifications, and UnifiedPush transport registration.
 - Rust owns account/session state, protocol feature discovery, normalized

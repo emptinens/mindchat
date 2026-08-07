@@ -167,6 +167,7 @@ private fun MindChatShell(
     var destination by rememberSaveable { mutableStateOf(Destination.Chats) }
     var selectedConversationId by rememberSaveable { mutableStateOf<Long?>(null) }
     var showAddAccount by rememberSaveable { mutableStateOf(false) }
+    var showAddContact by rememberSaveable { mutableStateOf(false) }
     var showNewConversation by rememberSaveable { mutableStateOf(false) }
 
     if (showAddAccount) {
@@ -188,6 +189,16 @@ private fun MindChatShell(
             onSave = { address, title, isGroup ->
                 gateway.openConversation(address, title, isGroup)
                 showNewConversation = false
+            },
+        )
+    }
+
+    if (showAddContact) {
+        AddContactDialog(
+            onDismiss = { showAddContact = false },
+            onSave = { jid, name ->
+                gateway.addContact(jid, name)
+                showAddContact = false
             },
         )
     }
@@ -241,12 +252,27 @@ private fun MindChatShell(
             }
         },
         floatingActionButton = {
-            if (destination == Destination.Chats && state.activeAccountId != 0L) {
-                FloatingActionButton(onClick = { showNewConversation = true }) {
-                    Icon(
-                        imageVector = Icons.Filled.Add,
-                        contentDescription = stringResource(R.string.new_chat),
-                    )
+            if (state.activeAccountId != 0L) {
+                when (destination) {
+                    Destination.Chats -> {
+                        FloatingActionButton(onClick = { showNewConversation = true }) {
+                            Icon(
+                                imageVector = Icons.Filled.Add,
+                                contentDescription = stringResource(R.string.new_chat),
+                            )
+                        }
+                    }
+
+                    Destination.Contacts -> {
+                        FloatingActionButton(onClick = { showAddContact = true }) {
+                            Icon(
+                                imageVector = Icons.Filled.Add,
+                                contentDescription = stringResource(R.string.add_contact),
+                            )
+                        }
+                    }
+
+                    Destination.Settings -> Unit
                 }
             }
         },
@@ -258,7 +284,16 @@ private fun MindChatShell(
                 onConversationClick = { selectedConversationId = it.id },
             )
 
-            Destination.Contacts -> ContactsScreen(state = state, contentPadding = padding)
+            Destination.Contacts -> ContactsScreen(
+                state = state,
+                contentPadding = padding,
+                onContactClick = { contact ->
+                    gateway.openConversation(contact.jid, contact.displayName, group = false)?.let {
+                        selectedConversationId = it
+                        destination = Destination.Chats
+                    }
+                },
+            )
             Destination.Settings -> SettingsScreen(
                 state = state,
                 contentPadding = padding,
@@ -610,13 +645,15 @@ private fun deliveryLabel(delivery: MessageDelivery): String = when (delivery) {
 }
 
 @Composable
-private fun ContactsScreen(state: MindChatUiState, contentPadding: PaddingValues) {
+private fun ContactsScreen(
+    state: MindChatUiState,
+    contentPadding: PaddingValues,
+    onContactClick: (ContactUi) -> Unit,
+) {
     val active = state.accounts.firstOrNull { it.id == state.activeAccountId }
-    val contacts = listOf(
-        "Bob" to "bob@example.org",
-        "Mila" to "mila@example.org",
-        "MindChat community" to "community@conference.example.org",
-    )
+    val contacts = state.contacts
+        .filter { it.accountId == state.activeAccountId }
+        .sortedBy { it.displayName.lowercase() }
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -636,14 +673,52 @@ private fun ContactsScreen(state: MindChatUiState, contentPadding: PaddingValues
             )
             Spacer(Modifier.height(8.dp))
         }
-        items(contacts, key = { it.second }) { contact ->
+        if (contacts.isEmpty()) {
+            item {
+                EmptyContacts()
+            }
+        }
+        items(contacts, key = { it.jid }) { contact ->
             ListItem(
-                headlineContent = { Text(contact.first) },
-                supportingContent = { Text(contact.second) },
-                leadingContent = { Avatar(contact.first, contact.second.contains("conference")) },
+                modifier = Modifier.clickable { onContactClick(contact) },
+                headlineContent = { Text(contact.displayName) },
+                supportingContent = {
+                    Column {
+                        Text(contact.jid)
+                        contact.status?.let { status ->
+                            Text(
+                                text = status,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                },
+                leadingContent = { Avatar(contact.displayName, contact.jid.contains("conference")) },
+                trailingContent = { PresenceDot(contact.presence) },
             )
             HorizontalDivider()
         }
+    }
+}
+
+@Composable
+private fun EmptyContacts() {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 72.dp, start = 24.dp, end = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = stringResource(R.string.no_contacts),
+            style = MaterialTheme.typography.headlineSmall,
+        )
+        Text(
+            text = stringResource(R.string.no_contacts_summary),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
@@ -768,8 +843,12 @@ private fun PresenceDot(presence: Presence) {
             .size(8.dp)
             .clip(CircleShape)
             .background(
-                if (presence == Presence.ONLINE) Color(0xFF2E7D32)
-                else MaterialTheme.colorScheme.outline,
+                when (presence) {
+                    Presence.ONLINE -> Color(0xFF2E7D32)
+                    Presence.AWAY -> Color(0xFFF9A825)
+                    Presence.DO_NOT_DISTURB -> MaterialTheme.colorScheme.error
+                    Presence.OFFLINE -> MaterialTheme.colorScheme.outline
+                },
             ),
     )
 }
@@ -828,6 +907,44 @@ private fun AddAccountDialog(
             TextButton(
                 onClick = { onSave(jid, server, displayName) },
                 enabled = jid.contains('@') && server.isNotBlank(),
+            ) { Text(stringResource(R.string.save)) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+private fun AddContactDialog(
+    onDismiss: () -> Unit,
+    onSave: (jid: String, displayName: String) -> Unit,
+) {
+    var jid by rememberSaveable { mutableStateOf("") }
+    var displayName by rememberSaveable { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.add_contact)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = jid,
+                    onValueChange = { jid = it },
+                    label = { Text(stringResource(R.string.contact_jid)) },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = displayName,
+                    onValueChange = { displayName = it },
+                    label = { Text(stringResource(R.string.display_name)) },
+                    singleLine = true,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(jid, displayName) },
+                enabled = jid.contains('@'),
             ) { Text(stringResource(R.string.save)) }
         },
         dismissButton = {
