@@ -51,4 +51,17 @@ class MindChatAppTest {
         assertTrue(firstConversation != null)
         assertEquals(firstConversation, repeatedConversation)
     }
+
+    @Test
+    fun accountSetupRequiresAPasswordBeforeThePreviewSessionIsCreated() {
+        val gateway = PreviewMindChatGateway()
+        val initialCount = gateway.state.accounts.size
+
+        assertFalse(gateway.addAccount("mila@example.org", "example.org", "Mila", ""))
+        assertEquals(initialCount, gateway.state.accounts.size)
+
+        assertTrue(gateway.addAccount("mila@example.org", "example.org", "Mila", "secret"))
+        assertEquals(initialCount + 1, gateway.state.accounts.size)
+        assertEquals("mila@example.org", gateway.state.accounts.last().jid)
+    }
 }

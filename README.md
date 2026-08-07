@@ -10,8 +10,8 @@ This repository contains a runnable foundation:
 - Kotlin + Jetpack Compose Android shell targeting Android 8+;
 - Material 3 adaptive/chat/settings UI;
 - Rust domain core with typed account, conversation, message, reaction, receipt,
-  roster-contact, and capability models, a reconnect-safe outgoing projection,
-  and an internal transport coordinator boundary;
+  roster-contact/subscription, and capability models, a reconnect-safe outgoing
+  projection, and a concrete Tokio/XMPP transport behind an internal coordinator;
 - UniFFI-generated Kotlin contract and Android ABI build pipeline;
 - local persistence for non-sensitive appearance and interaction preferences;
 - optional biometric/device-credential app gate with secure-window handling;
@@ -19,11 +19,14 @@ This repository contains a runnable foundation:
   customization, without a third-party code loader;
 - unit tests for the Rust state machine and CI for formatting, linting, and tests.
 
-The XMPP transport implementation, encrypted SQLCipher persistence, OMEMO,
-UnifiedPush integration, and plugin runtime remain explicit follow-up milestones
-described in [PLAN.md](PLAN.md). The native core currently validates, queues,
-and projects local state; it does not yet connect to an XMPP server or
-synchronize roster subscriptions.
+The Rust transport uses StartTLS, SRV or explicit-host connection resolution,
+initial service discovery, roster-result/push projection, and normalized contact
+presence. The Android account form hands a password directly to the Rust session
+startup call, then polls normalized native events and flushes queued text on an
+IO dispatcher; it never stores the password in preferences or saved Compose state. Encrypted SQLCipher
+persistence, account registration/subscription commands, MUC/MAM, OMEMO,
+UnifiedPush integration, and the plugin runtime remain explicit follow-up
+milestones described in [PLAN.md](PLAN.md).
 
 The pre-runtime extension contract is described in
 [docs/EXTENSIONS.md](docs/EXTENSIONS.md).

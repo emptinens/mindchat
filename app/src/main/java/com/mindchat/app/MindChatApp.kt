@@ -69,8 +69,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.delay
 
 private enum class Destination {
     Chats,
@@ -89,6 +91,12 @@ fun MindChatApp(appLockHost: AppLockHost? = null) {
 private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
     val state = gateway.state
     val context = LocalContext.current
+    LaunchedEffect(gateway) {
+        while (true) {
+            gateway.pollTransport()
+            delay(750)
+        }
+    }
     val colors = when {
         state.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
             if (androidx.compose.foundation.isSystemInDarkTheme()) dynamicDarkColorScheme(context)
@@ -173,10 +181,7 @@ private fun MindChatShell(
     if (showAddAccount) {
         AddAccountDialog(
             onDismiss = { showAddAccount = false },
-            onSave = { jid, server, name ->
-                gateway.addLocalAccount(jid, server, name)
-                showAddAccount = false
-            },
+            onSave = gateway::addAccount,
         )
     }
 
@@ -328,7 +333,9 @@ private fun MindChatTopBar(
                     style = MaterialTheme.typography.titleLarge,
                 )
                 Text(
-                    text = active?.jid.orEmpty(),
+                    text = active?.let { account ->
+                        "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}"
+                    }.orEmpty(),
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -371,6 +378,13 @@ private fun MindChatTopBar(
             }
         }
     }
+}
+
+private fun accountConnectionLabel(connectionState: AccountConnectionState): Int = when (connectionState) {
+    AccountConnectionState.OFFLINE -> R.string.connection_offline
+    AccountConnectionState.CONNECTING -> R.string.connection_connecting
+    AccountConnectionState.ONLINE -> R.string.connection_online
+    AccountConnectionState.FAILED -> R.string.connection_failed
 }
 
 @Composable
@@ -873,11 +887,13 @@ private fun UnreadBadge(count: Int) {
 @Composable
 private fun AddAccountDialog(
     onDismiss: () -> Unit,
-    onSave: (jid: String, server: String, displayName: String) -> Unit,
+    onSave: (jid: String, server: String, displayName: String, password: String) -> Boolean,
 ) {
     var jid by rememberSaveable { mutableStateOf("") }
     var server by rememberSaveable { mutableStateOf("") }
     var displayName by rememberSaveable { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var failedToStartSession by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.add_account)) },
@@ -901,12 +917,36 @@ private fun AddAccountDialog(
                     label = { Text(stringResource(R.string.display_name)) },
                     singleLine = true,
                 )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = {
+                        password = it
+                        failedToStartSession = false
+                    },
+                    label = { Text(stringResource(R.string.password)) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    isError = failedToStartSession,
+                )
+                if (failedToStartSession) {
+                    Text(
+                        text = stringResource(R.string.account_connection_error),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
-                onClick = { onSave(jid, server, displayName) },
-                enabled = jid.contains('@') && server.isNotBlank(),
+                onClick = {
+                    if (onSave(jid, server, displayName, password)) {
+                        onDismiss()
+                    } else {
+                        failedToStartSession = true
+                    }
+                },
+                enabled = jid.contains('@') && server.isNotBlank() && password.isNotEmpty(),
             ) { Text(stringResource(R.string.save)) }
         },
         dismissButton = {

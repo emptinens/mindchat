@@ -4,7 +4,10 @@
 //! stanzas to these domain-safe requests and events. The core intentionally
 //! depends on this trait rather than on a particular XMPP crate.
 
-use crate::{AccountId, ConversationId, DeliveryState, MessageId, ProtocolCapability};
+use crate::{
+    AccountId, ContactPresence, ConversationId, ConversationKind, DeliveryState, MessageId,
+    ProtocolCapability, RosterSubscription,
+};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -47,6 +50,7 @@ pub struct OutgoingMessage {
     pub account_id: AccountId,
     pub conversation_id: ConversationId,
     pub message_id: MessageId,
+    pub kind: ConversationKind,
     pub recipient: String,
     pub body: String,
     pub in_reply_to: Option<MessageId>,
@@ -63,8 +67,34 @@ pub enum TransportEvent {
         account_id: AccountId,
         recoverable: bool,
     },
+    /// Capabilities received after XEP-0030 service discovery completes.
+    CapabilitiesDiscovered {
+        account_id: AccountId,
+        capabilities: BTreeSet<ProtocolCapability>,
+    },
+    /// A roster item supplied by an XMPP roster result or push.
+    RosterContactUpsert {
+        account_id: AccountId,
+        jid: String,
+        display_name: String,
+        subscription: RosterSubscription,
+    },
+    /// A roster item removed by an XMPP roster result or push.
+    RosterContactRemoved {
+        account_id: AccountId,
+        jid: String,
+    },
+    /// A presence update for an existing roster contact.
+    ContactPresenceUpdated {
+        account_id: AccountId,
+        jid: String,
+        presence: ContactPresence,
+        status: Option<String>,
+    },
     IncomingText {
-        conversation_id: ConversationId,
+        account_id: AccountId,
+        kind: ConversationKind,
+        address: String,
         sender: String,
         body: String,
         received_at_epoch_ms: u64,

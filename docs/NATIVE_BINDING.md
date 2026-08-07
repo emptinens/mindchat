@@ -4,7 +4,8 @@ The `mindchat-core` crate builds as both `rlib` and `cdylib`. The Android app
 uses generated UniFFI Kotlin bindings in the `com.mindchat.core` package. The
 public ABI contains only immutable DTOs, commands, typed errors, and a
 thread-safe `MindChatCoreHandle` object. Snapshot DTOs include normalized
-account-scoped roster contacts but never roster XML or credentials.
+account-scoped roster contacts and server-confirmed subscription projections,
+but never roster XML, passwords, or other credential material.
 
 ## Build ABI artifacts
 
@@ -34,10 +35,17 @@ native binaries are committed to the repository.
   Android AAR required by UniFFI's generated bindings.
 - Kotlin receives `CoreEvent` notifications and refetches snapshots; it never
   receives XMPP XML, database connections, or cryptographic key material.
-- `FfiContact` and `FfiContactPresence` are UI-safe roster projections. Kotlin
-  can add/update a local projection through `upsert_contact`; subscription
-  negotiation and server roster synchronization stay behind a future transport
-  adapter.
+- `FfiContact`, `FfiContactPresence`, and `FfiRosterSubscription` are UI-safe
+  roster projections. Kotlin can add/update a local projection through
+  `upsert_contact`; authenticated subscribe/unsubscribe commands are not yet
+  part of the Android flow.
+- `connect_account(account_id, password)` makes one immediate credential
+  hand-off into the Rust transport session. `poll_transport_events(max_events)`
+  applies normalized state changes, and `flush_outbox(account_id)` sends queued
+  text only while the account is online. The Android gateway invokes polling and
+  outbox flushing from an IO dispatcher, then assigns snapshot UI state on the
+  Compose dispatcher. Password text is kept in ordinary, non-saveable form state
+  only until this call returns and is not written to Android preferences.
 - Kotlin owns Android Keystore, biometric prompts, media pickers, system
   notifications, and UnifiedPush transport registration.
 - Rust owns account/session state, protocol feature discovery, normalized
@@ -47,11 +55,16 @@ native binaries are committed to the repository.
   are not a UniFFI plugin ABI and do not load third-party code; see
   [EXTENSIONS.md](EXTENSIONS.md).
 
-`TransportCoordinator<T>` is an internal Rust-only helper that joins a
-`MindChatCore` with an `XmppTransport` implementation. It is intentionally not
-part of the UniFFI ABI: an adapter consumes a password for one connection
-request, flushes pending messages in stable order, and applies normalized
-events without exposing transport types or credentials to Kotlin.
+`TransportCoordinator<T>` is the Rust-internal helper that joins a
+`MindChatCore` with an `XmppTransport` implementation. `TokioXmppTransport`
+is the production implementation: it runs one Tokio worker per account,
+negotiates StartTLS through `tokio-xmpp`, performs initial service discovery and
+roster synchronization, and converts all received stanzas into domain events.
+It is intentionally not a Kotlin transport type. `MindChatCoreHandle` owns the
+concrete coordinator internally and exports only typed session commands and
+snapshots. The core never retains a password; the active transport worker owns
+it only for its authenticated session/reconnect lifecycle, without exposing it
+back to Kotlin.
 
 `MindChatCoreHandle` is the only native object the Android gateway owns. A
 native-unavailable fallback is restricted to local previews and test tooling;

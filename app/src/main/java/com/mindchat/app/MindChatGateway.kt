@@ -8,6 +8,7 @@ import androidx.compose.runtime.Stable
 import com.mindchat.core.FfiConnectionState
 import com.mindchat.core.FfiContactPresence
 import com.mindchat.core.FfiConversationKind
+import com.mindchat.core.FfiCoreSnapshot
 import com.mindchat.core.FfiDeliveryState
 import com.mindchat.core.FfiMessageDirection
 import com.mindchat.core.FfiProtocolCapability
@@ -16,16 +17,21 @@ import com.mindchat.core.MindChatCoreHandle
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 enum class Presence { ONLINE, AWAY, DO_NOT_DISTURB, OFFLINE }
 
 enum class MessageDelivery { PENDING, SENT, DELIVERED, READ, FAILED }
+
+enum class AccountConnectionState { OFFLINE, CONNECTING, ONLINE, FAILED }
 
 data class AccountUi(
     val id: Long,
     val jid: String,
     val displayName: String,
     val presence: Presence,
+    val connectionState: AccountConnectionState = AccountConnectionState.OFFLINE,
     val supportsGroupChats: Boolean = false,
 )
 
@@ -71,14 +77,20 @@ data class MindChatUiState(
     val appLockEnabled: Boolean = false,
 )
 
+private data class TransportPollResult(
+    val snapshot: FfiCoreSnapshot,
+    val flushedAccounts: Set<Long>,
+)
+
 interface MindChatGateway {
     val state: MindChatUiState
 
     fun selectAccount(accountId: Long)
-    fun addLocalAccount(jid: String, server: String, displayName: String)
+    fun addAccount(jid: String, server: String, displayName: String, password: String): Boolean
     fun addContact(jid: String, displayName: String)
     fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
+    suspend fun pollTransport()
     fun toggleDynamicColor()
     fun toggleComfortableLayout()
     fun toggleAppLock()
@@ -108,6 +120,7 @@ class NativeMindChatGateway(
 ) : MindChatGateway {
     private var activeAccountId = 0L
     private var customization = preferences.readCustomization()
+    private val pendingOutboxAccounts = mutableSetOf<Long>()
 
     override var state by mutableStateOf(snapshotToUiState())
         private set
@@ -119,17 +132,35 @@ class NativeMindChatGateway(
         }
     }
 
-    override fun addLocalAccount(jid: String, server: String, displayName: String) {
-        try {
-            val accountId = core.addAccount(
-                jid.trim(),
-                server.trim(),
-                displayName.trim().ifBlank { jid.substringBefore('@').trim() },
-            ).toLong()
+    override fun addAccount(
+        jid: String,
+        server: String,
+        displayName: String,
+        password: String,
+    ): Boolean {
+        if (password.isEmpty()) return false
+        val normalizedJid = jid.trim()
+        val normalizedServer = server.trim()
+        return try {
+            val accountId = core.snapshot().accounts
+                .firstOrNull { account ->
+                    account.jid == normalizedJid && account.server == normalizedServer
+                }
+                ?.id
+                ?.toLong()
+                ?: core.addAccount(
+                    normalizedJid,
+                    normalizedServer,
+                    displayName.trim().ifBlank { normalizedJid.substringBefore('@') },
+                ).toLong()
             activeAccountId = accountId
+            core.connectAccount(accountId.toULong(), password)
             refresh()
+            true
         } catch (_: MindChatBindingException) {
-            // The Compose form keeps invalid entries local until the user changes them.
+            // A failed native setup remains visible through its core connection state.
+            refresh()
+            false
         }
     }
 
@@ -159,9 +190,54 @@ class NativeMindChatGateway(
                 null,
                 System.currentTimeMillis().toULong(),
             )
+            pendingOutboxAccounts += account.id
             refresh()
         } catch (_: MindChatBindingException) {
             // Domain validation owns message rejection; the composer remains editable.
+        }
+    }
+
+    /**
+     * Polls Rust-owned transport events without blocking the Compose main dispatcher.
+     * Snapshot state is only assigned after the coroutine resumes on that dispatcher.
+     */
+    override suspend fun pollTransport() {
+        val pendingAccounts = pendingOutboxAccounts.toSet()
+        val onlineBefore = state.accounts
+            .asSequence()
+            .filter { it.connectionState == AccountConnectionState.ONLINE }
+            .map(AccountUi::id)
+            .toSet()
+        val result = withContext(Dispatchers.IO) {
+            try {
+                val processedEvents = core.pollTransportEvents(32U)
+                if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
+                    return@withContext null
+                }
+
+                val beforeFlush = core.snapshot()
+                val onlineNow = beforeFlush.accounts
+                    .asSequence()
+                    .filter { it.connectionState == FfiConnectionState.ONLINE }
+                    .map { it.id.toLong() }
+                    .toSet()
+                val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
+                    .intersect(onlineNow)
+                accountsToFlush.forEach { accountId ->
+                    try {
+                        core.flushOutbox(accountId.toULong())
+                    } catch (_: MindChatBindingException) {
+                        // The core has already projected a failed delivery state when applicable.
+                    }
+                }
+                TransportPollResult(core.snapshot(), accountsToFlush)
+            } catch (_: MindChatBindingException) {
+                null
+            }
+        }
+        result?.let { pollResult ->
+            pendingOutboxAccounts.removeAll(pollResult.flushedAccounts)
+            refresh(pollResult.snapshot)
         }
     }
 
@@ -205,8 +281,8 @@ class NativeMindChatGateway(
         }
     }
 
-    private fun refresh() {
-        state = snapshotToUiState()
+    private fun refresh(snapshot: FfiCoreSnapshot = core.snapshot()) {
+        state = snapshotToUiState(snapshot)
         core.drainEvents()
     }
 
@@ -216,8 +292,7 @@ class NativeMindChatGateway(
         refresh()
     }
 
-    private fun snapshotToUiState(): MindChatUiState {
-        val snapshot = core.snapshot()
+    private fun snapshotToUiState(snapshot: FfiCoreSnapshot = core.snapshot()): MindChatUiState {
         val accounts = snapshot.accounts.map { account ->
             AccountUi(
                 id = account.id.toLong(),
@@ -230,6 +305,7 @@ class NativeMindChatGateway(
                     FfiConnectionState.FAILED,
                     -> Presence.OFFLINE
                 },
+                connectionState = account.connectionState.toUiModel(),
                 supportsGroupChats = account.capabilities.contains(FfiProtocolCapability.MULTI_USER_CHAT),
             )
         }
@@ -302,6 +378,13 @@ class NativeMindChatGateway(
     }
 }
 
+private fun FfiConnectionState.toUiModel(): AccountConnectionState = when (this) {
+    FfiConnectionState.OFFLINE -> AccountConnectionState.OFFLINE
+    FfiConnectionState.CONNECTING -> AccountConnectionState.CONNECTING
+    FfiConnectionState.ONLINE -> AccountConnectionState.ONLINE
+    FfiConnectionState.FAILED -> AccountConnectionState.FAILED
+}
+
 private fun FfiDeliveryState.toUiModel(): MessageDelivery = when (this) {
     FfiDeliveryState.PENDING -> MessageDelivery.PENDING
     FfiDeliveryState.SENT -> MessageDelivery.SENT
@@ -330,20 +413,27 @@ class PreviewMindChatGateway(
         }
     }
 
-    override fun addLocalAccount(jid: String, server: String, displayName: String) {
-        if ('@' !in jid || server.isBlank()) return
+    override fun addAccount(
+        jid: String,
+        server: String,
+        displayName: String,
+        password: String,
+    ): Boolean {
+        if ('@' !in jid || server.isBlank() || password.isBlank()) return false
         val nextId = (state.accounts.maxOfOrNull { it.id } ?: 0) + 1
         val account = AccountUi(
             id = nextId,
             jid = jid.trim(),
             displayName = displayName.trim().ifBlank { jid.substringBefore('@') },
             presence = Presence.OFFLINE,
+            connectionState = AccountConnectionState.OFFLINE,
             supportsGroupChats = true,
         )
         state = state.copy(
             accounts = state.accounts + account,
             activeAccountId = nextId,
         )
+        return true
     }
 
     override fun addContact(jid: String, displayName: String) {
@@ -390,6 +480,8 @@ class PreviewMindChatGateway(
             },
         )
     }
+
+    override suspend fun pollTransport() = Unit
 
     override fun openConversation(address: String, title: String, group: Boolean): Long? {
         val addressValue = address.trim()
@@ -450,6 +542,7 @@ private fun seedState(): MindChatUiState {
         jid = "alice@mindchat.example",
         displayName = "Alice",
         presence = Presence.ONLINE,
+        connectionState = AccountConnectionState.ONLINE,
         supportsGroupChats = true,
     )
     val conversations = listOf(

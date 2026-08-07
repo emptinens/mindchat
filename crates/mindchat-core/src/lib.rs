@@ -13,6 +13,9 @@ use std::fmt;
 pub mod extension;
 pub mod transport;
 
+#[cfg(feature = "xmpp-transport")]
+pub mod xmpp;
+
 #[cfg(feature = "uniffi")]
 pub mod ffi;
 
@@ -27,6 +30,9 @@ pub use extension::{
 pub use transport::{
     ConnectionRequest, OutgoingMessage, SecretString, TransportError, TransportEvent, XmppTransport,
 };
+
+#[cfg(feature = "xmpp-transport")]
+pub use xmpp::TokioXmppTransport;
 
 /// Stable identifier for an XMPP account configured in the client.
 pub type AccountId = u64;
@@ -57,6 +63,26 @@ pub enum ContactPresence {
     DoNotDisturb,
     #[default]
     Offline,
+}
+
+/// Direction of a roster presence subscription as confirmed by the server.
+///
+/// This is an account-local projection of RFC 6121 roster state. Subscription
+/// requests themselves remain transport commands and are not represented as
+/// credentials or raw stanzas in the core.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RosterSubscription {
+    /// Neither side currently receives the other side's presence.
+    #[default]
+    None,
+    /// The local account receives the contact's presence.
+    Inbound,
+    /// The contact receives the local account's presence.
+    Outbound,
+    /// Both sides receive presence updates.
+    Mutual,
+    /// The server has a pending outgoing subscription request.
+    PendingOutbound,
 }
 
 /// Conversation transport topology.
@@ -148,6 +174,7 @@ pub struct Contact {
     pub display_name: String,
     pub presence: ContactPresence,
     pub status: Option<String>,
+    pub subscription: RosterSubscription,
 }
 
 /// A local conversation projection.
@@ -453,27 +480,90 @@ impl MindChatCore {
         presence: ContactPresence,
         status: Option<String>,
     ) -> Result<(), CoreError> {
-        self.accounts
-            .contains_key(&account_id)
-            .then_some(())
-            .ok_or(CoreError::UnknownAccount(account_id))?;
+        self.ensure_account(account_id)?;
         let jid = jid.into();
         validate_jid(&jid)?;
-        let display_name = display_name.into();
-        let display_name = match display_name.trim() {
-            "" => jid.split('@').next().unwrap_or(&jid).to_owned(),
-            value => value.to_owned(),
-        };
-        let status = status.and_then(|value| match value.trim() {
-            "" => None,
-            value => Some(value.to_owned()),
-        });
+        let display_name = normalize_contact_name(display_name.into(), &jid);
+        let status = normalize_status(status);
         self.contacts.insert(
             (account_id, jid.clone()),
-            Contact { account_id, jid, display_name, presence, status },
+            Contact {
+                account_id,
+                jid,
+                display_name,
+                presence,
+                status,
+                subscription: RosterSubscription::None,
+            },
         );
         self.events.push(CoreEvent::RosterChanged(account_id));
         Ok(())
+    }
+
+    /// Applies server-confirmed roster metadata while retaining the most
+    /// recent presence projection for an already-known contact.
+    pub fn sync_roster_contact(
+        &mut self,
+        account_id: AccountId,
+        jid: impl Into<String>,
+        display_name: impl Into<String>,
+        subscription: RosterSubscription,
+    ) -> Result<(), CoreError> {
+        self.ensure_account(account_id)?;
+        let jid = jid.into();
+        validate_jid(&jid)?;
+        let display_name = normalize_contact_name(display_name.into(), &jid);
+        let existing = self.contacts.get(&(account_id, jid.clone()));
+        let presence = existing.map_or(ContactPresence::Offline, |contact| contact.presence);
+        let status = existing.and_then(|contact| contact.status.clone());
+        self.contacts.insert(
+            (account_id, jid.clone()),
+            Contact { account_id, jid, display_name, presence, status, subscription },
+        );
+        self.events.push(CoreEvent::RosterChanged(account_id));
+        Ok(())
+    }
+
+    /// Removes a contact after a server roster removal event.
+    ///
+    /// A removal for an already absent contact is harmless and does not emit a
+    /// redundant UI event.
+    pub fn remove_contact(
+        &mut self,
+        account_id: AccountId,
+        jid: impl Into<String>,
+    ) -> Result<bool, CoreError> {
+        self.ensure_account(account_id)?;
+        let jid = jid.into();
+        validate_jid(&jid)?;
+        let removed = self.contacts.remove(&(account_id, jid)).is_some();
+        if removed {
+            self.events.push(CoreEvent::RosterChanged(account_id));
+        }
+        Ok(removed)
+    }
+
+    /// Updates presence received for an existing roster contact.
+    ///
+    /// Directed presence from a non-roster JID is intentionally ignored so it
+    /// cannot create an unrequested contact projection.
+    pub fn update_contact_presence(
+        &mut self,
+        account_id: AccountId,
+        jid: impl Into<String>,
+        presence: ContactPresence,
+        status: Option<String>,
+    ) -> Result<bool, CoreError> {
+        self.ensure_account(account_id)?;
+        let jid = jid.into();
+        validate_jid(&jid)?;
+        let Some(contact) = self.contacts.get_mut(&(account_id, jid)) else {
+            return Ok(false);
+        };
+        contact.presence = presence;
+        contact.status = normalize_status(status);
+        self.events.push(CoreEvent::RosterChanged(account_id));
+        Ok(true)
     }
 
     /// Applies one normalized event emitted by an XMPP transport adapter.
@@ -503,12 +593,39 @@ impl MindChatCore {
                 )?;
                 Ok(None)
             }
+            TransportEvent::CapabilitiesDiscovered { account_id, capabilities } => {
+                self.set_capabilities(account_id, capabilities)?;
+                Ok(None)
+            }
+            TransportEvent::RosterContactUpsert { account_id, jid, display_name, subscription } => {
+                self.sync_roster_contact(account_id, jid, display_name, subscription)?;
+                Ok(None)
+            }
+            TransportEvent::RosterContactRemoved { account_id, jid } => {
+                self.remove_contact(account_id, jid)?;
+                Ok(None)
+            }
+            TransportEvent::ContactPresenceUpdated { account_id, jid, presence, status } => {
+                self.update_contact_presence(account_id, jid, presence, status)?;
+                Ok(None)
+            }
             TransportEvent::IncomingText {
-                conversation_id,
+                account_id,
+                kind,
+                address,
                 sender,
                 body,
                 received_at_epoch_ms,
-            } => self.receive_text(conversation_id, sender, body, received_at_epoch_ms).map(Some),
+            } => self
+                .receive_transport_text(
+                    account_id,
+                    kind,
+                    address,
+                    sender,
+                    body,
+                    received_at_epoch_ms,
+                )
+                .map(Some),
             TransportEvent::DeliveryUpdated { message_id, state } => {
                 self.set_delivery_state(message_id, state)?;
                 Ok(None)
@@ -752,6 +869,7 @@ impl MindChatCore {
                     account_id,
                     conversation_id: conversation.id,
                     message_id: message.id,
+                    kind: conversation.kind,
                     recipient: conversation.address.clone(),
                     body: message.body.clone(),
                     in_reply_to: message.in_reply_to,
@@ -871,6 +989,56 @@ impl MindChatCore {
             .contains_key(&conversation_id)
             .then_some(())
             .ok_or(CoreError::UnknownConversation(conversation_id))
+    }
+
+    fn ensure_account(&self, account_id: AccountId) -> Result<(), CoreError> {
+        self.accounts
+            .contains_key(&account_id)
+            .then_some(())
+            .ok_or(CoreError::UnknownAccount(account_id))
+    }
+
+    fn receive_transport_text(
+        &mut self,
+        account_id: AccountId,
+        kind: ConversationKind,
+        address: String,
+        sender: String,
+        body: String,
+        received_at_epoch_ms: u64,
+    ) -> Result<MessageId, CoreError> {
+        self.ensure_account(account_id)?;
+        validate_conversation_address(&address)?;
+        let existing_conversation_id = self
+            .conversations
+            .values()
+            .find(|conversation| {
+                conversation.account_id == account_id
+                    && conversation.kind == kind
+                    && conversation.address == address
+            })
+            .map(|conversation| conversation.id);
+        let conversation_id = if let Some(id) = existing_conversation_id {
+            id
+        } else {
+            let id = self.allocate_conversation_id();
+            let title = address.split('@').next().unwrap_or(&address).to_owned();
+            self.conversations.insert(
+                id,
+                Conversation {
+                    id,
+                    account_id,
+                    kind,
+                    address,
+                    title,
+                    unread_count: 0,
+                    last_activity_epoch_ms: received_at_epoch_ms,
+                },
+            );
+            self.events.push(CoreEvent::ConversationChanged(id));
+            id
+        };
+        self.receive_text(conversation_id, sender, body, received_at_epoch_ms)
     }
 
     fn local_sender_for_conversation(
@@ -1039,7 +1207,13 @@ fn validate_jid(jid: &str) -> Result<(), CoreError> {
     let mut split = jid.split('@');
     let local = split.next().unwrap_or_default();
     let domain = split.next().unwrap_or_default();
-    if local.trim().is_empty() || domain.trim().is_empty() || split.next().is_some() {
+    if local.trim().is_empty()
+        || domain.trim().is_empty()
+        || local.contains(char::is_whitespace)
+        || domain.contains(char::is_whitespace)
+        || domain.contains('/')
+        || split.next().is_some()
+    {
         return Err(CoreError::InvalidJid);
     }
     Ok(())
@@ -1053,6 +1227,20 @@ fn validate_server(server: &str) -> Result<(), CoreError> {
 
 fn validate_conversation_address(address: &str) -> Result<(), CoreError> {
     validate_jid(address).map_err(|_| CoreError::InvalidConversationAddress)
+}
+
+fn normalize_contact_name(display_name: String, jid: &str) -> String {
+    match display_name.trim() {
+        "" => jid.split('@').next().unwrap_or(jid).to_owned(),
+        value => value.to_owned(),
+    }
+}
+
+fn normalize_status(status: Option<String>) -> Option<String> {
+    status.and_then(|value| match value.trim() {
+        "" => None,
+        value => Some(value.to_owned()),
+    })
 }
 
 fn validate_body(body: String) -> Result<String, CoreError> {
@@ -1121,6 +1309,10 @@ mod tests {
             core.add_account(AccountSetup::new("alice@example.org", "bad host", "Alice")),
             Err(CoreError::InvalidServer)
         );
+        assert_eq!(
+            core.add_account(AccountSetup::new("alice@example.org/mobile", "example.org", "Alice")),
+            Err(CoreError::InvalidJid)
+        );
     }
 
     #[test]
@@ -1167,6 +1359,7 @@ mod tests {
                 display_name: "bob".to_owned(),
                 presence: ContactPresence::Away,
                 status: None,
+                subscription: RosterSubscription::None,
             }]
         );
         assert_eq!(core.contacts(mila)[0].display_name, "Bobby");
@@ -1196,6 +1389,54 @@ mod tests {
             core.upsert_contact(account_id, "not-a-jid", "Bob", ContactPresence::Offline, None),
             Err(CoreError::InvalidJid)
         );
+    }
+
+    #[test]
+    fn server_roster_and_presence_events_preserve_subscription_state() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        core.drain_events();
+
+        core.apply_transport_event(TransportEvent::RosterContactUpsert {
+            account_id,
+            jid: "bob@example.org".to_owned(),
+            display_name: " Bob ".to_owned(),
+            subscription: RosterSubscription::Mutual,
+        })
+        .expect("roster item");
+        core.apply_transport_event(TransportEvent::ContactPresenceUpdated {
+            account_id,
+            jid: "bob@example.org".to_owned(),
+            presence: ContactPresence::DoNotDisturb,
+            status: Some(" Busy ".to_owned()),
+        })
+        .expect("presence item");
+        core.apply_transport_event(TransportEvent::ContactPresenceUpdated {
+            account_id,
+            jid: "directed@example.org".to_owned(),
+            presence: ContactPresence::Online,
+            status: None,
+        })
+        .expect("directed presence is ignored");
+
+        assert_eq!(
+            core.contacts(account_id),
+            vec![Contact {
+                account_id,
+                jid: "bob@example.org".to_owned(),
+                display_name: "Bob".to_owned(),
+                presence: ContactPresence::DoNotDisturb,
+                status: Some("Busy".to_owned()),
+                subscription: RosterSubscription::Mutual,
+            }]
+        );
+
+        core.apply_transport_event(TransportEvent::RosterContactRemoved {
+            account_id,
+            jid: "bob@example.org".to_owned(),
+        })
+        .expect("roster removal");
+        assert!(core.contacts(account_id).is_empty());
     }
 
     #[test]
@@ -1301,6 +1542,45 @@ mod tests {
     }
 
     #[test]
+    fn addressed_incoming_text_creates_the_direct_conversation_once() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        core.drain_events();
+
+        let first = core
+            .apply_transport_event(TransportEvent::IncomingText {
+                account_id,
+                kind: ConversationKind::Direct,
+                address: "bob@example.org".to_owned(),
+                sender: "bob@example.org".to_owned(),
+                body: "first".to_owned(),
+                received_at_epoch_ms: 10,
+            })
+            .expect("incoming text")
+            .expect("message ID");
+        let second = core
+            .apply_transport_event(TransportEvent::IncomingText {
+                account_id,
+                kind: ConversationKind::Direct,
+                address: "bob@example.org".to_owned(),
+                sender: "bob@example.org".to_owned(),
+                body: "second".to_owned(),
+                received_at_epoch_ms: 20,
+            })
+            .expect("incoming text")
+            .expect("message ID");
+
+        let conversations = core.conversations(account_id);
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].title, "bob");
+        assert_eq!(conversations[0].unread_count, 2);
+        assert_eq!(
+            core.messages(conversations[0].id).iter().map(|message| message.id).collect::<Vec<_>>(),
+            [first, second]
+        );
+    }
+
+    #[test]
     fn snapshot_round_trip_keeps_stable_ids() {
         let mut original = MindChatCore::default();
         let account_id = account(&mut original);
@@ -1350,7 +1630,9 @@ mod tests {
         );
         let incoming_id = core
             .apply_transport_event(TransportEvent::IncomingText {
-                conversation_id,
+                account_id,
+                kind: ConversationKind::Direct,
+                address: "bob@example.org".to_owned(),
                 sender: "bob@example.org".to_owned(),
                 body: "received".to_owned(),
                 received_at_epoch_ms: 3,

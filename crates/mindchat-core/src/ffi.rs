@@ -8,9 +8,13 @@
 use crate::{
     AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
     DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
+    RosterSubscription, SecretString, TokioXmppTransport, TransportCoordinator,
+    TransportCoordinatorError, TransportError,
 };
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+
+const MAX_TRANSPORT_EVENTS_PER_POLL: u32 = 128;
 
 /// State of an XMPP account as rendered by the platform UI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -70,6 +74,40 @@ impl From<FfiContactPresence> for ContactPresence {
             FfiContactPresence::Away => Self::Away,
             FfiContactPresence::DoNotDisturb => Self::DoNotDisturb,
             FfiContactPresence::Offline => Self::Offline,
+        }
+    }
+}
+
+/// Server-confirmed roster subscription state for a contact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum FfiRosterSubscription {
+    None,
+    Inbound,
+    Outbound,
+    Mutual,
+    PendingOutbound,
+}
+
+impl From<RosterSubscription> for FfiRosterSubscription {
+    fn from(value: RosterSubscription) -> Self {
+        match value {
+            RosterSubscription::None => Self::None,
+            RosterSubscription::Inbound => Self::Inbound,
+            RosterSubscription::Outbound => Self::Outbound,
+            RosterSubscription::Mutual => Self::Mutual,
+            RosterSubscription::PendingOutbound => Self::PendingOutbound,
+        }
+    }
+}
+
+impl From<FfiRosterSubscription> for RosterSubscription {
+    fn from(value: FfiRosterSubscription) -> Self {
+        match value {
+            FfiRosterSubscription::None => Self::None,
+            FfiRosterSubscription::Inbound => Self::Inbound,
+            FfiRosterSubscription::Outbound => Self::Outbound,
+            FfiRosterSubscription::Mutual => Self::Mutual,
+            FfiRosterSubscription::PendingOutbound => Self::PendingOutbound,
         }
     }
 }
@@ -232,6 +270,7 @@ pub struct FfiContact {
     pub display_name: String,
     pub presence: FfiContactPresence,
     pub status: Option<String>,
+    pub subscription: FfiRosterSubscription,
 }
 
 /// A direct chat or MUC projection safe for display in the Android UI.
@@ -308,6 +347,8 @@ pub enum MindChatBindingError {
     InvalidInput { detail: String },
     NotFound { detail: String },
     CapabilityUnavailable { capability: FfiProtocolCapability },
+    AuthenticationFailed,
+    ConnectionFailed { detail: String },
     Internal { detail: String },
 }
 
@@ -316,10 +357,12 @@ impl fmt::Display for MindChatBindingError {
         match self {
             Self::InvalidInput { detail }
             | Self::NotFound { detail }
+            | Self::ConnectionFailed { detail }
             | Self::Internal { detail } => formatter.write_str(detail),
             Self::CapabilityUnavailable { capability } => {
                 write!(formatter, "capability unavailable: {capability:?}")
             }
+            Self::AuthenticationFailed => formatter.write_str("authentication failed"),
         }
     }
 }
@@ -346,18 +389,41 @@ impl From<CoreError> for MindChatBindingError {
     }
 }
 
+impl From<TransportError> for MindChatBindingError {
+    fn from(value: TransportError) -> Self {
+        match value {
+            TransportError::AuthenticationFailed => Self::AuthenticationFailed,
+            TransportError::ConnectionFailed(detail) => Self::ConnectionFailed { detail },
+            TransportError::ProtocolViolation(detail) => Self::InvalidInput { detail },
+            TransportError::Unsupported(detail) => Self::Internal { detail },
+        }
+    }
+}
+
+impl From<TransportCoordinatorError> for MindChatBindingError {
+    fn from(value: TransportCoordinatorError) -> Self {
+        match value {
+            TransportCoordinatorError::Core(error) => error.into(),
+            TransportCoordinatorError::Transport(error) => error.into(),
+        }
+    }
+}
+
 /// Thread-safe owner for a Rust core instance.
 ///
 /// Kotlin never receives the inner state machine. Every mutation is validated
 /// in Rust and the result is rendered from immutable snapshots.
 #[derive(uniffi::Object)]
 pub struct MindChatCoreHandle {
-    core: Mutex<MindChatCore>,
+    session: Mutex<TransportCoordinator<TokioXmppTransport>>,
 }
 
 impl MindChatCoreHandle {
-    fn lock(&self) -> Result<MutexGuard<'_, MindChatCore>, MindChatBindingError> {
-        self.core.lock().map_err(|_| MindChatBindingError::Internal {
+    fn lock(
+        &self,
+    ) -> Result<MutexGuard<'_, TransportCoordinator<TokioXmppTransport>>, MindChatBindingError>
+    {
+        self.session.lock().map_err(|_| MindChatBindingError::Internal {
             detail: "MindChat core lock was poisoned".to_owned(),
         })
     }
@@ -365,13 +431,19 @@ impl MindChatCoreHandle {
 
 #[uniffi::export]
 impl MindChatCoreHandle {
-    /// Creates an empty local core. Account credentials are intentionally not
-    /// accepted here; a future Android credential flow hands them only to the
-    /// XMPP transport boundary.
+    /// Creates an empty local core and a concrete internal XMPP session.
+    ///
+    /// Account credentials are accepted only by [`Self::connect_account`],
+    /// never stored in the core snapshot, and never returned through this API.
     #[uniffi::constructor]
     #[must_use]
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { core: Mutex::new(MindChatCore::default()) })
+        Arc::new(Self {
+            session: Mutex::new(TransportCoordinator::new(
+                MindChatCore::default(),
+                TokioXmppTransport::new(),
+            )),
+        })
     }
 
     /// Adds an account configuration after basic JID and server validation.
@@ -381,7 +453,10 @@ impl MindChatCoreHandle {
         server: String,
         display_name: String,
     ) -> Result<u64, MindChatBindingError> {
-        self.lock()?.add_account(AccountSetup::new(jid, server, display_name)).map_err(Into::into)
+        self.lock()?
+            .core_mut()
+            .add_account(AccountSetup::new(jid, server, display_name))
+            .map_err(Into::into)
     }
 
     /// Updates the visible connection state for an account.
@@ -390,7 +465,7 @@ impl MindChatCoreHandle {
         account_id: u64,
         state: FfiConnectionState,
     ) -> Result<(), MindChatBindingError> {
-        self.lock()?.set_connection_state(account_id, state.into()).map_err(Into::into)
+        self.lock()?.core_mut().set_connection_state(account_id, state.into()).map_err(Into::into)
     }
 
     /// Replaces the server features discovered for an account.
@@ -400,6 +475,7 @@ impl MindChatCoreHandle {
         capabilities: Vec<FfiProtocolCapability>,
     ) -> Result<(), MindChatBindingError> {
         self.lock()?
+            .core_mut()
             .set_capabilities(account_id, capabilities.into_iter().map(Into::into))
             .map_err(Into::into)
     }
@@ -414,6 +490,7 @@ impl MindChatCoreHandle {
         status: Option<String>,
     ) -> Result<(), MindChatBindingError> {
         self.lock()?
+            .core_mut()
             .upsert_contact(account_id, jid, display_name, presence.into(), status)
             .map_err(Into::into)
     }
@@ -428,6 +505,7 @@ impl MindChatCoreHandle {
         now_epoch_ms: u64,
     ) -> Result<u64, MindChatBindingError> {
         self.lock()?
+            .core_mut()
             .open_conversation(account_id, kind.into(), address, title, now_epoch_ms)
             .map_err(Into::into)
     }
@@ -442,6 +520,7 @@ impl MindChatCoreHandle {
         now_epoch_ms: u64,
     ) -> Result<u64, MindChatBindingError> {
         self.lock()?
+            .core_mut()
             .send_text(conversation_id, sender, body, in_reply_to, now_epoch_ms)
             .map_err(Into::into)
     }
@@ -454,7 +533,10 @@ impl MindChatCoreHandle {
         body: String,
         now_epoch_ms: u64,
     ) -> Result<u64, MindChatBindingError> {
-        self.lock()?.receive_text(conversation_id, sender, body, now_epoch_ms).map_err(Into::into)
+        self.lock()?
+            .core_mut()
+            .receive_text(conversation_id, sender, body, now_epoch_ms)
+            .map_err(Into::into)
     }
 
     /// Adds a reaction to a message.
@@ -464,22 +546,83 @@ impl MindChatCoreHandle {
         actor: String,
         emoji: String,
     ) -> Result<u64, MindChatBindingError> {
-        self.lock()?.add_reaction(message_id, actor, emoji).map_err(Into::into)
+        self.lock()?.core_mut().add_reaction(message_id, actor, emoji).map_err(Into::into)
     }
 
     /// Clears a conversation's unread count.
     pub fn mark_conversation_read(&self, conversation_id: u64) -> Result<(), MindChatBindingError> {
-        self.lock()?.mark_conversation_read(conversation_id).map_err(Into::into)
+        self.lock()?.core_mut().mark_conversation_read(conversation_id).map_err(Into::into)
+    }
+
+    /// Starts a concrete XMPP session for an existing account.
+    ///
+    /// The password is handed directly to the active Rust worker and is not
+    /// retained by the domain core, snapshots, or event stream.
+    pub fn connect_account(
+        &self,
+        account_id: u64,
+        password: String,
+    ) -> Result<(), MindChatBindingError> {
+        if password.is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a password is required".to_owned(),
+            });
+        }
+        self.lock()?.connect(account_id, SecretString::new(password)).map_err(Into::into)
+    }
+
+    /// Stops an active XMPP session and projects the account as offline.
+    pub fn disconnect_account(&self, account_id: u64) -> Result<(), MindChatBindingError> {
+        self.lock()?.disconnect(account_id).map_err(Into::into)
+    }
+
+    /// Applies up to `max_events` normalized transport events to the core.
+    ///
+    /// The bound prevents a busy server from monopolizing the Kotlin caller;
+    /// pass zero to perform no work, and values above 128 are clamped.
+    pub fn poll_transport_events(&self, max_events: u32) -> Result<u32, MindChatBindingError> {
+        let mut session = self.lock()?;
+        let limit = max_events.min(MAX_TRANSPORT_EVENTS_PER_POLL);
+        let mut applied = 0;
+        while applied < limit {
+            if !session.poll_next_event().map_err(MindChatBindingError::from)? {
+                break;
+            }
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
+    /// Sends queued or retryable text for an online account in stable message order.
+    ///
+    /// Offline and connecting accounts keep their queue untouched and return
+    /// zero, so Android can safely invoke this after each polling pass.
+    pub fn flush_outbox(&self, account_id: u64) -> Result<u32, MindChatBindingError> {
+        let mut session = self.lock()?;
+        let connection_state = session
+            .core()
+            .accounts()
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.connection_state)
+            .ok_or(CoreError::UnknownAccount(account_id))?;
+        if connection_state != ConnectionState::Online {
+            return Ok(0);
+        }
+        session
+            .flush_outbox(account_id)
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(Into::into)
     }
 
     /// Returns all UI-safe state in stable identifier order.
     pub fn snapshot(&self) -> Result<FfiCoreSnapshot, MindChatBindingError> {
-        Ok(self.lock()?.snapshot().into())
+        Ok(self.lock()?.core().snapshot().into())
     }
 
     /// Drains state-change notifications in mutation order.
     pub fn drain_events(&self) -> Result<Vec<FfiCoreEvent>, MindChatBindingError> {
-        Ok(self.lock()?.drain_events().into_iter().map(Into::into).collect())
+        Ok(self.lock()?.core_mut().drain_events().into_iter().map(Into::into).collect())
     }
 }
 
@@ -523,6 +666,7 @@ impl From<crate::Contact> for FfiContact {
             display_name: value.display_name,
             presence: value.presence.into(),
             status: value.status,
+            subscription: value.subscription.into(),
         }
     }
 }
@@ -664,6 +808,7 @@ mod tests {
         assert_eq!(snapshot.contacts[0].jid, "bob@example.org");
         assert_eq!(snapshot.contacts[0].presence, FfiContactPresence::Online);
         assert_eq!(snapshot.contacts[0].status.as_deref(), Some("Available"));
+        assert_eq!(snapshot.contacts[0].subscription, FfiRosterSubscription::None);
         assert_eq!(
             core.drain_events().expect("events"),
             vec![FfiCoreEvent::RosterChanged { account_id }]
@@ -676,6 +821,29 @@ mod tests {
         assert_eq!(
             core.add_account("invalid".to_owned(), "example.org".to_owned(), "Alice".to_owned()),
             Err(MindChatBindingError::InvalidInput { detail: "a full JID is required".to_owned() })
+        );
+    }
+
+    #[test]
+    fn bridge_rejects_empty_passwords_before_starting_a_transport_worker() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        assert_eq!(
+            core.connect_account(account_id, String::new()),
+            Err(MindChatBindingError::InvalidInput { detail: "a password is required".to_owned() })
+        );
+        assert_eq!(core.poll_transport_events(0).expect("zero poll"), 0);
+        assert_eq!(
+            core.snapshot().expect("snapshot").accounts[0].connection_state,
+            FfiConnectionState::Offline
         );
     }
 }

@@ -5,7 +5,7 @@
     <string name="add_contact">Добавить контакт</string>
     <string name="contact_jid">JID контакта</string>
     <string name="no_contacts">Контактов пока нет</string>
-    <string name="no_contacts_summary">Добавьте контакт локально, пока синхронизация списка контактов недоступна.</string>
+    <string name="no_contacts_summary">Контакты с сервера появятся здесь после синхронизации.</string>
     <string name="settings">Настройки</string>
     <string name="new_chat">Новый чат</string>
     <string name="conversation_address">Адрес контакта или комнаты</string>
@@ -19,6 +19,12 @@
     <string name="account_jid">JID</string>
     <string name="server">Сервер</string>
     <string name="display_name">Имя</string>
+    <string name="password">Пароль</string>
+    <string name="account_connection_error">Проверьте настройки аккаунта и пароль, затем повторите попытку.</string>
+    <string name="connection_offline">Не в сети</string>
+    <string name="connection_connecting">Подключение</string>
+    <string name="connection_online">В сети</string>
+    <string name="connection_failed">Ошибка подключения</string>
     <string name="cancel">Отмена</string>
     <string name="save">Сохранить</string>
     <string name="type_message">Введите сообщение</string>

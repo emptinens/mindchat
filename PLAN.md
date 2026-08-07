@@ -57,17 +57,27 @@ layout density and navigation are retained.
 - Foundation is implemented: the Android Compose shell, Russian and English
   resources, adaptive Material 3 theming, Rust state model, generated UniFFI
   Kotlin binding, ABI packaging, linting, and CI all build from this workspace.
-- The Rust core now includes an internal `TransportCoordinator`: it accepts a
-  transport adapter, holds connection passwords only for the connect call,
-  projects normalized connection/incoming/receipt events, and retries pending
-  or failed outgoing text after a snapshot restore. Optional XMPP capabilities
-  start unavailable and become usable only after service discovery projects
-  them into the account. This is an internal adapter boundary, not an XMPP
-  implementation yet.
-- The Rust snapshot and UniFFI contract include account-scoped local roster
-  contacts with normalized display names, presence/status projections, and
-  roster-change events. Android renders that roster and can add a local contact;
-  XMPP roster subscription and synchronization are still transport work.
+- The Rust core now includes `TokioXmppTransport`, a concrete internal
+  `tokio-xmpp` adapter behind `TransportCoordinator`. It starts encrypted
+  StartTLS sessions through SRV discovery or an explicit host/port, keeps all
+  Tokio/XML/TLS types outside the domain and UniFFI contracts, sends direct
+  text, projects incoming direct messages, and keeps retryable outgoing text
+  in stable order after a snapshot restore. The core does not retain a password;
+  the active transport worker owns the credential needed for its authenticated
+  session and reconnect attempts.
+- Initial XEP-0030 discovery projects advertised capabilities, including stream
+  management when present in stream features. The concrete adapter requests the
+  roster on each online transition, acknowledges roster pushes, projects roster
+  add/change/removal events, and maps contact presence/status. Contact snapshots
+  now preserve server-confirmed subscription direction. The Android account
+  form accepts a password only in non-saveable UI memory, hands it directly to
+  the native session startup call, and then clears the form when startup is
+  accepted. The Rust-owned session's event polling and queued-outbox flushing
+  run from an Android lifecycle-bound IO coroutine; its snapshots update
+  connection, roster, incoming-message, and queued-outbox projections on the
+  Compose dispatcher.
+  Credentials are not persisted. Server-side subscribe / unsubscribe commands,
+  account registration, and reconnect credential UX remain protocol work.
 - Customization choices (system colors, layout density, and app-lock preference)
   are persisted locally as non-sensitive Android preferences. The optional app
   lock uses AndroidX `BiometricPrompt` with biometric or device-credential
@@ -79,8 +89,10 @@ layout density and navigation are retained.
   ID-only event projections. It has no package parser, runtime, catalog, or
   third-party code loader; see `docs/EXTENSIONS.md` for the contract.
 - The remaining protocol, encrypted persistence, OMEMO, push, and plugin-runtime
-  work remains in milestones 2–5; the current app does not connect to an XMPP
-  server.
+  work remains in milestones 2–5. Packaged Android builds now use the native
+  credential/session boundary for newly configured accounts; account and message
+  persistence are still intentionally absent, so credentials are re-entered
+  after a process restart.
 
 ## Acceptance and verification
 

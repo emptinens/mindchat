@@ -5,7 +5,7 @@
     <string name="add_contact">Add contact</string>
     <string name="contact_jid">Contact JID</string>
     <string name="no_contacts">No contacts yet</string>
-    <string name="no_contacts_summary">Add a contact locally while roster synchronization is unavailable.</string>
+    <string name="no_contacts_summary">Your server contacts appear here after synchronization.</string>
     <string name="settings">Settings</string>
     <string name="new_chat">New chat</string>
     <string name="conversation_address">Contact or room address</string>
@@ -19,6 +19,12 @@
     <string name="account_jid">JID</string>
     <string name="server">Server</string>
     <string name="display_name">Display name</string>
+    <string name="password">Password</string>
+    <string name="account_connection_error">Check the account settings and password, then try again.</string>
+    <string name="connection_offline">Offline</string>
+    <string name="connection_connecting">Connecting</string>
+    <string name="connection_online">Online</string>
+    <string name="connection_failed">Connection failed</string>
     <string name="cancel">Cancel</string>
     <string name="save">Save</string>
     <string name="type_message">Type a message</string>
