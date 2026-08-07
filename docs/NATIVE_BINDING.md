@@ -38,6 +38,9 @@ native binaries are committed to the repository.
 - Rust owns account/session state, protocol feature discovery, normalized
   transport-event projection, reconnect-safe outgoing text queues, OMEMO
   session state, and encrypted storage access.
+- The internal extension manifest and permission policy remain Rust-only. They
+  are not a UniFFI plugin ABI and do not load third-party code; see
+  [EXTENSIONS.md](EXTENSIONS.md).
 
 `TransportCoordinator<T>` is an internal Rust-only helper that joins a
 `MindChatCore` with an `XmppTransport` implementation. It is intentionally not

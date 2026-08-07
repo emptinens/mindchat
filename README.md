@@ -15,12 +15,17 @@ This repository contains a runnable foundation:
 - UniFFI-generated Kotlin contract and Android ABI build pipeline;
 - local persistence for non-sensitive appearance and interaction preferences;
 - optional biometric/device-credential app gate with secure-window handling;
+- internal extension manifest and permission policy for future sandboxed
+  customization, without a third-party code loader;
 - unit tests for the Rust state machine and CI for formatting, linting, and tests.
 
 The XMPP transport implementation, encrypted SQLCipher persistence, OMEMO,
 UnifiedPush integration, and plugin runtime remain explicit follow-up milestones
 described in [PLAN.md](PLAN.md). The native core currently validates, queues,
 and projects local state; it does not yet connect to an XMPP server.
+
+The pre-runtime extension contract is described in
+[docs/EXTENSIONS.md](docs/EXTENSIONS.md).
 
 ## Local checks
 

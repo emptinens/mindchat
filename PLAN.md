@@ -45,9 +45,11 @@ layout density and navigation are retained.
    Keystore-wrapped storage keys, optional biometric lock, UnifiedPush endpoint
    registration, and background-sync degradation when a distributor is absent.
 5. **Extension readiness** — stabilize internal command/event/capability
-   boundaries. A subsequent project supplies the plugin manifest, permission
-   model, sandbox, SDK, documentation, signing, and catalog. No third-party
-   plugin loader belongs in the base release.
+   boundaries. The core now has a data-only manifest, narrowly scoped
+   permissions, ID-only event filtering, and policy-mediated commands with
+   account-owned attribution. A subsequent project supplies package parsing,
+   sandboxing, user consent, SDK, documentation, signing, revocation, and a
+   catalog. No third-party plugin loader belongs in the base release.
 
 ## Current implementation baseline
 
@@ -67,6 +69,10 @@ layout density and navigation are retained.
   authentication, locks on return from the background, and enables Android's
   secure-window flag while configured; it stores no authentication material.
   No account credentials, message content, or OMEMO material is stored there.
+- Extension readiness is implemented only as an internal Rust policy boundary:
+  validated reverse-domain manifest metadata, scoped command permissions, and
+  ID-only event projections. It has no package parser, runtime, catalog, or
+  third-party code loader; see `docs/EXTENSIONS.md` for the contract.
 - The remaining protocol, encrypted persistence, OMEMO, push, and plugin-runtime
   work remains in milestones 2–5; the current app does not connect to an XMPP
   server.
