@@ -1,6 +1,5 @@
 package com.mindchat.app
 
-import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -51,10 +50,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -72,6 +67,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.mindchat.app.theme.MindChatTheme
 import kotlinx.coroutines.delay
 
 private enum class Destination {
@@ -90,23 +86,13 @@ fun MindChatApp(appLockHost: AppLockHost? = null) {
 @Composable
 private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
     val state = gateway.state
-    val context = LocalContext.current
     LaunchedEffect(gateway) {
         while (true) {
             gateway.pollTransport()
             delay(750)
         }
     }
-    val colors = when {
-        state.dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S ->
-            if (androidx.compose.foundation.isSystemInDarkTheme()) dynamicDarkColorScheme(context)
-            else dynamicLightColorScheme(context)
-
-        androidx.compose.foundation.isSystemInDarkTheme() -> darkColorScheme()
-        else -> lightColorScheme()
-    }
-
-    MaterialTheme(colorScheme = colors) {
+    MindChatTheme(dynamicColor = state.dynamicColor) {
         Surface(modifier = Modifier.fillMaxSize()) {
             if (appLockHost?.appLockState?.blocksContent == true) {
                 AppLockedScreen(
