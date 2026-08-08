@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MindChat — Project Dashboard</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#161a22; --panel2:#1c212c; --ink:#e8eaed; --mut:#96a0b0;
+    --line:#242a36; --acc:#6c8cff; --ok:#4ade80; --warn:#fbbf24; --bad:#f87171; --dim:#5b6472;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html { -webkit-text-size-adjust:100%; }
+  body { background:var(--bg); color:var(--ink); font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1080px; margin:0 auto; padding:48px 24px 90px; }
+
+  header.hero { padding-bottom:26px; border-bottom:1px solid var(--line); margin-bottom:34px; }
+  .kicker { font-size:11px; letter-spacing:.18em; text-transform:uppercase; color:var(--mut); }
+  h1 { font-size:31px; font-weight:700; letter-spacing:-.02em; margin:8px 0 10px; }
+  .sub { color:var(--mut); max-width:66ch; }
+  .meta { display:flex; flex-wrap:wrap; gap:8px 24px; margin-top:16px; font-size:12.5px; color:var(--mut); }
+  .meta b { color:var(--ink); font-weight:600; }
+
+  section { margin:42px 0; }
+  h2 { font-size:12px; font-weight:650; letter-spacing:.14em; text-transform:uppercase; color:var(--mut); margin-bottom:16px; }
+  h2 .n { color:var(--acc); margin-right:8px; }
+
+  .grid { display:grid; gap:14px; }
+  .g4 { grid-template-columns:repeat(4,1fr); }
+  .g2 { grid-template-columns:repeat(2,1fr); }
+  @media (max-width:860px){ .g4{grid-template-columns:repeat(2,1fr);} .g2{grid-template-columns:1fr;} }
+
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:18px 20px; }
+  .stat .v { font-size:27px; font-weight:700; letter-spacing:-.02em; font-variant-numeric:tabular-nums; }
+  .stat .l { font-size:12px; color:var(--mut); margin-top:2px; }
+  .stat .d { font-size:11.5px; color:var(--dim); margin-top:6px; }
+
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; font-weight:600; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--mut); padding:8px 10px; border-bottom:1px solid var(--ink); }
+  td { padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr:last-child td { border-bottom:none; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td .mini { display:block; height:3px; border-radius:2px; background:#262d3a; margin-top:4px; overflow:hidden; }
+  td .mini i { display:block; height:100%; background:var(--acc); }
+
+  .pill { display:inline-block; font-size:10.5px; font-weight:600; letter-spacing:.04em; padding:2px 8px; border-radius:999px; white-space:nowrap; }
+  .pill.ok   { background:rgba(74,222,128,.12);  color:var(--ok); }
+  .pill.warn { background:rgba(251,191,36,.12);  color:var(--warn); }
+  .pill.bad  { background:rgba(248,113,113,.12); color:var(--bad); }
+  .pill.mut  { background:rgba(91,98,114,.18);   color:var(--mut); }
+  .pill.acc  { background:rgba(108,140,255,.12); color:var(--acc); }
+
+  .bar { height:8px; border-radius:4px; background:#262d3a; overflow:hidden; margin:6px 0 10px; }
+  .bar > i { display:block; height:100%; background:var(--acc); border-radius:4px; }
+  .mstone { margin-bottom:20px; }
+  .mstone:last-child { margin-bottom:0; }
+  .mstone .row { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+  .mstone .t { font-weight:600; font-size:14px; }
+  .mstone .pct { font-variant-numeric:tabular-nums; font-size:13px; color:var(--mut); }
+  .mstone .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+
+  .chart { display:flex; align-items:flex-end; gap:12px; height:170px; padding-top:8px; }
+  .chart .col { flex:1; display:flex; flex-direction:column; align-items:center; gap:6px; min-width:0; }
+  .chart .col .cbar { width:100%; height:120px; display:flex; align-items:flex-end; }
+  .chart .col .cbar i { display:block; width:100%; border-radius:4px 4px 0 0; min-height:2px; transition:height .4s ease; }
+  .chart .col .val { font-size:11px; color:var(--ink); font-variant-numeric:tabular-nums; }
+  .chart .col .lb { font-size:10px; color:var(--mut); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%; }
+
+  .donut { display:flex; align-items:center; gap:20px; }
+  .legend { display:flex; flex-direction:column; gap:7px; font-size:12.5px; color:var(--mut); }
+  .legend .row { display:flex; align-items:center; gap:8px; }
+  .legend .sw { width:10px; height:10px; border-radius:3px; flex:none; }
+  .legend b { color:var(--ink); font-variant-numeric:tabular-nums; }
+
+  .flow { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-size:12.5px; }
+  .flow .node { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:9px 13px; }
+  .flow .node b { display:block; font-size:12.5px; }
+  .flow .node span { color:var(--mut); font-size:11px; }
+  .flow .arrow { color:var(--dim); font-size:15px; flex:none; }
+  .flow + .flow { margin-top:12px; }
+
+  .risks { list-style:none; }
+  .risks li { display:flex; gap:10px; margin:10px 0; font-size:13px; color:var(--mut); }
+  .risks li:first-child { margin-top:0; }
+  .risks .ix { color:var(--acc); font-variant-numeric:tabular-nums; font-weight:600; flex:none; }
+  .risks b { color:var(--ink); }
+
+  footer { margin-top:54px; padding-top:18px; border-top:1px solid var(--line); font-size:11.5px; color:var(--dim); }
+  @media print { body{background:#fff;color:#000;} .card{border-color:#ddd;background:#fff;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="kicker">MindChat · Android XMPP client</div>
+    <h1>Project dashboard</h1>
+    <p class="sub">Kotlin + Jetpack Compose shell, Rust domain core за UniFFI, Tokio/XMPP транспорт. Состояние на 2026-08-08.</p>
+    <div class="meta" id="heroMeta"></div>
+  </header>
+
+  <section id="stats"><h2><span class="n">01</span>Ключевые метрики</h2><div class="grid g4" id="statCards"></div></section>
+
+  <section id="arch"><h2><span class="n">02</span>Архитектура и потоки данных</h2>
+    <div class="card"><div class="flow" id="flow"></div><div class="flow" id="flow2"></div></div>
+  </section>
+
+  <section id="milestones"><h2><span class="n">03</span>Вехи (PLAN.md)</h2><div class="card" id="mstones"></div></section>
+
+  <section id="modules"><h2><span class="n">04</span>Модули</h2><div class="card" id="moduleTable"></div></section>
+
+  <section id="xeps"><h2><span class="n">05</span>Протокол: XMPP / XEP</h2><div class="card" id="xepTable"></div></section>
+
+  <section id="tests"><h2><span class="n">06</span>Тесты</h2><div class="grid g2">
+    <div class="card"><div class="chart" id="testChart"></div></div>
+    <div class="card"><div class="donut" id="testDonut"></div></div>
+  </div></section>
+
+  <section id="versions"><h2><span class="n">07</span>Версии инструментов</h2><div class="card" id="versionTable"></div></section>
+
+  <section id="risks"><h2><span class="n">08</span>Риски</h2><div class="card"><ul class="risks" id="riskList"></ul></div></section>
+
+  <footer>MindChat · сгенерировано 2026-08-08 · данные: docs/consolidated-report.md (4 исследовательских отчёта, проверка исходников, cargo test)</footer>
+</div>
+
+<script>
+const D = {
+  meta: [["Rust core","4041 LOC"],["Kotlin shell","1947 LOC"],["Тесты","43"],["Строки ru/en","51/51"],["ABIs","3"],["Milestone 1","100%"]],
+  stats: [
+    {v:"4041", l:"Rust LOC", d:"lib 1857 · xmpp 722 · ffi 849 · ext 463 · transport 150"},
+    {v:"1947", l:"Kotlin LOC", d:"6 файлов main + 150 строк тестов"},
+    {v:"43", l:"Тестов всего", d:"33 Rust + 6 unit + 4 instrumented"},
+    {v:"33/33", l:"Rust-тесты проходят", d:"29 default · 33 all-features, cargo test"},
+    {v:"51/51", l:"Строки en/ru", d:"наборы ключей идентичны"},
+    {v:"3", l:"ABIs", d:"arm64-v8a · armeabi-v7a · x86_64"},
+    {v:"17", l:"FFI-функций", d:"MindChatCoreHandle + version fn"},
+    {v:"26", l:"minSdk", d:"Android 8+, target/compile 36"},
+  ],
+  flow: [
+    ["Compose UI","23 composable, 5 экранов"],
+    ["MindChatGateway","native-адаптер + snapshot-remap"],
+    ["UniFFI","контракт из 17 функций"],
+    ["MindChatCore","state machine, 16 типов"],
+    ["TransportCoordinator","connect / flush / poll"],
+    ["TokioXmppTransport","StartTLS + SRV, поток на аккаунт"],
+  ],
+  flow2: [
+    ["XMPP server","starttls + disco#info + roster"],
+    ["TransportEvent","8 вариантов, mpsc"],
+    ["MindChatCore","8 проекций событий"],
+    ["CoreEvent","5 ID-only событий"],
+    ["FfiCoreEvent","5 событий"],
+    ["UI snapshot","poll 750 мс → Compose"],
+  ],
+  mstones: [
+    { t:"M1 · Foundation", pct:100, items:[["done","Workspace + shell"],["done","Rust state core"],["done","FFI-контракт"],["done","CI + lint + fixtures"],["done","Локализация 51/51"],["done","A11y + no-telemetry"]] },
+    { t:"M2 · Protocol + persistence", pct:55, items:[["done","StartTLS + SRV"],["done","XEP-0030"],["done","Логин + ростер"],["partial","MUC"],["partial","Stream Management"],["missing","Регистрация"],["missing","MAM"],["missing","SQLCipher БД"],["missing","Медиа-хранилище"]] },
+    { t:"M3 · Messaging", pct:33, items:[["done","Outgoing queue"],["partial","HTTP upload"],["partial","Receipts"],["partial","Reactions"],["partial","Replies"],["missing","Markers"],["missing","Typing"],["missing","Corrections"],["missing","Shared pins"]] },
+    { t:"M4 · Security + background", pct:20, items:[["done","Биометрический лок"],["missing","OMEMO"],["missing","Keystore-ключи"],["missing","UnifiedPush"],["missing","Фоновая доставка"]] },
+    { t:"M5 · Extension readiness", pct:100, items:[["done","Границы команд/событий"],["done","Манифест + 7 прав"],["done","ID-only события"],["done","Политика команд"],["done","Атрибуция аккаунтам"],["done","Runtime — вне скоупа"]] },
+  ],
+  modules: {
+    h:[["","Модуль"],["loc","LOC"],["files","Файлы"],["note","Роль"]],
+    r:[
+      ["lib.rs","1857","1","state machine + доменные модели"],
+      ["xmpp.rs","722","1","Tokio/XMPP транспорт"],
+      ["ffi.rs","849","1","UniFFI-поверхность"],
+      ["extension.rs","463","1","политика расширений"],
+      ["transport.rs","150","1","граница адаптера"],
+      ["Kotlin app","1947","6","Compose UI + gateway + prefs"],
+    ]
+  },
+  xeps: {
+    h:["Фича","Статус","Свидетельство"],
+    r:[
+      ["RFC 6120 StartTLS","implemented","xmpp.rs"],
+      ["XEP-0030 discovery","implemented","xmpp.rs"],
+      ["RFC 6121 roster","implemented","xmpp.rs + lib.rs"],
+      ["MUC (XEP-0045)","partial","capability + send, приём chat-only"],
+      ["SM (XEP-0198)","partial","detect-only, нет ack/resume"],
+      ["HTTP upload (XEP-0363)","partial","capability + attach() без клиента"],
+      ["Reactions (XEP-0444)","partial","core + UI, нет wire-станзы"],
+      ["Replies (reply:0)","partial","модель in_reply_to, нет элемента"],
+      ["Receipts (XEP-0184)","partial","DeliveryUpdated без wire"],
+      ["MAM (XEP-0313)","missing","только capability"],
+      ["OMEMO (XEP-0384)","missing","только capability"],
+      ["Markers / typing / corrections","missing","только capability"],
+      ["UnifiedPush","missing","только capability"],
+    ]
+  },
+  tests: {
+    bars:[
+      {l:"lib.rs",  v:17, c:"#6c8cff"},
+      {l:"xmpp.rs", v:6,  c:"#6c8cff"},
+      {l:"ffi.rs",  v:4,  c:"#6c8cff"},
+      {l:"extension.rs", v:5, c:"#6c8cff"},
+      {l:"transport.rs", v:1, c:"#6c8cff"},
+      {l:"Kotlin unit", v:6, c:"#4ade80"},
+      {l:"Kotlin instr", v:4, c:"#fbbf24"},
+    ],
+    donut:[
+      {l:"Rust unit", v:33, c:"#6c8cff"},
+      {l:"Kotlin unit", v:6, c:"#4ade80"},
+      {l:"Instrumented", v:4, c:"#fbbf24"},
+    ]
+  },
+  versions: {
+    h:["Инструмент","Версия","Примечание"],
+    r:[
+      ["Rust","1.97.1","edition 2024"],
+      ["UniFFI","0.32.0","CLI не закреплён локально"],
+      ["Gradle","8.14.3","—"],
+      ["AGP","8.11.0","требует JDK 11+"],
+      ["Kotlin","2.1.0","—"],
+      ["JDK","17","закреплён"],
+      ["NDK","29.0.14206865","cargo-ndk --platform 26"],
+      ["minSdk / target / compile","26 / 36 / 36","Android 8+ → 16"],
+    ]
+  },
+  risks: [
+    ["Нет persistence", "аккаунты и сообщения исчезают после рестарта, пароль вводится заново; SQLCipher и миграции — с нуля (только CoreStore trait + InMemoryStore)."],
+    ["MUC на wire-уровне", "все входящие groupchat-сообщения молча отбрасываются (приём chat-only), контракт v1 по MUC не выполним."],
+    ["SM detect-only", "нет ack/sequence; flush_outbox шлёт Pending/Failed повторно без дедупликации — риск дублей после реконнекта."],
+    ["Нет e2e-инфраструктуры", "все транспортные тесты — XML-маппинг или FakeTransport; disposable-сервер из PLAN не существует; CI не запускает Android-тесты."],
+    ["FFI на main thread", "команды и refresh() синхронно ходят в нативный код с UI-потока; только poll на IO — риск jank/ANR."],
+    ["Неиспользуемые permissions", "POST_NOTIFICATIONS и RECORD_AUDIO объявлены, кода нет — риск отказа в Play/F-Droid."],
+    ["UniFFI CLI не закреплён", "скрипт проверяет только наличие, не версию; расхождение версий = ABI-поломка биндингов."],
+    ["Нет релизной подписи", "нет signingConfig, minify выключен, нет воспроизводимости и F-Droid-метаданных."],
+  ]
+};
+
+function el(tag, cls, text){ const e=document.createElement(tag); if(cls)e.className=cls; if(text!=null)e.textContent=text; return e; }
+function pill(s){
+  const map={done:["ok","Done"],partial:["warn","Partial"],missing:["bad","Missing"],implemented:["ok","implemented"],planned:["mut","planned"]};
+  const [c,t]=map[s]||map.planned;
+  return el("span","pill "+c,t);
+}
+
+function render(){
+  document.getElementById("heroMeta").innerHTML = D.meta.map(m=>m[0]+" <b>"+m[1]+"</b>").join("");
+  const sc=document.getElementById("statCards");
+  D.stats.forEach(s=>{const c=el("div","card stat");c.append(el("div","v",s.v),el("div","l",s.l));if(s.d)c.append(el("div","d",s.d));sc.append(c);});
+
+  document.getElementById("flow").innerHTML = D.flow.map((n,i)=>(i?'<span class="arrow">→</span>':'')+'<div class="node"><b>'+n[0]+'</b><span>'+n[1]+'</span></div>').join("");
+  document.getElementById("flow2").innerHTML = D.flow2.map((n,i)=>(i?'<span class="arrow">→</span>':'')+'<div class="node"><b>'+n[0]+'</b><span>'+n[1]+'</span></div>').join("");
+
+  const ms=document.getElementById("mstones");
+  D.mstones.forEach(m=>{
+    const d=el("div","mstone"), r=el("div","row");
+    r.append(el("span","t",m.t), el("span","pct",m.pct+"%"));
+    d.append(r);
+    const b=el("div","bar"), i=el("i"); i.style.width=m.pct+"%"; b.append(i); d.append(b);
+    const chips=el("div","chips");
+    m.items.forEach(it=>chips.append(pill(it[0]), el("span","",it[1])));
+    d.append(chips); ms.append(d);
+  });
+
+  const mkTable=(id,data,miniCol)=>{ const host=document.getElementById(id); const t=el("table");
+    const thead=el("thead"); const hr=el("tr"); data.h.forEach(h=>hr.append(el("th", h[0]==="loc"?"num":"", h[1]))); thead.append(hr); t.append(thead);
+    const tb=el("tbody");
+    data.r.forEach((row,ri)=>{ const tr=el("tr");
+      row.forEach((c,ci)=>{
+        const td=el("td", ci===1?"num":"", String(c));
+        if(miniCol===ci){ const mini=el("span","mini"); const fi=el("i"); fi.style.width=Math.round(c/data.max*100)+"%"; mini.append(fi); td.append(mini); }
+        tr.append(td);
+      }); tb.append(tr); });
+    t.append(tb); host.append(t);
+  };
+  const maxLoc=Math.max(...D.modules.r.map(r=>+r[1]));
+  mkTable("moduleTable",{...D.modules,max:maxLoc},1);
+
+  const xt=document.getElementById("xepTable"); const t2=el("table"); const thead2=el("thead"); const hr2=el("tr");
+  D.xeps.h.forEach(h=>hr2.append(el("th","",h))); thead2.append(hr2); t2.append(thead2);
+  const tb2=el("tbody");
+  D.xeps.r.forEach(row=>{ const tr=el("tr");
+    tr.append(el("td","",row[0]), el("td","",pill(row[1])), el("td","",row[2]||""));
+    tb2.append(tr); });
+  t2.append(tb2); xt.append(t2);
+
+  const tc=document.getElementById("testChart");
+  const max=Math.max(...D.tests.bars.map(b=>b.v));
+  D.tests.bars.forEach(b=>{ const c=el("div","col"); const bar=el("div","cbar"); const i=el("i");
+    i.style.height=(b.v/max*100)+"%"; i.style.background=b.c; bar.append(i);
+    c.append(bar, el("div","val",String(b.v)), el("div","lb",b.l)); tc.append(c); });
+
+  const td=document.getElementById("testDonut");
+  const NS="http://www.w3.org/2000/svg";
+  const svg=document.createElementNS(NS,"svg");
+  svg.setAttribute("width","130"); svg.setAttribute("height","130"); svg.setAttribute("viewBox","0 0 130 130");
+  let total=D.tests.donut.reduce((a,d)=>a+d.v,0), off=0;
+  const r=52, cx=65, cy=65, C=2*Math.PI*r;
+  D.tests.donut.forEach(d=>{ const circ=document.createElementNS(NS,"circle");
+    circ.setAttribute("cx",cx); circ.setAttribute("cy",cy); circ.setAttribute("r",r);
+    circ.setAttribute("fill","none"); circ.setAttribute("stroke",d.c); circ.setAttribute("stroke-width","15");
+    const frac=d.v/total;
+    circ.setAttribute("stroke-dasharray",(frac*C).toFixed(2)+" "+(C-frac*C).toFixed(2));
+    circ.setAttribute("stroke-dashoffset",(-off*C).toFixed(2));
+    circ.setAttribute("transform","rotate(-90 "+cx+" "+cy+")");
+    svg.append(circ); off+=frac; });
+  const tx=document.createElementNS(NS,"text");
+  tx.setAttribute("x",cx); tx.setAttribute("y",cy+6); tx.setAttribute("text-anchor","middle");
+  tx.setAttribute("fill","#e8eaed"); tx.setAttribute("font-size","22"); tx.setAttribute("font-weight","700");
+  tx.textContent=total; svg.append(tx);
+  td.append(svg);
+  const leg=el("div","legend");
+  D.tests.donut.forEach(d=>{ const r2=el("div","row"); const sw=el("span","sw"); sw.style.background=d.c;
+    r2.append(sw, el("span","",d.l+" "), el("b","",String(d.v))); leg.append(r2); });
+  td.append(leg);
+
+  mkTable("versionTable",D.versions);
+
+  const rl=document.getElementById("riskList");
+  D.risks.forEach((r,i)=>{ const li=el("li");
+    li.innerHTML="<span class=\"ix\">"+String(i+1).padStart(2,"0")+"</span><span><b>"+r[0]+"</b> — "+r[1]+"</span>";
+    rl.append(li);
+  });
+}
+document.addEventListener("DOMContentLoaded", render);
+</script>
+</body>
+</html>
