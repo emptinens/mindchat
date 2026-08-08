@@ -22,3 +22,8 @@ app/src/main/jniLibs/
 *.jks
 *.log
 mindchat-diagnostics-*.zip
+
+# Local machine config
+local.properties
+.scratch/
+.DS_Store

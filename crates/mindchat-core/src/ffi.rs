@@ -260,6 +260,8 @@ pub struct FfiAccount {
     pub display_name: String,
     pub connection_state: FfiConnectionState,
     pub capabilities: Vec<FfiProtocolCapability>,
+    /// Last connection failure reason, safe to show in the UI.
+    pub connection_error: Option<String>,
 }
 
 /// A roster contact record safe for display in the Android UI.
@@ -654,6 +656,7 @@ impl From<crate::Account> for FfiAccount {
             display_name: value.display_name,
             connection_state: value.connection_state.into(),
             capabilities: value.capabilities.into_iter().map(Into::into).collect(),
+            connection_error: value.connection_error,
         }
     }
 }

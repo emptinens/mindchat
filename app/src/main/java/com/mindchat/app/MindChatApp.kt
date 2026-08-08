@@ -177,11 +177,30 @@ private fun MindChatShell(
     var showAddAccount by rememberSaveable { mutableStateOf(false) }
     var showAddContact by rememberSaveable { mutableStateOf(false) }
     var showNewConversation by rememberSaveable { mutableStateOf(false) }
+    var reconnectAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
 
     if (showAddAccount) {
         AddAccountDialog(
             onDismiss = { showAddAccount = false },
             onSave = gateway::addAccount,
+        )
+    }
+
+    val reconnectAccount = reconnectAccountId?.let { id ->
+        state.accounts.firstOrNull { it.id == id }
+    }
+    if (reconnectAccount != null) {
+        ReconnectDialog(
+            account = reconnectAccount,
+            onDismiss = { reconnectAccountId = null },
+            onReconnect = { password ->
+                if (gateway.reconnectAccount(reconnectAccount.id, password)) {
+                    reconnectAccountId = null
+                    true
+                } else {
+                    false
+                }
+            },
         )
     }
 
@@ -225,6 +244,7 @@ private fun MindChatShell(
                 state = state,
                 onAccountSelected = gateway::selectAccount,
                 onAddAccount = { showAddAccount = true },
+                onReconnect = { reconnectAccountId = it },
             )
         },
         bottomBar = {
@@ -323,6 +343,7 @@ private fun MindChatTopBar(
     state: MindChatUiState,
     onAccountSelected: (Long) -> Unit,
     onAddAccount: () -> Unit,
+    onReconnect: (Long) -> Unit,
 ) {
     val active = state.accounts.firstOrNull { it.id == state.activeAccountId }
     TopAppBar(
@@ -337,11 +358,29 @@ private fun MindChatTopBar(
                         "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}"
                     }.orEmpty(),
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = if (active?.connectionState == AccountConnectionState.FAILED) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                 )
+                active?.connectionError?.let { detail ->
+                    Text(
+                        text = detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
             }
         },
         actions = {
+            if (active?.connectionState == AccountConnectionState.FAILED) {
+                TextButton(onClick = { onReconnect(active.id) }) {
+                    Text(stringResource(R.string.reconnect))
+                }
+            }
             IconButton(onClick = onAddAccount) {
                 Icon(
                     imageVector = Icons.Filled.Add,
@@ -948,6 +987,62 @@ private fun AddAccountDialog(
                 },
                 enabled = jid.contains('@') && server.isNotBlank() && password.isNotEmpty(),
             ) { Text(stringResource(R.string.save)) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+private fun ReconnectDialog(
+    account: AccountUi,
+    onDismiss: () -> Unit,
+    onReconnect: (password: String) -> Boolean,
+) {
+    var password by remember { mutableStateOf("") }
+    var failedToReconnect by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.reconnect_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = account.jid,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = {
+                        password = it
+                        failedToReconnect = false
+                    },
+                    label = { Text(stringResource(R.string.password)) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    isError = failedToReconnect,
+                )
+                if (failedToReconnect) {
+                    Text(
+                        text = stringResource(R.string.account_connection_error),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (onReconnect(password)) {
+                        onDismiss()
+                    } else {
+                        failedToReconnect = true
+                    }
+                },
+                enabled = password.isNotEmpty(),
+            ) { Text(stringResource(R.string.reconnect)) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }

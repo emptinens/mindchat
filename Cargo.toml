@@ -8,6 +8,11 @@ license = "Apache-2.0"
 repository = "https://github.com/mindchat/mindchat"
 rust-version = "1.88"
 
+# Patched tokio-xmpp 6.0.0: authentication failures are terminal instead of
+# retrying forever, and the login module is public for auth preflight.
+[patch.crates-io]
+tokio-xmpp = { path = "vendor/tokio-xmpp" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

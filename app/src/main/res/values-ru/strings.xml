@@ -20,6 +20,8 @@
     <string name="server">Сервер</string>
     <string name="display_name">Имя</string>
     <string name="password">Пароль</string>
+    <string name="reconnect">Переподключиться</string>
+    <string name="reconnect_title">Переподключение аккаунта</string>
     <string name="account_connection_error">Проверьте настройки аккаунта и пароль, затем повторите попытку.</string>
     <string name="connection_offline">Не в сети</string>
     <string name="connection_connecting">Подключение</string>

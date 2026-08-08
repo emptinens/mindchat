@@ -32,7 +32,7 @@ pub use transport::{
 };
 
 #[cfg(feature = "xmpp-transport")]
-pub use xmpp::TokioXmppTransport;
+pub use xmpp::{TokioXmppTransport, resolve_endpoint};
 
 /// Stable identifier for an XMPP account configured in the client.
 pub type AccountId = u64;
@@ -164,6 +164,8 @@ pub struct Account {
     pub display_name: String,
     pub connection_state: ConnectionState,
     pub capabilities: BTreeSet<ProtocolCapability>,
+    /// Last connection failure reason, cleared on the next successful connect.
+    pub connection_error: Option<String>,
 }
 
 /// A roster contact projection owned by one account.
@@ -436,6 +438,7 @@ impl MindChatCore {
                 display_name: setup.display_name,
                 connection_state: ConnectionState::Offline,
                 capabilities: BTreeSet::new(),
+                connection_error: None,
             },
         );
         self.events.push(CoreEvent::AccountChanged(id));
@@ -451,6 +454,9 @@ impl MindChatCore {
         let account =
             self.accounts.get_mut(&account_id).ok_or(CoreError::UnknownAccount(account_id))?;
         account.connection_state = state;
+        if matches!(state, ConnectionState::Connecting | ConnectionState::Online) {
+            account.connection_error = None;
+        }
         self.events.push(CoreEvent::AccountChanged(account_id));
         Ok(())
     }
@@ -583,14 +589,19 @@ impl MindChatCore {
                     .ok_or(CoreError::UnknownAccount(account_id))?;
                 account.connection_state = ConnectionState::Online;
                 account.capabilities = capabilities;
+                account.connection_error = None;
                 self.events.push(CoreEvent::AccountChanged(account_id));
                 Ok(None)
             }
-            TransportEvent::Disconnected { account_id, recoverable } => {
-                self.set_connection_state(
-                    account_id,
-                    if recoverable { ConnectionState::Offline } else { ConnectionState::Failed },
-                )?;
+            TransportEvent::Disconnected { account_id, recoverable, detail } => {
+                let account = self
+                    .accounts
+                    .get_mut(&account_id)
+                    .ok_or(CoreError::UnknownAccount(account_id))?;
+                account.connection_state =
+                    if recoverable { ConnectionState::Offline } else { ConnectionState::Failed };
+                account.connection_error = detail;
+                self.events.push(CoreEvent::AccountChanged(account_id));
                 Ok(None)
             }
             TransportEvent::CapabilitiesDiscovered { account_id, capabilities } => {
@@ -1170,6 +1181,7 @@ impl<T: XmppTransport> TransportCoordinator<T> {
         self.core.apply_transport_event(TransportEvent::Disconnected {
             account_id,
             recoverable: true,
+            detail: None,
         })?;
         Ok(())
     }
@@ -1646,10 +1658,12 @@ mod tests {
             core.apply_transport_event(TransportEvent::Disconnected {
                 account_id,
                 recoverable: false,
+                detail: Some("not authorized".to_owned()),
             }),
             Ok(None)
         );
         assert_eq!(core.accounts()[0].connection_state, ConnectionState::Failed);
+        assert_eq!(core.accounts()[0].connection_error.as_deref(), Some("not authorized"));
     }
 
     #[test]

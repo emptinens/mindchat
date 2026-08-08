@@ -17,14 +17,18 @@ uniffi = ["dep:uniffi", "xmpp-transport"]
 # Builds the concrete Tokio/XMPP implementation behind the domain-safe
 # `XmppTransport` trait. It is enabled in production builds but can be
 # disabled for small, pure-state consumers.
-xmpp-transport = ["dep:futures", "dep:tokio", "dep:tokio-xmpp", "dep:xmpp-parsers"]
+xmpp-transport = ["dep:futures", "dep:hickory-resolver", "dep:tokio", "dep:tokio-xmpp", "dep:xmpp-parsers"]
 
 [dependencies]
 futures = { version = "0.3.31", optional = true }
+hickory-resolver = { version = "0.26.1", optional = true }
 tokio = { version = "1.48.0", features = ["net", "rt", "sync", "time"], optional = true }
-tokio-xmpp = { version = "6.0.0", default-features = false, features = ["ring", "starttls", "webpki-roots"], optional = true }
+tokio-xmpp = { version = "6.0.0", default-features = false, features = ["direct-tls", "ring", "starttls", "webpki-roots"], optional = true }
 uniffi = { version = "0.32.0", default-features = false, optional = true }
 xmpp-parsers = { version = "0.23.0", optional = true }
+
+[dev-dependencies]
+env_logger = "0.11"
 
 [lints]
 workspace = true

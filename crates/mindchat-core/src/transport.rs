@@ -66,6 +66,8 @@ pub enum TransportEvent {
     Disconnected {
         account_id: AccountId,
         recoverable: bool,
+        /// Human-readable failure reason for the UI, when the transport has one.
+        detail: Option<String>,
     },
     /// Capabilities received after XEP-0030 service discovery completes.
     CapabilitiesDiscovered {

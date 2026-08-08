@@ -33,6 +33,7 @@ data class AccountUi(
     val presence: Presence,
     val connectionState: AccountConnectionState = AccountConnectionState.OFFLINE,
     val supportsGroupChats: Boolean = false,
+    val connectionError: String? = null,
 )
 
 data class ContactUi(
@@ -87,6 +88,7 @@ interface MindChatGateway {
 
     fun selectAccount(accountId: Long)
     fun addAccount(jid: String, server: String, displayName: String, password: String): Boolean
+    fun reconnectAccount(accountId: Long, password: String): Boolean
     fun addContact(jid: String, displayName: String)
     fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
@@ -154,11 +156,22 @@ class NativeMindChatGateway(
                     displayName.trim().ifBlank { normalizedJid.substringBefore('@') },
                 ).toLong()
             activeAccountId = accountId
+            reconnectAccount(accountId, password)
+            true
+        } catch (_: MindChatBindingException) {
+            // A failed native setup remains visible through its core connection state.
+            refresh()
+            false
+        }
+    }
+
+    override fun reconnectAccount(accountId: Long, password: String): Boolean {
+        if (password.isEmpty()) return false
+        return try {
             core.connectAccount(accountId.toULong(), password)
             refresh()
             true
         } catch (_: MindChatBindingException) {
-            // A failed native setup remains visible through its core connection state.
             refresh()
             false
         }
@@ -307,6 +320,7 @@ class NativeMindChatGateway(
                 },
                 connectionState = account.connectionState.toUiModel(),
                 supportsGroupChats = account.capabilities.contains(FfiProtocolCapability.MULTI_USER_CHAT),
+                connectionError = account.connectionError,
             )
         }
         if (activeAccountId == 0L || accounts.none { it.id == activeAccountId }) {
@@ -432,6 +446,20 @@ class PreviewMindChatGateway(
         state = state.copy(
             accounts = state.accounts + account,
             activeAccountId = nextId,
+        )
+        return true
+    }
+
+    override fun reconnectAccount(accountId: Long, password: String): Boolean {
+        if (password.isEmpty() || state.accounts.none { it.id == accountId }) return false
+        state = state.copy(
+            accounts = state.accounts.map {
+                if (it.id == accountId) {
+                    it.copy(connectionState = AccountConnectionState.CONNECTING, connectionError = null)
+                } else {
+                    it
+                }
+            },
         )
         return true
     }

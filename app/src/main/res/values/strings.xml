@@ -20,6 +20,8 @@
     <string name="server">Server</string>
     <string name="display_name">Display name</string>
     <string name="password">Password</string>
+    <string name="reconnect">Reconnect</string>
+    <string name="reconnect_title">Reconnect account</string>
     <string name="account_connection_error">Check the account settings and password, then try again.</string>
     <string name="connection_offline">Offline</string>
     <string name="connection_connecting">Connecting</string>
