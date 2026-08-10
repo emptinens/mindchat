@@ -94,3 +94,6 @@ pedantic = ["xmpp-parsers/pedantic"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(xmpprs_doc_build)'] }
+
+# MindChat: standalone workspace so `cargo test --manifest-path` works from the vendor dir.
+[workspace]

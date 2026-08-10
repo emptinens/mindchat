@@ -59,7 +59,7 @@ fn live_login_chain_reaches_sasl_on_jabber_ru() {
         })
         .expect("worker must start");
 
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut saw_connected = false;
     let mut terminal: Option<TransportEvent> = None;
     while Instant::now() < deadline {
@@ -96,4 +96,126 @@ fn live_login_chain_reaches_sasl_on_jabber_ru() {
         detail.as_deref().unwrap_or("<no detail>")
     );
     assert!(detail.is_some(), "auth failures must carry a UI-safe detail");
+}
+
+#[test]
+fn live_blackhole_connect_terminates_within_30_seconds() {
+    if !live_enabled() {
+        eprintln!("skipped: set MINDCHAT_LIVE_TESTS=1");
+        return;
+    }
+    init_logger();
+    let mut transport = TokioXmppTransport::new();
+    let account_id = 2;
+    // An explicit IP in a non-routable range: resolution is immediate, the
+    // connect hangs at the OS level, and the bounded connect phase must still
+    // emit a terminal Disconnected within ~30 seconds.
+    transport
+        .connect(ConnectionRequest {
+            account_id,
+            jid: "blackhole@10.255.255.1".to_owned(),
+            server: "10.255.255.1".to_owned(),
+            password: SecretString::new("irrelevant"),
+        })
+        .expect("worker must start");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(32);
+    let mut terminal: Option<TransportEvent> = None;
+    while Instant::now() < deadline {
+        match transport.next_event().expect("event poll must not fail") {
+            Some(event @ TransportEvent::Disconnected { .. }) => {
+                terminal = Some(event);
+                break;
+            }
+            Some(TransportEvent::Connected { .. }) => {
+                panic!("blackhole endpoint must never connect");
+            }
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let terminal = terminal.expect("blackhole connect must terminate within 32 seconds");
+    assert!(
+        elapsed <= Duration::from_secs(32),
+        "blackhole connect took {elapsed:?}, exceeding the 32 second bound"
+    );
+    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail } = terminal
+    else {
+        panic!("unexpected terminal event");
+    };
+    assert_eq!(seen_account, account_id);
+    eprintln!(
+        "blackhole connect terminated after {elapsed:?}: recoverable={recoverable} detail={}",
+        detail.as_deref().unwrap_or("<none>")
+    );
+    assert!(
+        recoverable,
+        "an unroutable endpoint is a recoverable connection failure, not an auth failure"
+    );
+}
+
+#[test]
+fn live_wrong_password_fails_fast_without_preflight() {
+    if !live_enabled() {
+        eprintln!("skipped: set MINDCHAT_LIVE_TESTS=1");
+        return;
+    }
+    init_logger();
+    let mut transport = TokioXmppTransport::new();
+    let account_id = 3;
+    let server = live_server();
+    let jid = format!("mindchat-wrong-pw-{}@{server}", std::process::id());
+    transport
+        .connect(ConnectionRequest {
+            account_id,
+            jid,
+            server,
+            password: SecretString::new("definitely-wrong-password"),
+        })
+        .expect("worker must start");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(20);
+    let mut terminal: Option<TransportEvent> = None;
+    while Instant::now() < deadline {
+        match transport.next_event().expect("event poll must not fail") {
+            Some(event @ TransportEvent::Disconnected { .. }) => {
+                terminal = Some(event);
+                break;
+            }
+            Some(TransportEvent::Connected { .. }) => {
+                panic!("bogus credentials must never authenticate");
+            }
+            Some(_) => {}
+            None => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+
+    let elapsed = started.elapsed();
+    let terminal = terminal.expect("wrong password must fail within 20 seconds");
+    assert!(
+        elapsed <= Duration::from_secs(20),
+        "wrong-password rejection took {elapsed:?}, exceeding the 20 second bound"
+    );
+    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail } = terminal
+    else {
+        panic!("unexpected terminal event");
+    };
+    assert_eq!(seen_account, account_id);
+    eprintln!(
+        "wrong-password failure after {elapsed:?}: recoverable={recoverable} detail={}",
+        detail.as_deref().unwrap_or("<none>")
+    );
+    assert!(
+        !recoverable,
+        "rejected credentials must be non-recoverable; got detail: {}",
+        detail.as_deref().unwrap_or("<no detail>")
+    );
+    assert!(
+        detail.is_some() && !detail.as_deref().unwrap_or("").is_empty(),
+        "auth failures must carry a precise UI-safe detail"
+    );
 }

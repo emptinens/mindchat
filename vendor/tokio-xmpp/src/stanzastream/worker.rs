@@ -87,10 +87,20 @@ pub(super) enum WorkerEvent {
     /// Stream disconnected.
     Disconnected {
         /// Slot for a new connection.
-        slot: oneshot::Sender<Connection>,
+        slot: oneshot::Sender<Result<Connection, crate::Error>>,
 
         /// Set to None if the stream was cleanly closed by the remote side.
         error: Option<io::Error>,
+    },
+
+    /// The connector reported a fatal error (e.g. authentication was
+    /// rejected). No reconnect will be attempted.
+    ///
+    /// MindChat patch: this surfaces terminal connector failures instead of
+    /// hanging the stream in the reconnect loop.
+    Fatal {
+        /// The terminal connector error.
+        error: crate::Error,
     },
 
     /// The reconnection backend dropped the connection channel.
@@ -101,10 +111,13 @@ enum WorkerStream {
     /// Pending connection.
     Connecting {
         /// Optional contents of an [`WorkerEvent::Disconnect`] to emit.
-        notify: Option<(oneshot::Sender<Connection>, Option<io::Error>)>,
+        notify: Option<(
+            oneshot::Sender<Result<Connection, crate::Error>>,
+            Option<io::Error>,
+        )>,
 
         /// Receiver slot for the next connection.
-        slot: oneshot::Receiver<Connection>,
+        slot: oneshot::Receiver<Result<Connection, crate::Error>>,
 
         /// Stream management state from a previous connection.
         sm_state: Option<SmState>,
@@ -157,11 +170,11 @@ impl WorkerStream {
                     }
 
                     match ready!(Pin::new(slot).poll(cx)) {
-                        Ok(Connection {
+                        Ok(Ok(Connection {
                             stream,
                             features,
                             identity,
-                        }) => {
+                        })) => {
                             let substate = ConnectedState::Negotiating {
                                 // We panic here, but that is ok-ish, because
                                 // that will "only" crash the worker and thus
@@ -176,6 +189,13 @@ impl WorkerStream {
                                 features,
                                 identity,
                             };
+                        }
+                        Ok(Err(error)) => {
+                            // The connector failed terminally (e.g. the server
+                            // rejected the credentials). Surface the error and
+                            // stop the worker instead of retrying forever.
+                            *this = Self::Terminated;
+                            return Poll::Ready(Some(WorkerEvent::Fatal { error }));
                         }
                         Err(_) => {
                             // The sender was dropped. This is fatal.
@@ -406,7 +426,13 @@ pub(super) fn parse_error_to_stream_error(e: xso::error::Error) -> StreamError {
 
 /// Worker system for a [`StanzaStream`].
 pub(super) struct StanzaStreamWorker {
-    reconnector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
+    reconnector: Box<
+        dyn FnMut(
+                Option<String>,
+                oneshot::Sender<Result<Connection, crate::Error>>,
+            ) + Send
+            + 'static,
+    >,
     frontend_tx: mpsc::Sender<Event>,
     stream: WorkerStream,
     transmit_queue: TransmitQueue<QueueEntry>,
@@ -436,7 +462,11 @@ macro_rules! send_or_break {
 impl StanzaStreamWorker {
     pub fn spawn(
         mut reconnector: Box<
-            dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static,
+            dyn FnMut(
+                    Option<String>,
+                    oneshot::Sender<Result<Connection, crate::Error>>,
+                ) + Send
+                + 'static,
         >,
         queue_depth: usize,
     ) -> (mpsc::Sender<QueueEntry>, mpsc::Receiver<Event>) {
@@ -544,6 +574,17 @@ impl StanzaStreamWorker {
                                     ping::Ping,
                                 ).into())));
                             }
+                        }
+                        WorkerEvent::Fatal { error } => {
+                            log::error!(
+                                "Stream failed terminally: {}. No reconnect will be attempted.",
+                                error
+                            );
+                            send_or_break!(
+                                Event::Stream(StreamEvent::Fatal(error)) => permit in self.frontend_tx,
+                                self.transmit_queue => self.stream,
+                            );
+                            break;
                         }
                         WorkerEvent::ReconnectAborted => {
                             panic!("Backend was unable to handle reconnect request.");

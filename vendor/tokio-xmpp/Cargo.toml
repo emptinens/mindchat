@@ -241,3 +241,6 @@ features = [
 level = "warn"
 priority = 0
 check-cfg = ["cfg(xmpprs_doc_build)"]
+
+# MindChat: standalone workspace so `cargo test --manifest-path` works from the vendor dir.
+[workspace]

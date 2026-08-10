@@ -10,7 +10,7 @@ use crate::{
 };
 use futures::StreamExt;
 use hickory_resolver::{TokioResolver, config::LookupIpStrategy, proto::rr::RData};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -21,7 +21,7 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_xmpp::{
     Client, Event as TokioXmppEvent, Stanza,
-    connect::{DirectTlsServerConnector, DnsConfig, ServerConnector, StartTlsServerConnector},
+    connect::DnsConfig,
     parsers::{
         disco::{DiscoInfoQuery, DiscoInfoResult},
         iq::Iq,
@@ -36,10 +36,19 @@ use tokio_xmpp::{
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total wall-clock budget for the DNS resolution phase. getaddrinfo is the
+/// primary path; hickory SRV is only consulted within a shorter inner bound.
+const DNS_TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Upper bound for the best-effort hickory SRV lookup, which is unreliable on
+/// Android and must never sit on the hot path.
+const SRV_TIMEOUT: Duration = Duration::from_secs(3);
 /// Upper bound for one connection attempt. tokio-xmpp reconnects silently on
 /// its own, so without this bound a stalled handshake would leave the UI in
 /// "connecting" forever.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard deadline for the whole connect phase (DNS plus all candidate
+/// handshakes). A terminal `Disconnected` is always emitted when it elapses.
+const CONNECT_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tokio-backed XMPP client implementation used by the Android native core.
 ///
@@ -242,6 +251,7 @@ impl WorkerConnection {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_worker(
     connection: WorkerConnection,
     mut command_receiver: UnboundedReceiver<WorkerCommand>,
@@ -249,35 +259,58 @@ async fn run_worker(
 ) {
     install_rustls_provider();
     let account_id = connection.account_id;
-    let attempts = match resolve_endpoints(&connection.server).await {
-        Ok(attempts) => attempts,
-        Err(detail) => {
+    // The entire connect phase (DNS plus every candidate handshake) runs under
+    // one hard deadline so a terminal event is guaranteed within
+    // CONNECT_PHASE_TIMEOUT, and it is selectable against the command channel
+    // so a user disconnect during "connecting" is honored immediately.
+    let phase = async {
+        let attempts = resolve_endpoints(&connection.server)
+            .await
+            .map_err(|detail| ConnectFailure { detail, recoverable: true })?;
+        connect_attempt(&connection, attempts).await
+    };
+    let outcome = tokio::select! {
+        command = command_receiver.recv() => {
+            match command {
+                Some(WorkerCommand::Disconnect { response_sender }) => {
+                    let _ = response_sender.send(Ok(()));
+                }
+                Some(WorkerCommand::Send { response_sender, .. }) => {
+                    let _ = response_sender.send(Err(TransportError::ConnectionFailed(
+                        "account is still connecting".to_owned(),
+                    )));
+                }
+                None => {}
+            }
+            return;
+        }
+        outcome = tokio::time::timeout(CONNECT_PHASE_TIMEOUT, phase) => outcome,
+    };
+    let (mut client, pending_event) = match outcome {
+        Ok(Ok(ReadyClient { client, pending_event })) => (client, pending_event),
+        Ok(Err(failure)) => {
+            send_event(
+                &event_sender,
+                TransportEvent::Disconnected {
+                    account_id,
+                    recoverable: failure.recoverable,
+                    detail: Some(failure.detail),
+                },
+            );
+            return;
+        }
+        Err(_) => {
             send_event(
                 &event_sender,
                 TransportEvent::Disconnected {
                     account_id,
                     recoverable: true,
-                    detail: Some(detail),
+                    detail: Some("connection attempt exceeded 30 seconds".to_owned()),
                 },
             );
             return;
         }
     };
-    let ReadyClient { mut client, pending_event } =
-        match connect_attempt(&connection, attempts).await {
-            Ok(client) => client,
-            Err(failure) => {
-                send_event(
-                    &event_sender,
-                    TransportEvent::Disconnected {
-                        account_id,
-                        recoverable: failure.recoverable,
-                        detail: Some(failure.detail),
-                    },
-                );
-                return;
-            }
-        };
     let mut stream_capabilities = BTreeSet::new();
     if let Some(event) = pending_event {
         let keep_running = handle_client_event(
@@ -345,55 +378,24 @@ struct ConnectFailure {
     recoverable: bool,
 }
 
-/// Result of the bounded authentication preflight for one candidate.
-enum Preflight {
-    /// The server accepted the credentials.
-    Authenticated,
-    /// The server rejected the credentials; no other candidate can help.
-    AuthFailed(String),
-    /// The candidate could not be reached or the handshake stalled.
-    ConnectionFailed(String),
-}
-
 /// Attempts each candidate endpoint in order and returns the first client
-/// whose handshake produces any event within [`CONNECT_TIMEOUT`].
+/// whose handshake produces a usable event within
+/// [`CONNECT_ATTEMPT_TIMEOUT`].
 ///
 /// tokio-xmpp retries failed connections internally without surfacing them,
 /// so each attempt is bounded here and the next candidate (for example
 /// direct TLS on port 5223) is tried instead of leaving the UI stuck in
-/// "connecting". Credentials are validated by a bounded preflight first so a
-/// wrong password fails fast with a precise reason instead of a timeout.
+/// "connecting". Only one handshake runs per candidate: authentication
+/// failures are delivered by the vendored tokio-xmpp as the first event
+/// (`Event::Disconnected(Error::Auth(_))`), so a rejected password fails fast
+/// with a precise, non-recoverable reason instead of a second handshake or a
+/// generic timeout.
 async fn connect_attempt(
     connection: &WorkerConnection,
     attempts: Vec<(SocketAddr, bool)>,
 ) -> Result<ReadyClient, ConnectFailure> {
     let mut last_error = String::from("no connection candidates");
     for (endpoint, direct_tls) in attempts {
-        let preflight = if direct_tls {
-            preflight_auth(
-                DirectTlsServerConnector::from(DnsConfig::addr(&endpoint.to_string())),
-                &connection.jid,
-                &connection.password,
-            )
-            .await
-        } else {
-            preflight_auth(
-                StartTlsServerConnector::from(DnsConfig::addr(&endpoint.to_string())),
-                &connection.jid,
-                &connection.password,
-            )
-            .await
-        };
-        match preflight {
-            Preflight::AuthFailed(detail) => {
-                return Err(ConnectFailure { detail, recoverable: false });
-            }
-            Preflight::ConnectionFailed(detail) => {
-                last_error = detail;
-                continue;
-            }
-            Preflight::Authenticated => {}
-        }
         let mut client = if direct_tls {
             Client::new_direct_tls_with_config(
                 connection.jid.clone(),
@@ -409,8 +411,11 @@ async fn connect_attempt(
                 Timeouts::default(),
             )
         };
-        match tokio::time::timeout(CONNECT_TIMEOUT, client.next()).await {
+        match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, client.next()).await {
             Ok(Some(event)) => {
+                if let Some(failure) = terminal_failure_for_event(&event) {
+                    return Err(failure);
+                }
                 return Ok(ReadyClient { client, pending_event: Some(event) });
             }
             Ok(None) => {
@@ -419,7 +424,7 @@ async fn connect_attempt(
             Err(_) => {
                 last_error = format!(
                     "connection to {endpoint} timed out after {} seconds",
-                    CONNECT_TIMEOUT.as_secs()
+                    CONNECT_ATTEMPT_TIMEOUT.as_secs()
                 );
             }
         }
@@ -427,31 +432,33 @@ async fn connect_attempt(
     Err(ConnectFailure { detail: last_error, recoverable: true })
 }
 
-/// Runs one bounded authentication handshake for a candidate endpoint.
-async fn preflight_auth<C: ServerConnector>(
-    connector: C,
-    jid: &BareJid,
-    password: &str,
-) -> Preflight {
-    let handshake = tokio_xmpp::client::login::client_auth(
-        connector,
-        jid.clone().into(),
-        password.to_owned(),
-        Timeouts::default(),
-    );
-    match tokio::time::timeout(CONNECT_TIMEOUT, handshake).await {
-        Ok(Ok((_features, stream))) => {
-            drop(stream);
-            Preflight::Authenticated
+/// Removes duplicate `(address, use_direct_tls)` candidates while preserving
+/// order. The SRV target often equals the plain `host:5222` candidate.
+#[must_use]
+fn dedupe_candidates(attempts: Vec<(SocketAddr, bool)>) -> Vec<(SocketAddr, bool)> {
+    let mut seen = HashSet::new();
+    attempts.into_iter().filter(|candidate| seen.insert(*candidate)).collect()
+}
+
+/// True when the error is a terminal authentication failure.
+#[must_use]
+fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
+    matches!(error, tokio_xmpp::Error::Auth(_))
+}
+
+/// Maps the first client event to a terminal connect failure, if it is one.
+///
+/// The only terminal first event is `Disconnected`; it carries the precise
+/// reason (for example a rejected SASL exchange) and its recoverability. This
+/// is the single place that replaces the old authentication preflight's
+/// detection of rejected credentials.
+#[must_use]
+fn terminal_failure_for_event(event: &TokioXmppEvent) -> Option<ConnectFailure> {
+    match event {
+        TokioXmppEvent::Disconnected(error) => {
+            Some(ConnectFailure { detail: error.to_string(), recoverable: !is_auth_error(error) })
         }
-        Ok(Err(tokio_xmpp::Error::Auth(auth_error))) => {
-            Preflight::AuthFailed(format!("authentication failed: {auth_error}"))
-        }
-        Ok(Err(error)) => Preflight::ConnectionFailed(format!("connection failed: {error}")),
-        Err(_) => Preflight::ConnectionFailed(format!(
-            "connection timed out after {} seconds",
-            CONNECT_TIMEOUT.as_secs()
-        )),
+        _ => None,
     }
 }
 
@@ -697,52 +704,63 @@ fn validate_endpoint_syntax(server: &str) -> Result<(), TransportError> {
 
 /// Resolves a configured server to one concrete socket address.
 ///
-/// The resolution order is: explicit IP, explicit host:port through the OS
-/// resolver, SRV lookup through hickory when the system DNS configuration is
-/// readable, and finally a plain host:5222 OS-resolver fallback. The OS
-/// resolver path (getaddrinfo) works on Android where parsing
-/// `/etc/resolv.conf` inside hickory is unreliable.
+/// Returns the first candidate of [`resolve_endpoints`]. For SRV-dependent
+/// domains this may be the plain `host:5222` candidate rather than the SRV
+/// target; this is a diagnostic helper, not the connect path.
 #[cfg_attr(docsrs, doc(cfg(feature = "xmpp-transport")))]
 pub async fn resolve_endpoint(server: &str) -> Result<SocketAddr, String> {
-    let server = server.trim();
-    if let Some((host, port)) = split_host_and_port(server).map_err(|error| error.to_string())? {
-        return resolve_host(&host, port).await;
-    }
-    if let Ok(ip) = server.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, 5222));
-    }
-    if let Some(endpoint) = srv_endpoint(server).await {
-        return Ok(endpoint);
-    }
-    resolve_host(server, 5222).await
+    resolve_endpoints(server)
+        .await?
+        .into_iter()
+        .next()
+        .map(|(address, _)| address)
+        .ok_or_else(|| format!("cannot resolve XMPP server {server}"))
 }
 
 /// Resolves the ordered connection candidates for a server.
 ///
 /// Each candidate is a `(socket address, use_direct_tls)` pair. Explicit
 /// endpoints resolve to a single candidate (StartTLS unless the port is the
-/// direct-TLS port 5223); bare domains get a StartTLS candidate on the SRV or
-/// default port 5222 and a direct-TLS fallback on port 5223.
+/// direct-TLS port 5223); bare domains get a StartTLS candidate on the default
+/// port 5222, a direct-TLS fallback on port 5223, and finally a bounded
+/// best-effort hickory SRV candidate appended after the plain ones. The whole
+/// resolution is capped by [`DNS_TOTAL_TIMEOUT`] so a wedged system resolver
+/// cannot stall the connect phase forever.
 async fn resolve_endpoints(server: &str) -> Result<Vec<(SocketAddr, bool)>, String> {
     let server = server.trim();
-    let mut attempts = Vec::new();
-    if let Some((host, port)) = split_host_and_port(server).map_err(|error| error.to_string())? {
-        attempts.push((resolve_host(&host, port).await?, port == 5223));
-        return Ok(attempts);
-    }
-    if let Ok(ip) = server.parse::<IpAddr>() {
-        attempts.push((SocketAddr::new(ip, 5222), false));
-        attempts.push((SocketAddr::new(ip, 5223), true));
-        return Ok(attempts);
-    }
-    match srv_endpoint(server).await {
-        Some(endpoint) => attempts.push((endpoint, false)),
-        None => attempts.push((resolve_host(server, 5222).await?, false)),
-    }
-    if let Ok(endpoint) = resolve_host(server, 5223).await {
-        attempts.push((endpoint, true));
-    }
-    Ok(attempts)
+    tokio::time::timeout(DNS_TOTAL_TIMEOUT, async {
+        let mut attempts = Vec::new();
+        if let Some((host, port)) =
+            split_host_and_port(server).map_err(|error| error.to_string())?
+        {
+            attempts.push((resolve_host(&host, port).await?, port == 5223));
+            return Ok(attempts);
+        }
+        if let Ok(ip) = server.parse::<IpAddr>() {
+            attempts.push((SocketAddr::new(ip, 5222), false));
+            attempts.push((SocketAddr::new(ip, 5223), true));
+            return Ok(attempts);
+        }
+        // Plain getaddrinfo candidates come first: they are reliable on
+        // Android and usually succeed or fail fast. A failed single lookup is
+        // skipped, not fatal, so SRV can still rescue SRV-dependent domains.
+        if let Ok(endpoint) = resolve_host(server, 5222).await {
+            attempts.push((endpoint, false));
+        }
+        if let Ok(endpoint) = resolve_host(server, 5223).await {
+            attempts.push((endpoint, true));
+        }
+        // Bounded best-effort SRV fallback, never on the hot path.
+        if let Ok(Some(endpoint)) = tokio::time::timeout(SRV_TIMEOUT, srv_endpoint(server)).await {
+            attempts.push((endpoint, false));
+        }
+        if attempts.is_empty() {
+            return Err(format!("cannot resolve XMPP server {server}"));
+        }
+        Ok(dedupe_candidates(attempts))
+    })
+    .await
+    .map_err(|_| "DNS resolution timed out".to_owned())?
 }
 
 /// Attempts a `_xmpp-client._tcp` SRV lookup, then resolves the best target.
@@ -956,6 +974,78 @@ mod tests {
         assert!(validate_endpoint_syntax("[::1]:5222").is_ok());
         assert!(validate_endpoint_syntax("example.org:not-a-port").is_err());
         assert!(validate_endpoint_syntax("").is_err());
+    }
+
+    #[test]
+    fn dedupe_candidates_removes_duplicate_pairs_preserving_order() {
+        let address = |port: u16| SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port);
+        let attempts = vec![
+            (address(5222), false),
+            (address(5223), true),
+            (address(5222), false),
+            (address(5222), true),
+            (address(5222), false),
+        ];
+        assert_eq!(
+            dedupe_candidates(attempts),
+            vec![(address(5222), false), (address(5223), true), (address(5222), true)]
+        );
+    }
+
+    #[test]
+    fn candidate_ordering_places_plain_endpoints_before_srv() {
+        // An explicit-IP server never touches DNS: exactly two candidates with
+        // StartTLS on 5222 first and direct TLS on 5223 second.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let candidates = runtime
+            .block_on(resolve_endpoints("127.0.0.1"))
+            .expect("explicit IP resolves without DNS");
+        assert_eq!(
+            candidates,
+            vec![
+                (SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 5222), false),
+                (SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 5223), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn is_auth_error_maps_only_auth_variants() {
+        let auth = tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::NotAuthorized,
+        ));
+        assert!(is_auth_error(&auth));
+        assert!(!is_auth_error(&tokio_xmpp::Error::Disconnected));
+        assert!(!is_auth_error(&tokio_xmpp::Error::Protocol(
+            tokio_xmpp::error::ProtocolError::NoTls
+        )));
+    }
+
+    #[test]
+    fn terminal_failure_for_event_marks_auth_non_recoverable() {
+        let auth = tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::NotAuthorized,
+        ));
+        let failure = terminal_failure_for_event(&TokioXmppEvent::Disconnected(auth))
+            .expect("a disconnected first event is a terminal failure");
+        assert!(!failure.recoverable, "rejected credentials must be non-recoverable");
+        assert!(!failure.detail.is_empty(), "auth failures must carry precise detail");
+        assert!(failure.detail.contains("authentication"));
+    }
+
+    #[test]
+    fn terminal_failure_for_event_ignores_non_terminal_first_events() {
+        assert!(
+            terminal_failure_for_event(&TokioXmppEvent::Online {
+                bound_jid: "bob@example.org/resource".parse().expect("valid jid"),
+                features: xmpp_parsers::stream_features::StreamFeatures::default(),
+                resumed: false,
+            })
+            .is_none()
+        );
     }
 
     #[test]

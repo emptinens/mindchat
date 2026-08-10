@@ -76,6 +76,12 @@ pub enum StreamEvent {
     ///
     /// This is merely informative. Potentially useful to prolong timeouts.
     Resumed,
+
+    /// The stream failed terminally, e.g. authentication was rejected.
+    ///
+    /// MindChat patch: no reconnect will be attempted after this event; the
+    /// connector's fatal error is surfaced so the stream does not hang.
+    Fatal(crate::Error),
 }
 
 /// Event emitted by the [`StanzaStream`].
@@ -125,7 +131,8 @@ impl StanzaStream {
         queue_depth: usize,
     ) -> Self {
         let reconnector = Box::new(
-            move |_preferred_location: Option<String>, slot: oneshot::Sender<Connection>| {
+            move |_preferred_location: Option<String>,
+                  slot: oneshot::Sender<Result<Connection, crate::Error>>| {
                 let jid = jid.clone();
                 let server = server.clone();
                 let password = password.clone();
@@ -145,12 +152,14 @@ impl StanzaStream {
                             Ok((features, stream)) => {
                                 log::debug!("Connection as {} established", jid);
                                 let stream = stream.box_stream();
-                                let Err(mut conn) = slot.send(Connection {
+                                let Err(Ok(mut conn)) = slot.send(Ok(Connection {
                                     stream,
                                     features,
                                     identity: jid,
-                                }) else {
-                                    // Send succeeded, we're done here.
+                                })) else {
+                                    // Send succeeded, or the slot rejected the
+                                    // value for a reason we cannot act on; either
+                                    // way we are done here.
                                     return;
                                 };
 
@@ -176,6 +185,11 @@ impl StanzaStream {
                                         "Failed to connect: {}. Authentication errors are fatal; giving up.",
                                         e
                                     );
+                                    // MindChat patch: surface the fatal connector
+                                    // error through the slot so the stream worker
+                                    // can emit it as a terminal event instead of
+                                    // hanging the stream forever.
+                                    let _ = slot.send(Err(e));
                                     return;
                                 }
                                 log::error!("Failed to connect: {}. Retrying in {:?}.", e, delay);
@@ -223,7 +237,13 @@ impl StanzaStream {
     /// full for example because of a slow server, you can still receive
     /// data).
     pub fn new(
-        connector: Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static>,
+        connector: Box<
+            dyn FnMut(
+                    Option<String>,
+                    oneshot::Sender<Result<Connection, crate::Error>>,
+                ) + Send
+                + 'static,
+        >,
         queue_depth: usize,
     ) -> Self {
         // c2f = core to frontend, f2c = frontend to core

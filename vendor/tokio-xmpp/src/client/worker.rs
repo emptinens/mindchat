@@ -99,6 +99,10 @@ impl ClientWorker {
                 resumed: true,
             },
             StanzaStreamEvent::Stream(StreamEvent::Suspended) => return,
+            // MindChat patch: surface the stanzastream's terminal connector
+            // failure (e.g. rejected authentication) as a Disconnected event
+            // instead of dropping the stream and hanging client.next().
+            StanzaStreamEvent::Stream(StreamEvent::Fatal(error)) => Event::Disconnected(error),
         };
 
         let Ok(()) = self.stanza_w2f_tx.send(send_event).await else {

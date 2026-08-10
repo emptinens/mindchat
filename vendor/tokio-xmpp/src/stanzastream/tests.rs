@@ -108,11 +108,11 @@ async fn custom_stream_pair(
     let mut lhs = Some((lhs, identity.clone()));
     let client = StanzaStream::new(
         Box::new(move |_, sink| match lhs.take() {
-            Some(((features, stream), identity)) => match sink.send(Connection {
+            Some(((features, stream), identity)) => match sink.send(Ok(Connection {
                 features,
                 stream: stream.box_stream(),
                 identity: identity.into(),
-            }) {
+            })) {
                 Ok(()) => (),
                 Err(_) => {
                     panic!("stanza stream crashed while test suite was preparing the stream!")
@@ -292,6 +292,31 @@ async fn drop_stanza_with_unparsable_payload_sm() {
     match client.next().await {
         Some(Event::Stanza(Stanza::Presence(Presence { type_, .. }))) => {
             assert_eq!(type_, PresenceType::Unavailable);
+        }
+        other => panic!("unexpected recv result on client side: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn fatal_connector_error_is_surfaced_as_stream_event() {
+    // MindChat patch regression test: a connector whose authentication fails
+    // terminally must surface `StreamEvent::Fatal` instead of hanging the
+    // stream in the reconnect loop.
+    // Constructed inside the closure because the reconnector is `FnMut` and
+    // `Error` is not `Clone`; building a fresh value per call is cheaper and
+    // keeps the closure from moving out of its capture.
+    let mut client = StanzaStream::new(
+        Box::new(move |_, sink| {
+            let fatal = crate::Error::Auth(crate::error::AuthError::Fail(
+                crate::parsers::sasl::DefinedCondition::NotAuthorized,
+            ));
+            let _ = sink.send(Err(fatal));
+        }),
+        16,
+    );
+    match client.next().await {
+        Some(Event::Stream(StreamEvent::Fatal(error))) => {
+            assert!(matches!(error, crate::Error::Auth(_)));
         }
         other => panic!("unexpected recv result on client side: {other:?}"),
     }
