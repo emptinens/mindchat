@@ -14,6 +14,7 @@ import com.mindchat.core.FfiMessageDirection
 import com.mindchat.core.FfiProtocolCapability
 import com.mindchat.core.MindChatBindingException
 import com.mindchat.core.MindChatCoreHandle
+import java.io.File
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
@@ -93,6 +94,7 @@ interface MindChatGateway {
     fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
     suspend fun pollTransport()
+    suspend fun persistNow()
     fun toggleDynamicColor()
     fun toggleComfortableLayout()
     fun toggleAppLock()
@@ -107,7 +109,10 @@ object MindChatGatewayFactory {
     fun create(context: Context): MindChatGateway {
         val preferences = SharedPreferencesMindChatPreferences(context)
         return try {
-            NativeMindChatGateway(preferences = preferences)
+            NativeMindChatGateway(
+                stateFile = File(context.filesDir, "mindchat_state.json"),
+                preferences = preferences,
+            )
         } catch (error: LinkageError) {
             if (BuildConfig.DEBUG) PreviewMindChatGateway(preferences) else throw error
         }
@@ -118,14 +123,36 @@ object MindChatGatewayFactory {
 @Stable
 class NativeMindChatGateway(
     private val core: MindChatCoreHandle = MindChatCoreHandle(),
+    private val stateFile: File,
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
 ) : MindChatGateway {
     private var activeAccountId = 0L
     private var customization = preferences.readCustomization()
     private val pendingOutboxAccounts = mutableSetOf<Long>()
 
+    /** True when a user mutation since the last save must be persisted. */
+    @Volatile
+    private var dirty = false
+
     override var state by mutableStateOf(snapshotToUiState())
         private set
+
+    init {
+        // Restore durable state once at startup. Ok(true) restores the previous
+        // session; Ok(false) (no file) starts fresh; a failure renames the bad
+        // file aside so the app can continue with an empty core.
+        runCatching { core.loadState(stateFile.absolutePath) }
+            .onFailure {
+                if (stateFile.exists()) {
+                    stateFile.renameTo(File(stateFile.path + ".corrupt-" + System.currentTimeMillis()))
+                }
+            }
+        refresh()
+    }
+
+    companion object {
+        private const val STATE_FILE_NAME = "mindchat_state.json"
+    }
 
     override fun selectAccount(accountId: Long) {
         if (state.accounts.any { it.id == accountId }) {
@@ -157,6 +184,7 @@ class NativeMindChatGateway(
                 ).toLong()
             activeAccountId = accountId
             reconnectAccount(accountId, password)
+            dirty = true
             true
         } catch (_: MindChatBindingException) {
             // A failed native setup remains visible through its core connection state.
@@ -169,6 +197,7 @@ class NativeMindChatGateway(
         if (password.isEmpty()) return false
         return try {
             core.connectAccount(accountId.toULong(), password)
+            dirty = true
             refresh()
             true
         } catch (_: MindChatBindingException) {
@@ -187,6 +216,7 @@ class NativeMindChatGateway(
                 FfiContactPresence.OFFLINE,
                 null,
             )
+            dirty = true
             refresh()
         } catch (_: MindChatBindingException) {
             // Domain validation owns contact-address rejection.
@@ -203,6 +233,7 @@ class NativeMindChatGateway(
                 null,
                 System.currentTimeMillis().toULong(),
             )
+            dirty = true
             pendingOutboxAccounts += account.id
             refresh()
         } catch (_: MindChatBindingException) {
@@ -224,26 +255,42 @@ class NativeMindChatGateway(
         val result = withContext(Dispatchers.IO) {
             try {
                 val processedEvents = core.pollTransportEvents(32U)
+
+                // Flush the outbox before persisting so delivery transitions are
+                // captured in the saved snapshot.
+                val hasTransportWork = processedEvents > 0U || pendingAccounts.any { it in onlineBefore }
+                val flushedAccounts = if (hasTransportWork) {
+                    val beforeFlush = core.snapshot()
+                    val onlineNow = beforeFlush.accounts
+                        .asSequence()
+                        .filter { it.connectionState == FfiConnectionState.ONLINE }
+                        .map { it.id.toLong() }
+                        .toSet()
+                    val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
+                        .intersect(onlineNow)
+                    accountsToFlush.forEach { accountId ->
+                        try {
+                            core.flushOutbox(accountId.toULong())
+                        } catch (_: MindChatBindingException) {
+                            // The core has already projected a failed delivery state when applicable.
+                        }
+                    }
+                    accountsToFlush
+                } else {
+                    emptySet()
+                }
+
+                val userDirty = dirty
+                dirty = false
+                val stateChanged = userDirty || processedEvents > 0U || flushedAccounts.isNotEmpty()
+                if (stateChanged) {
+                    runCatching { core.saveState(stateFile.absolutePath) }
+                }
+
                 if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
                     return@withContext null
                 }
-
-                val beforeFlush = core.snapshot()
-                val onlineNow = beforeFlush.accounts
-                    .asSequence()
-                    .filter { it.connectionState == FfiConnectionState.ONLINE }
-                    .map { it.id.toLong() }
-                    .toSet()
-                val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
-                    .intersect(onlineNow)
-                accountsToFlush.forEach { accountId ->
-                    try {
-                        core.flushOutbox(accountId.toULong())
-                    } catch (_: MindChatBindingException) {
-                        // The core has already projected a failed delivery state when applicable.
-                    }
-                }
-                TransportPollResult(core.snapshot(), accountsToFlush)
+                TransportPollResult(core.snapshot(), flushedAccounts)
             } catch (_: MindChatBindingException) {
                 null
             }
@@ -251,6 +298,13 @@ class NativeMindChatGateway(
         result?.let { pollResult ->
             pendingOutboxAccounts.removeAll(pollResult.flushedAccounts)
             refresh(pollResult.snapshot)
+        }
+    }
+
+    override suspend fun persistNow() {
+        withContext(Dispatchers.IO) {
+            runCatching { core.saveState(stateFile.absolutePath) }
+            dirty = false
         }
     }
 
@@ -286,6 +340,7 @@ class NativeMindChatGateway(
                 title.trim().ifBlank { address.substringBefore('@') },
                 System.currentTimeMillis().toULong(),
             ).toLong()
+            dirty = true
             refresh()
             return conversationId
         } catch (_: MindChatBindingException) {
@@ -510,6 +565,8 @@ class PreviewMindChatGateway(
     }
 
     override suspend fun pollTransport() = Unit
+
+    override suspend fun persistNow() = Unit
 
     override fun openConversation(address: String, title: String, group: Boolean): Long? {
         val addressValue = address.trim()

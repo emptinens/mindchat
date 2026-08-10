@@ -10,7 +10,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 pub mod extension;
+pub mod persistence;
 pub mod transport;
 
 #[cfg(feature = "xmpp-transport")]
@@ -46,7 +49,7 @@ pub type ReactionId = u64;
 const MAX_MESSAGE_CHARS: usize = 16_384;
 
 /// Connection status projected to the UI.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ConnectionState {
     #[default]
     Offline,
@@ -56,7 +59,7 @@ pub enum ConnectionState {
 }
 
 /// Presence projected for one roster contact.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContactPresence {
     Online,
     Away,
@@ -70,7 +73,7 @@ pub enum ContactPresence {
 /// This is an account-local projection of RFC 6121 roster state. Subscription
 /// requests themselves remain transport commands and are not represented as
 /// credentials or raw stanzas in the core.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RosterSubscription {
     /// Neither side currently receives the other side's presence.
     #[default]
@@ -86,21 +89,21 @@ pub enum RosterSubscription {
 }
 
 /// Conversation transport topology.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ConversationKind {
     Direct,
     MultiUserChat,
 }
 
 /// Direction of a message relative to the local account.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MessageDirection {
     Incoming,
     Outgoing,
 }
 
 /// Delivery state shown for an outgoing message.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DeliveryState {
     Pending,
     Sent,
@@ -110,7 +113,7 @@ pub enum DeliveryState {
 }
 
 /// High-level payload category. Binary data is kept outside this core model.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MessageKind {
     Text,
     Attachment,
@@ -118,7 +121,7 @@ pub enum MessageKind {
 }
 
 /// XMPP capability that must be discovered before its UI action is available.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum ProtocolCapability {
     MultiUserChat,
     MessageArchiveManagement,
@@ -156,7 +159,7 @@ impl AccountSetup {
 }
 
 /// One configured XMPP account.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Account {
     pub id: AccountId,
     pub jid: String,
@@ -169,7 +172,7 @@ pub struct Account {
 }
 
 /// A roster contact projection owned by one account.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Contact {
     pub account_id: AccountId,
     pub jid: String,
@@ -180,7 +183,7 @@ pub struct Contact {
 }
 
 /// A local conversation projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Conversation {
     pub id: ConversationId,
     pub account_id: AccountId,
@@ -192,7 +195,7 @@ pub struct Conversation {
 }
 
 /// Attachment metadata that is safe to expose to the UI.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     pub id: String,
     pub filename: String,
@@ -202,7 +205,7 @@ pub struct Attachment {
 }
 
 /// An immutable message projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
     pub conversation_id: ConversationId,
@@ -217,7 +220,7 @@ pub struct Message {
 }
 
 /// An emoji reaction attached to a message.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Reaction {
     pub id: ReactionId,
     pub message_id: MessageId,
@@ -226,7 +229,7 @@ pub struct Reaction {
 }
 
 /// Read-only state suitable for a persistence adapter or test fixture.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CoreSnapshot {
     pub accounts: Vec<Account>,
     pub contacts: Vec<Contact>,

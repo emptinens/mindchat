@@ -5,6 +5,7 @@
 //! details, while Kotlin receives only immutable, display-safe records and
 //! commands.
 
+use crate::persistence::{PersistenceError, load_state, save_state};
 use crate::{
     AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
     DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
@@ -12,6 +13,7 @@ use crate::{
     TransportCoordinatorError, TransportError,
 };
 use std::fmt;
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_TRANSPORT_EVENTS_PER_POLL: u32 = 128;
@@ -411,6 +413,25 @@ impl From<TransportCoordinatorError> for MindChatBindingError {
     }
 }
 
+impl From<PersistenceError> for MindChatBindingError {
+    fn from(value: PersistenceError) -> Self {
+        match value {
+            PersistenceError::Io(error) => {
+                Self::Internal { detail: format!("state persistence I/O error: {error}") }
+            }
+            PersistenceError::Corrupt(detail) => {
+                Self::Internal { detail: format!("corrupt state file: {detail}") }
+            }
+            PersistenceError::UnsupportedVersion(version) => {
+                Self::Internal { detail: format!("unsupported state schema version {version}") }
+            }
+            PersistenceError::TooLarge(bytes) => {
+                Self::Internal { detail: format!("state file too large: {bytes} bytes") }
+            }
+        }
+    }
+}
+
 /// Thread-safe owner for a Rust core instance.
 ///
 /// Kotlin never receives the inner state machine. Every mutation is validated
@@ -625,6 +646,48 @@ impl MindChatCoreHandle {
     /// Drains state-change notifications in mutation order.
     pub fn drain_events(&self) -> Result<Vec<FfiCoreEvent>, MindChatBindingError> {
         Ok(self.lock()?.core_mut().drain_events().into_iter().map(Into::into).collect())
+    }
+
+    /// Writes the current snapshot to `path` as versioned JSON.
+    ///
+    /// The snapshot is captured under the session lock and written outside it,
+    /// so file I/O never blocks other core mutations. No secrets are written:
+    /// account passwords never enter the core or the snapshot. Callers must
+    /// serialize concurrent `save_state` calls.
+    pub fn save_state(&self, path: String) -> Result<(), MindChatBindingError> {
+        let snapshot = self.lock()?.core().snapshot();
+        save_state(&snapshot, Path::new(&path)).map_err(Into::into)
+    }
+
+    /// Restores a saved snapshot from `path`, returning whether one was loaded.
+    ///
+    /// `Ok(false)` means no state file exists and the handle stays empty.
+    /// `Ok(true)` replaces the core with the sanitized snapshot; restored
+    /// accounts are always `Offline` with cleared errors and capabilities
+    /// until a real connect happens. The load is refused when the core
+    /// already contains accounts or the transport owns connections, because
+    /// restore must run exactly once at startup on an empty handle rather
+    /// than merge or clobber live state. The file contains no secrets.
+    pub fn load_state(&self, path: String) -> Result<bool, MindChatBindingError> {
+        let mut session = self.lock()?;
+        if !session.core().accounts().is_empty() {
+            return Err(MindChatBindingError::Internal {
+                detail: "core already contains accounts; load_state must run before any mutation"
+                    .to_owned(),
+            });
+        }
+        if !session.transport().connected_accounts().is_empty() {
+            return Err(MindChatBindingError::Internal {
+                detail: "transport already has connected accounts; load_state must run before any connection"
+                    .to_owned(),
+            });
+        }
+        let Some(snapshot) = load_state(Path::new(&path)).map_err(MindChatBindingError::from)?
+        else {
+            return Ok(false);
+        };
+        *session.core_mut() = MindChatCore::from_snapshot(snapshot);
+        Ok(true)
     }
 }
 
@@ -847,6 +910,120 @@ mod tests {
         assert_eq!(
             core.snapshot().expect("snapshot").accounts[0].connection_state,
             FfiConnectionState::Offline
+        );
+    }
+
+    /// Unique state-file path under the system temp dir for one test.
+    ///
+    /// The parent directory is removed when the guard drops so tests never
+    /// leave files behind.
+    struct TempState {
+        path: std::path::PathBuf,
+    }
+
+    impl TempState {
+        fn new(label: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mindchat-ffi-{label}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("create test temp directory");
+            Self { path: dir.join("mindchat_state.json") }
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.path.clone()
+        }
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            if let Some(parent) = self.path.parent() {
+                let _result = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
+    fn populate_handle(core: &MindChatCoreHandle) -> (u64, u64, u64) {
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+        let conversation_id = core
+            .open_conversation(
+                account_id,
+                FfiConversationKind::Direct,
+                "bob@example.org".to_owned(),
+                "Bob".to_owned(),
+                100,
+            )
+            .expect("conversation");
+        let message_id = core
+            .send_text(
+                conversation_id,
+                "alice@example.org".to_owned(),
+                "hello".to_owned(),
+                None,
+                200,
+            )
+            .expect("message");
+        (account_id, conversation_id, message_id)
+    }
+
+    #[test]
+    fn bridge_save_and_load_state_round_trip() {
+        let first = MindChatCoreHandle::new();
+        let (account_id, conversation_id, message_id) = populate_handle(&first);
+        let temp = TempState::new("round-trip");
+
+        first.save_state(temp.path().to_string_lossy().into_owned()).expect("save succeeds");
+
+        let second = MindChatCoreHandle::new();
+        assert!(
+            second.load_state(temp.path().to_string_lossy().into_owned()).expect("load succeeds")
+        );
+
+        let restored = second.snapshot().expect("restored snapshot");
+        assert_eq!(restored.accounts.len(), 1);
+        assert_eq!(restored.accounts[0].id, account_id);
+        assert_eq!(restored.accounts[0].connection_state, FfiConnectionState::Offline);
+        assert!(restored.accounts[0].capabilities.is_empty());
+        assert_eq!(restored.conversations[0].id, conversation_id);
+        assert_eq!(restored.messages[0].id, message_id);
+        assert_eq!(restored.messages[0].body, "hello");
+    }
+
+    #[test]
+    fn bridge_load_state_refuses_non_empty_core() {
+        let core = MindChatCoreHandle::new();
+        populate_handle(&core);
+        let temp = TempState::new("refuse");
+
+        assert_eq!(
+            core.load_state(temp.path().to_string_lossy().into_owned()),
+            Err(MindChatBindingError::Internal {
+                detail: "core already contains accounts; load_state must run before any mutation"
+                    .to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_load_state_missing_file_returns_false() {
+        let core = MindChatCoreHandle::new();
+        let temp = TempState::new("missing");
+        let missing = temp.path().with_extension("never-written.json");
+
+        assert!(
+            !core
+                .load_state(missing.to_string_lossy().into_owned())
+                .expect("missing file loads as false")
         );
     }
 }
