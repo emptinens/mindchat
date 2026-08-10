@@ -27,3 +27,6 @@ mindchat-diagnostics-*.zip
 local.properties
 .scratch/
 .DS_Store
+
+# Scratch screenshots
+.scratch_screen.png
