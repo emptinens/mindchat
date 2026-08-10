@@ -285,13 +285,15 @@ class NativeMindChatGateway(
                 }
 
                 val userDirty = dirty
+                // Optimistic clear: a successful save below confirms it, while
+                // a mutation that lands during the save re-sets the flag and is
+                // covered by the next poll.
+                dirty = false
                 val stateChanged = userDirty || processedEvents > 0U || flushedAccounts.isNotEmpty()
                 if (stateChanged) {
                     val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
-                    // Clear the dirty flag only on success so a transient I/O
-                    // failure is retried on the next poll instead of silently
-                    // dropping the pending mutation. Mutations that arrive
-                    // while the save is in flight re-set dirty themselves.
+                    // On failure restore the pending flag so the mutation is
+                    // retried on the next poll instead of silently dropped.
                     if (!saved) dirty = userDirty || dirty
                 }
 

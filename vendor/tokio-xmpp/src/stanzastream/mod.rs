@@ -140,6 +140,13 @@ impl StanzaStream {
                     const MAX_DELAY: Duration = Duration::new(30, 0);
                     let mut delay = Duration::new(1, 0);
                     loop {
+                        // MindChat patch: stop retrying as soon as the stream
+                        // worker has gone away (cancelled connect or dropped
+                        // stream), instead of leaving a stray dialing task
+                        // looping until it eventually connects or fails.
+                        if slot.is_closed() {
+                            return;
+                        }
                         log::debug!("Starting new connection as {}", jid);
                         match crate::client::login::client_auth(
                             server.clone(),

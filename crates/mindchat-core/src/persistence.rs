@@ -85,13 +85,22 @@ impl std::error::Error for PersistenceError {
 /// # Errors
 ///
 /// Returns [`PersistenceError::Io`] when the file system rejects any step of
-/// the write, and [`PersistenceError::Corrupt`] if the snapshot cannot be
-/// serialized (which cannot happen for valid in-memory state).
+/// the write, [`PersistenceError::Corrupt`] if the snapshot cannot be
+/// serialized (which cannot happen for valid in-memory state), and
+/// [`PersistenceError::TooLarge`] when the serialized file would exceed
+/// [`MAX_STATE_FILE_BYTES`].
 pub fn save_state(snapshot: &CoreSnapshot, path: &Path) -> Result<(), PersistenceError> {
     let persisted =
         PersistedState { schema_version: CURRENT_SCHEMA_VERSION, snapshot: snapshot.clone() };
     let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| PersistenceError::Corrupt(error.to_string()))?;
+    // Enforce the same bound that load_state applies, so the app can never
+    // write a file it will refuse (and rename aside as corrupt) on the next
+    // launch.
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_count > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceError::TooLarge(byte_count));
+    }
     let tmp_path = tmp_path_for(path);
 
     let write_result = std::fs::File::create(&tmp_path)

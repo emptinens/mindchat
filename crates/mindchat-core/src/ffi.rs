@@ -651,9 +651,11 @@ impl MindChatCoreHandle {
     /// Writes the current snapshot to `path` as versioned JSON.
     ///
     /// The snapshot is captured under the session lock and written outside it,
-    /// so file I/O never blocks other core mutations. No secrets are written:
-    /// account passwords never enter the core or the snapshot. Callers must
-    /// serialize concurrent `save_state` calls.
+    /// so file I/O never blocks other core mutations. Concurrent saves are
+    /// safe: each write stages a unique temporary file and renames it over
+    /// `path` atomically, so the last completed save wins with a complete
+    /// snapshot. No secrets are written: account passwords never enter the
+    /// core or the snapshot.
     pub fn save_state(&self, path: String) -> Result<(), MindChatBindingError> {
         let snapshot = self.lock()?.core().snapshot();
         save_state(&snapshot, Path::new(&path)).map_err(Into::into)

@@ -441,9 +441,21 @@ fn dedupe_candidates(attempts: Vec<(SocketAddr, bool)>) -> Vec<(SocketAddr, bool
 }
 
 /// True when the error is a terminal authentication failure.
+///
+/// A server-side `TemporaryAuthFailure` is deliberately recoverable: it is a
+/// transient condition (for example rate limiting) and a later retry can
+/// succeed, unlike a hard credential rejection.
 #[must_use]
 fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
-    matches!(error, tokio_xmpp::Error::Auth(_))
+    let tokio_xmpp::Error::Auth(auth_error) = error else {
+        return false;
+    };
+    !matches!(
+        auth_error,
+        tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::TemporaryAuthFailure,
+        )
+    )
 }
 
 /// Maps the first client event to a terminal connect failure, if it is one.
@@ -1022,6 +1034,16 @@ mod tests {
         assert!(!is_auth_error(&tokio_xmpp::Error::Protocol(
             tokio_xmpp::error::ProtocolError::NoTls
         )));
+    }
+
+    #[test]
+    fn temporary_auth_failure_is_recoverable() {
+        let temporary = tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::TemporaryAuthFailure,
+        ));
+        let failure = terminal_failure_for_event(&TokioXmppEvent::Disconnected(temporary))
+            .expect("a disconnected first event is a terminal failure");
+        assert!(failure.recoverable, "a transient server auth failure must be retryable");
     }
 
     #[test]
