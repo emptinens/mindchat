@@ -143,6 +143,10 @@ class NativeMindChatGateway(
         // file aside so the app can continue with an empty core.
         runCatching { core.loadState(stateFile.absolutePath) }
             .onFailure {
+                // The load is refused (corrupt/unknown/oversized); rename the
+                // bad file aside so a fresh state can be written. A failed
+                // rename is tolerated: it only means the corrupt file stays
+                // behind and the next launch retries the same rename.
                 if (stateFile.exists()) {
                     stateFile.renameTo(File(stateFile.path + ".corrupt-" + System.currentTimeMillis()))
                 }
@@ -281,10 +285,14 @@ class NativeMindChatGateway(
                 }
 
                 val userDirty = dirty
-                dirty = false
                 val stateChanged = userDirty || processedEvents > 0U || flushedAccounts.isNotEmpty()
                 if (stateChanged) {
-                    runCatching { core.saveState(stateFile.absolutePath) }
+                    val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
+                    // Clear the dirty flag only on success so a transient I/O
+                    // failure is retried on the next poll instead of silently
+                    // dropping the pending mutation. Mutations that arrive
+                    // while the save is in flight re-set dirty themselves.
+                    if (!saved) dirty = userDirty || dirty
                 }
 
                 if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
@@ -303,8 +311,8 @@ class NativeMindChatGateway(
 
     override suspend fun persistNow() {
         withContext(Dispatchers.IO) {
-            runCatching { core.saveState(stateFile.absolutePath) }
-            dirty = false
+            val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
+            if (saved) dirty = false
         }
     }
 

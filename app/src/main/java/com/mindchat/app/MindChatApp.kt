@@ -378,8 +378,14 @@ private fun MindChatTopBar(
             }
         },
         actions = {
-            if (active?.connectionState == AccountConnectionState.FAILED) {
-                TextButton(onClick = { onReconnect(active.id) }) {
+            // Offer retry both for hard failures (Failed) and for recoverable
+            // connect errors (Offline with a reason), so a wedged DNS or a
+            // timed-out handshake always has a visible retry affordance.
+            val needsReconnect = active != null &&
+                (active.connectionState == AccountConnectionState.FAILED ||
+                    active.connectionError != null)
+            if (needsReconnect) {
+                TextButton(onClick = { active?.let { onReconnect(it.id) } }) {
                     Text(stringResource(R.string.reconnect))
                 }
             }

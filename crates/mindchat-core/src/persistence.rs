@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Schema version of the on-disk [`PersistedState`] format.
 ///
@@ -20,8 +21,10 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 /// Upper bound for an acceptable state file, in bytes.
 ///
-/// Larger files are refused on load as a corrupt or hostile-file guard.
-pub const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// Larger files are refused on load as a corrupt or hostile-file guard. The
+/// bound also indirectly caps the memory cost of deserializing a snapshot on
+/// the startup thread, so it is kept far below archive-sized histories.
+pub const MAX_STATE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// On-disk envelope wrapping one [`CoreSnapshot`] with a schema version.
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
@@ -71,10 +74,13 @@ impl std::error::Error for PersistenceError {
 
 /// Writes `snapshot` to `path` atomically as versioned, pretty-printed JSON.
 ///
-/// Bytes are serialized first, written to `<path>.tmp`, flushed to disk with
-/// `sync_all`, and finally renamed over `path`. A crash mid-write leaves the
-/// previous file intact and only a stale `.tmp` file behind, which the next
-/// save overwrites. On error the `.tmp` file is removed best-effort.
+/// Bytes are serialized first, written to a unique `<path>.<pid>.<counter>.tmp`
+/// staging file, flushed to disk with `sync_all`, and finally renamed over
+/// `path`. A crash mid-write leaves the previous file intact and only a stale
+/// staging file behind, which a later save leaves untouched and the OS
+/// eventually reclaims. Concurrent saves from other threads each write their
+/// own staging file, so the last `rename` always installs one complete
+/// snapshot. On error the staging file is removed best-effort.
 ///
 /// # Errors
 ///
@@ -160,10 +166,16 @@ fn sanitize_snapshot(mut snapshot: CoreSnapshot) -> CoreSnapshot {
     snapshot
 }
 
-/// Returns the `<path>.tmp` staging name used for atomic saves.
+/// Returns a unique `<path>.<pid>.<counter>.tmp` staging name for atomic saves.
+///
+/// Uniqueness matters: a concurrent save from another thread (for example the
+/// poll loop and the `ON_STOP` lifecycle flush in Kotlin) writes its own
+/// staging file, so the final `rename` always installs one complete snapshot
+/// instead of interleaving two writers on a shared staging path.
 fn tmp_path_for(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
     PathBuf::from(tmp)
 }
 
@@ -336,7 +348,12 @@ mod tests {
         let temp = TempState::new("atomic");
 
         save_state(&core.snapshot(), temp.path()).expect("save succeeds");
-        assert!(!tmp_path_for(temp.path()).exists(), "staging file must be renamed away");
+        let parent = temp.path().parent().expect("temp path has a parent");
+        let stray_tmp = std::fs::read_dir(parent)
+            .expect("read temp directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!stray_tmp, "staging file must be renamed away");
 
         let content = std::fs::read_to_string(temp.path()).expect("read saved file");
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
