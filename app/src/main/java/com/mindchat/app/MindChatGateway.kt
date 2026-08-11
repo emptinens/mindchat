@@ -18,8 +18,11 @@ import java.io.File
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 enum class Presence { ONLINE, AWAY, DO_NOT_DISTURB, OFFLINE }
 
@@ -84,6 +87,33 @@ private data class TransportPollResult(
     val flushedAccounts: Set<Long>,
 )
 
+/**
+ * Tracks mutations independently from completed persistence snapshots.
+ *
+ * A save only acknowledges the epoch captured before its native snapshot. A
+ * concurrent later mutation therefore remains dirty even if an older writer
+ * completes after it.
+ */
+internal class PersistenceStateTracker {
+    private val mutationEpoch = AtomicLong(0)
+    private val persistedEpoch = AtomicLong(0)
+
+    fun markMutation() {
+        mutationEpoch.incrementAndGet()
+    }
+
+    fun requiresSave(): Boolean = mutationEpoch.get() != persistedEpoch.get()
+
+    fun captureSaveEpoch(): Long = mutationEpoch.get()
+
+    fun markPersisted(epoch: Long) {
+        while (true) {
+            val current = persistedEpoch.get()
+            if (current >= epoch || persistedEpoch.compareAndSet(current, epoch)) return
+        }
+    }
+}
+
 interface MindChatGateway {
     val state: MindChatUiState
 
@@ -130,32 +160,19 @@ class NativeMindChatGateway(
     private var customization = preferences.readCustomization()
     private val pendingOutboxAccounts = mutableSetOf<Long>()
 
-    /** True when a user mutation since the last save must be persisted. */
-    @Volatile
-    private var dirty = false
+    /** Serializes snapshots written by polling and lifecycle shutdown. */
+    private val persistenceMutex = Mutex()
+    private val persistenceTracker = PersistenceStateTracker()
 
     override var state by mutableStateOf(snapshotToUiState())
         private set
 
     init {
-        // Restore durable state once at startup. Ok(true) restores the previous
-        // session; Ok(false) (no file) starts fresh; a failure renames the bad
-        // file aside so the app can continue with an empty core.
-        runCatching { core.loadState(stateFile.absolutePath) }
-            .onFailure {
-                // The load is refused (corrupt/unknown/oversized); rename the
-                // bad file aside so a fresh state can be written. A failed
-                // rename is tolerated: it only means the corrupt file stays
-                // behind and the next launch retries the same rename.
-                if (stateFile.exists()) {
-                    stateFile.renameTo(File(stateFile.path + ".corrupt-" + System.currentTimeMillis()))
-                }
-            }
+        // Restore durable state once at startup. The bounded JSON file is
+        // parsed by the native core before Compose starts rendering. A failure
+        // is quarantined so a future successful save can start a clean state.
+        restoreState()
         refresh()
-    }
-
-    companion object {
-        private const val STATE_FILE_NAME = "mindchat_state.json"
     }
 
     override fun selectAccount(accountId: Long) {
@@ -187,9 +204,9 @@ class NativeMindChatGateway(
                     displayName.trim().ifBlank { normalizedJid.substringBefore('@') },
                 ).toLong()
             activeAccountId = accountId
-            reconnectAccount(accountId, password)
-            dirty = true
-            true
+            val connected = reconnectAccount(accountId, password)
+            markDirty()
+            connected
         } catch (_: MindChatBindingException) {
             // A failed native setup remains visible through its core connection state.
             refresh()
@@ -201,7 +218,7 @@ class NativeMindChatGateway(
         if (password.isEmpty()) return false
         return try {
             core.connectAccount(accountId.toULong(), password)
-            dirty = true
+            markDirty()
             refresh()
             true
         } catch (_: MindChatBindingException) {
@@ -220,7 +237,7 @@ class NativeMindChatGateway(
                 FfiContactPresence.OFFLINE,
                 null,
             )
-            dirty = true
+            markDirty()
             refresh()
         } catch (_: MindChatBindingException) {
             // Domain validation owns contact-address rejection.
@@ -237,7 +254,7 @@ class NativeMindChatGateway(
                 null,
                 System.currentTimeMillis().toULong(),
             )
-            dirty = true
+            markDirty()
             pendingOutboxAccounts += account.id
             refresh()
         } catch (_: MindChatBindingException) {
@@ -284,17 +301,12 @@ class NativeMindChatGateway(
                     emptySet()
                 }
 
-                val userDirty = dirty
-                // Optimistic clear: a successful save below confirms it, while
-                // a mutation that lands during the save re-sets the flag and is
-                // covered by the next poll.
-                dirty = false
-                val stateChanged = userDirty || processedEvents > 0U || flushedAccounts.isNotEmpty()
+                if (processedEvents > 0U || flushedAccounts.isNotEmpty()) {
+                    markDirty()
+                }
+                val stateChanged = persistenceTracker.requiresSave()
                 if (stateChanged) {
-                    val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
-                    // On failure restore the pending flag so the mutation is
-                    // retried on the next poll instead of silently dropped.
-                    if (!saved) dirty = userDirty || dirty
+                    saveSnapshot()
                 }
 
                 if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
@@ -313,8 +325,7 @@ class NativeMindChatGateway(
 
     override suspend fun persistNow() {
         withContext(Dispatchers.IO) {
-            val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
-            if (saved) dirty = false
+            saveSnapshot()
         }
     }
 
@@ -350,7 +361,7 @@ class NativeMindChatGateway(
                 title.trim().ifBlank { address.substringBefore('@') },
                 System.currentTimeMillis().toULong(),
             ).toLong()
-            dirty = true
+            markDirty()
             refresh()
             return conversationId
         } catch (_: MindChatBindingException) {
@@ -362,6 +373,33 @@ class NativeMindChatGateway(
     private fun refresh(snapshot: FfiCoreSnapshot = core.snapshot()) {
         state = snapshotToUiState(snapshot)
         core.drainEvents()
+    }
+
+    private fun markDirty() {
+        persistenceTracker.markMutation()
+    }
+
+    private fun restoreState() {
+        runCatching { core.loadState(stateFile.absolutePath) }
+            .onFailure {
+                if (stateFile.exists()) {
+                    stateFile.renameTo(File(stateFile.path + ".corrupt-" + System.currentTimeMillis()))
+                }
+            }
+    }
+
+    /**
+     * Saves one ordered snapshot. A mutation concurrent with native I/O keeps
+     * `dirty` set because its epoch differs from the snapshot's captured
+     * epoch.
+     */
+    private suspend fun saveSnapshot(): Boolean = persistenceMutex.withLock {
+        val epochAtSave = persistenceTracker.captureSaveEpoch()
+        val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
+        if (saved) {
+            persistenceTracker.markPersisted(epochAtSave)
+        }
+        saved
     }
 
     private fun updateCustomization(update: (MindChatCustomization) -> MindChatCustomization) {

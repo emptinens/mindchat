@@ -356,7 +356,10 @@ async fn run_worker(
             } else {
                 send_event(
                     &event_sender,
-                    TransportEvent::Disconnected { account_id, recoverable: false, detail: None },
+                    // An EOF has no server-supplied terminal cause. Treat it
+                    // as retryable so an ordinary network loss never becomes
+                    // a permanent credential failure in the UI.
+                    TransportEvent::Disconnected { account_id, recoverable: true, detail: None },
                 );
                 break;
             },
