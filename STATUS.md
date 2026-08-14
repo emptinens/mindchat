@@ -263,6 +263,47 @@ but not yet into the embedded library; CI performs the full native assembly.
 Registration UI on `LoginScreen` (sign-in/register toggle) is wired to
 `gateway.registerAccount`.
 
+## 0.1.6 (floating dock, detailed settings, optimization; 2026-08-14)
+
+Two parallel agents delivered the 0.1.6 slice; merged commits `8060781`
+(fix/dock) and `4f49503` (fix/optim), merge commits `190ecc8`, `4122c16`.
+
+1. **Floating M3E dock** (`MindChatApp.kt`): the edge-to-edge `NavigationBar`
+   is replaced with a raised, centered pill dock (surfaceContainerHighest,
+   28dp shape, shadow, `navigationBarsPadding` + bottom offset) with an
+   animated `secondaryContainer` selected pill. It lives only on the shell
+   scaffold, so chat-detail screens stay full-height. Same three
+   destinations: Chats / Contacts / Settings.
+2. **Detailed settings** (`SettingsScreen.kt`, new public composable) with
+   M3 Expressive categories: Appearance (dynamic color, comfortable layout,
+   accent row linked to the active profile sheet), Accounts (app lock,
+   manage-accounts drawer, add account, edit profile), Privacy (search /
+   encryption switches with explicit not-implemented-yet text, no fake
+   backing), Notifications (coming-later rows), Storage (local size estimate
+   of avatars + state file, clear profile images with confirmation that also
+   drops stale avatar refs), About (version, licenses dialog, repository
+   link). `SettingsStorageTest` covers the estimate/clear helpers.
+3. **Poll-path optimization** (`MindChatGateway.kt`): `refresh()` compares
+   the raw `FfiCoreSnapshot` structurally against the last mapped one
+   (allocation-free data-class equals) and skips the full UI rebuild and
+   recomposition when nothing changed; CONNECTING accounts always rebuild so
+   wall-clock stall detection keeps working. `core.drainEvents()` still runs
+   every poll. Reactions are indexed by message id once, making message
+   mapping O(messages + reactions) instead of O(messages x reactions).
+   Measured: ~53 us per unchanged poll (vs full rebuild), reaction mapping
+   3.59 ms -> 0.49 ms. 15 new unit tests (`SnapshotDiffingTest`).
+4. **Strings**: EN/RU parity maintained (125/125).
+
+Verification on the merged tree: Rust all-targets tests + clippy
+`-D warnings` + `cargo fmt --check` green; Android `compileDebugKotlin`,
+`testDebugUnitTest` (28 tests, 4 suites), `lintDebug` (0 errors),
+`assembleDebug` all pass. APK SHA-256 `54876b1e…`.
+
+Caveats: About shows `BuildConfig.VERSION_NAME` = 0.1.4 until the release
+bump; privacy/notification rows are placeholders with explicit supporting
+text; the local APK still embeds the previously built native `.so` (no NDK
+on this host, CI does the native assembly).
+
 ## Verification already completed for 0.1.4
 
 All listed Rust checks were run successfully against the current source using
@@ -322,15 +363,15 @@ remain ignored build output.
 
 ### Current debug APK
 
-Current generated artifact (2026-08-14, 0.1.5 tree; note the embedded native
+Current generated artifact (2026-08-14, 0.1.6 tree; note the embedded native
 library is still the 0.1.4 `.so` because this host has no NDK):
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 versionCode: 5
 versionName: 0.1.4
-SHA-256: 62f6c0a7a8e6cc7c0ef3a808405ce381e27d48da686e95a0aa3800e2406379c6
-size: 42,844,136 bytes
+SHA-256: 54876b1efe4ec197aaed7c614c980ee8edcb29cfdabf5bad464cce6242baf4f9
+size: 43,153,701 bytes
 ```
 
 The 0.1.4 release artifact (source `d79f0d5`) was:
