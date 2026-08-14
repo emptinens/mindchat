@@ -4,13 +4,45 @@
 //! directly. The domain remains free to evolve its storage and transport
 //! details, while Kotlin receives only immutable, display-safe records and
 //! commands.
+//!
+//! # Current public session methods on [`MindChatCoreHandle`]
+//!
+//! ```text
+//! new
+//! add_account
+//! set_connection_state
+//! set_capabilities
+//! upsert_contact
+//! open_conversation
+//! send_text
+//! receive_text
+//! add_reaction
+//! mark_conversation_read
+//! connect_account
+//! register_account
+//! disconnect_account
+//! delete_account
+//! update_account_display_name
+//! delete_conversation
+//! poll_transport_events
+//! flush_outbox
+//! snapshot
+//! drain_events
+//! save_state
+//! load_state
+//! ```
+//!
+//! [`mindchat_binding_version`] is the free binding contract probe. All session
+//! methods take UI-safe values and return typed errors; passwords are accepted
+//! only by [`MindChatCoreHandle::connect_account`] and
+//! [`MindChatCoreHandle::register_account`], never stored or returned.
 
 use crate::persistence::{PersistenceError, load_state, save_state};
 use crate::{
     AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
     DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
-    RosterSubscription, SecretString, TokioXmppTransport, TransportCoordinator,
-    TransportCoordinatorError, TransportError,
+    RegisterRequest, RosterSubscription, SecretString, TokioXmppTransport, TransportCoordinator,
+    TransportCoordinatorError, TransportError, XmppTransport,
 };
 use std::fmt;
 use std::path::Path;
@@ -382,6 +414,7 @@ impl From<CoreError> for MindChatBindingError {
             | CoreError::EmptyMessage
             | CoreError::MessageTooLong
             | CoreError::EmptyReaction
+            | CoreError::EmptyDisplayName
             | CoreError::InvalidReplyTarget => Self::InvalidInput { detail: value.to_string() },
             CoreError::UnknownAccount(_)
             | CoreError::UnknownConversation(_)
@@ -594,9 +627,109 @@ impl MindChatCoreHandle {
         self.lock()?.connect(account_id, SecretString::new(password)).map_err(Into::into)
     }
 
+    /// Registers a new account with XEP-0077 in-band registration and starts
+    /// its authenticated session.
+    ///
+    /// The whole registration exchange (DNS, stream setup, fields query, and
+    /// submission) runs synchronously under a hard time bound, so this call
+    /// always returns a terminal result. Registration is offered only when the
+    /// server advertises `jabber:iq:register`; servers that require a data form
+    /// or captcha are refused with a UI-safe detail, because MindChat
+    /// implements only username/password registration. On success the account
+    /// is created in the core and a normal authenticated session starts, so
+    /// the account ends up `Online` once transport events are polled.
+    ///
+    /// The password is handed to the registration worker and to the session
+    /// connect; it is never stored in the core, snapshots, or event stream.
+    pub fn register_account(
+        &self,
+        username: String,
+        server: String,
+        display_name: String,
+        password: String,
+    ) -> Result<u64, MindChatBindingError> {
+        if password.is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a password is required".to_owned(),
+            });
+        }
+        if username.trim().is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a username is required".to_owned(),
+            });
+        }
+        if server.trim().is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a server hostname is required".to_owned(),
+            });
+        }
+        let mut session = self.lock()?;
+        let jid = format!("{username}@{server}");
+        session
+            .transport_mut()
+            .register(RegisterRequest {
+                username: username.clone(),
+                server: server.clone(),
+                password: SecretString::new(password.clone()),
+            })
+            .map_err(MindChatBindingError::from)?;
+        let account_id =
+            session.core_mut().add_account(AccountSetup::new(jid, server, display_name))?;
+        session.connect(account_id, SecretString::new(password))?;
+        Ok(account_id)
+    }
+
     /// Stops an active XMPP session and projects the account as offline.
     pub fn disconnect_account(&self, account_id: u64) -> Result<(), MindChatBindingError> {
         self.lock()?.disconnect(account_id).map_err(Into::into)
+    }
+
+    /// Removes an account, disconnecting it first if a session is active.
+    ///
+    /// The account's contacts, conversations, messages, and reactions are
+    /// removed from the core, and the UI is notified with `AccountChanged`;
+    /// the next snapshot simply no longer contains the account or its data.
+    pub fn delete_account(&self, account_id: u64) -> Result<(), MindChatBindingError> {
+        let mut session = self.lock()?;
+        if !session.core().accounts().iter().any(|account| account.id == account_id) {
+            return Err(MindChatBindingError::NotFound {
+                detail: format!("unknown account {account_id}"),
+            });
+        }
+        // Best effort: a tracked worker (including a dead one whose terminal
+        // event was not polled yet) is released; the account is being deleted,
+        // so a stale worker cannot keep the account slot or the connection.
+        if session.transport().connected_accounts().contains(&account_id) {
+            let _ = session.transport_mut().disconnect(account_id);
+        }
+        session.core_mut().delete_account(account_id).map_err(Into::into)
+    }
+
+    /// Replaces the display name shown for an account.
+    ///
+    /// An empty or whitespace-only display name is rejected as invalid input.
+    pub fn update_account_display_name(
+        &self,
+        account_id: u64,
+        display_name: String,
+    ) -> Result<(), MindChatBindingError> {
+        if display_name.trim().is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a display name is required".to_owned(),
+            });
+        }
+        self.lock()?
+            .core_mut()
+            .update_account_display_name(account_id, display_name)
+            .map_err(Into::into)
+    }
+
+    /// Removes a conversation and every message and reaction inside it.
+    ///
+    /// The UI is notified with `ConversationChanged`; the next snapshot no
+    /// longer contains the conversation or its data.
+    pub fn delete_conversation(&self, conversation_id: u64) -> Result<(), MindChatBindingError> {
+        self.lock()?.core_mut().delete_conversation(conversation_id).map_err(Into::into)
     }
 
     /// Applies up to `max_events` normalized transport events to the core.
@@ -1030,6 +1163,196 @@ mod tests {
             !core
                 .load_state(missing.to_string_lossy().into_owned())
                 .expect("missing file loads as false")
+        );
+    }
+
+    #[test]
+    fn register_account_rejects_empty_password_and_identifiers_without_network() {
+        let core = MindChatCoreHandle::new();
+        assert_eq!(
+            core.register_account(
+                "alice".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+                String::new(),
+            ),
+            Err(MindChatBindingError::InvalidInput { detail: "a password is required".to_owned() })
+        );
+        assert_eq!(
+            core.register_account(
+                String::new(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+                "s3cret".to_owned(),
+            ),
+            Err(MindChatBindingError::InvalidInput { detail: "a username is required".to_owned() })
+        );
+        assert_eq!(
+            core.register_account(
+                "alice".to_owned(),
+                String::new(),
+                "Alice".to_owned(),
+                "s3cret".to_owned(),
+            ),
+            Err(MindChatBindingError::InvalidInput {
+                detail: "a server hostname is required".to_owned(),
+            })
+        );
+        // No registration worker or session may have been started.
+        assert_eq!(core.poll_transport_events(0).expect("zero poll"), 0);
+        assert!(core.snapshot().expect("snapshot").accounts.is_empty());
+    }
+
+    #[test]
+    fn delete_account_removes_all_account_state_from_snapshot() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        let conversation_id = core
+            .open_conversation(
+                account_id,
+                FfiConversationKind::Direct,
+                "bob@example.org".to_owned(),
+                "Bob".to_owned(),
+                100,
+            )
+            .expect("conversation");
+        let message_id = core
+            .send_text(
+                conversation_id,
+                "alice@example.org".to_owned(),
+                "hello".to_owned(),
+                None,
+                200,
+            )
+            .expect("message");
+        core.set_capabilities(account_id, vec![FfiProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(message_id, "bob@example.org".to_owned(), "👍".to_owned())
+            .expect("reaction");
+        core.drain_events().expect("initial events");
+
+        core.delete_account(account_id).expect("account deleted");
+        let snapshot = core.snapshot().expect("snapshot");
+        assert!(snapshot.accounts.is_empty());
+        assert!(snapshot.conversations.is_empty());
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.reactions.is_empty());
+        assert_eq!(
+            core.drain_events().expect("events"),
+            vec![FfiCoreEvent::AccountChanged { account_id }]
+        );
+    }
+
+    #[test]
+    fn delete_conversation_removes_messages_and_reactions_from_snapshot() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        let conversation_id = core
+            .open_conversation(
+                account_id,
+                FfiConversationKind::Direct,
+                "bob@example.org".to_owned(),
+                "Bob".to_owned(),
+                100,
+            )
+            .expect("conversation");
+        let message_id = core
+            .send_text(
+                conversation_id,
+                "alice@example.org".to_owned(),
+                "hello".to_owned(),
+                None,
+                200,
+            )
+            .expect("message");
+        core.set_capabilities(account_id, vec![FfiProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(message_id, "bob@example.org".to_owned(), "👍".to_owned())
+            .expect("reaction");
+        core.drain_events().expect("initial events");
+
+        core.delete_conversation(conversation_id).expect("conversation deleted");
+        let snapshot = core.snapshot().expect("snapshot");
+        assert_eq!(snapshot.accounts.len(), 1, "the account survives conversation deletion");
+        assert!(snapshot.conversations.is_empty());
+        assert!(snapshot.messages.is_empty());
+        assert!(snapshot.reactions.is_empty());
+        assert_eq!(
+            core.drain_events().expect("events"),
+            vec![FfiCoreEvent::ConversationChanged { conversation_id }]
+        );
+    }
+
+    #[test]
+    fn delete_account_and_conversation_reject_unknown_ids() {
+        let core = MindChatCoreHandle::new();
+        assert_eq!(
+            core.delete_account(999),
+            Err(MindChatBindingError::NotFound { detail: "unknown account 999".to_owned() })
+        );
+        assert_eq!(
+            core.delete_conversation(999),
+            Err(MindChatBindingError::NotFound { detail: "unknown conversation 999".to_owned() })
+        );
+    }
+
+    #[test]
+    fn update_account_display_name_propagates_to_snapshot_and_validates() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        assert_eq!(
+            core.update_account_display_name(account_id, "   ".to_owned()),
+            Err(MindChatBindingError::InvalidInput {
+                detail: "a display name is required".to_owned(),
+            })
+        );
+        assert_eq!(
+            core.update_account_display_name(999, "Alicia".to_owned()),
+            Err(MindChatBindingError::NotFound { detail: "unknown account 999".to_owned() })
+        );
+
+        core.update_account_display_name(account_id, "Alicia".to_owned())
+            .expect("display name updated");
+        assert_eq!(core.snapshot().expect("snapshot").accounts[0].display_name, "Alicia");
+        assert_eq!(
+            core.drain_events().expect("events"),
+            vec![FfiCoreEvent::AccountChanged { account_id }]
+        );
+    }
+
+    #[test]
+    fn registration_refusal_surfaces_as_ui_safe_connection_error() {
+        // The transport's caps-gating detail (a server without
+        // jabber:iq:register) must reach Kotlin as a displayable
+        // ConnectionFailed, never as an Internal error.
+        let error = MindChatBindingError::from(TransportError::ConnectionFailed(
+            "this server does not support in-band registration".to_owned(),
+        ));
+        assert_eq!(
+            error,
+            MindChatBindingError::ConnectionFailed {
+                detail: "this server does not support in-band registration".to_owned(),
+            }
         );
     }
 }

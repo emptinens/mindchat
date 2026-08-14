@@ -36,7 +36,7 @@ pub use transport::{
 };
 
 #[cfg(feature = "xmpp-transport")]
-pub use xmpp::{TokioXmppTransport, resolve_endpoint};
+pub use xmpp::{RegisterRequest, TokioXmppTransport, resolve_endpoint};
 
 /// Stable identifier for an XMPP account configured in the client.
 pub type AccountId = u64;
@@ -287,6 +287,7 @@ pub enum CoreError {
     EmptyMessage,
     MessageTooLong,
     EmptyReaction,
+    EmptyDisplayName,
     InvalidReplyTarget,
     UnknownAccount(AccountId),
     UnknownConversation(ConversationId),
@@ -307,6 +308,7 @@ impl fmt::Display for CoreError {
                 formatter.write_str("message exceeds the configured length limit")
             }
             Self::EmptyReaction => formatter.write_str("a reaction cannot be empty"),
+            Self::EmptyDisplayName => formatter.write_str("a display name is required"),
             Self::InvalidReplyTarget => {
                 formatter.write_str("a reply must target a message in the same conversation")
             }
@@ -1020,6 +1022,65 @@ impl MindChatCore {
         Ok(())
     }
 
+    /// Removes an account and every projection owned by it.
+    ///
+    /// The account's contacts, conversations, and the messages and reactions
+    /// of those conversations are removed from the core. No removal-specific
+    /// event exists yet, so the UI is notified with the established
+    /// [`CoreEvent::AccountChanged`] event; the next snapshot simply no longer
+    /// contains the account or its data.
+    pub fn delete_account(&mut self, account_id: AccountId) -> Result<(), CoreError> {
+        if !self.accounts.contains_key(&account_id) {
+            return Err(CoreError::UnknownAccount(account_id));
+        }
+        let conversation_ids = self
+            .conversations
+            .values()
+            .filter(|conversation| conversation.account_id == account_id)
+            .map(|conversation| conversation.id)
+            .collect::<Vec<_>>();
+        for conversation_id in conversation_ids {
+            self.remove_conversation_state(conversation_id);
+        }
+        self.contacts.retain(|(owner, _), _| *owner != account_id);
+        self.accounts.remove(&account_id);
+        self.events.push(CoreEvent::AccountChanged(account_id));
+        Ok(())
+    }
+
+    /// Removes a conversation and every message and reaction inside it.
+    ///
+    /// Notifies the UI with the established [`CoreEvent::ConversationChanged`]
+    /// event; the next snapshot no longer contains the conversation.
+    pub fn delete_conversation(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<(), CoreError> {
+        if !self.conversations.contains_key(&conversation_id) {
+            return Err(CoreError::UnknownConversation(conversation_id));
+        }
+        self.remove_conversation_state(conversation_id);
+        self.events.push(CoreEvent::ConversationChanged(conversation_id));
+        Ok(())
+    }
+
+    /// Replaces the display name shown for an account.
+    pub fn update_account_display_name(
+        &mut self,
+        account_id: AccountId,
+        display_name: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        let display_name = display_name.into();
+        if display_name.trim().is_empty() {
+            return Err(CoreError::EmptyDisplayName);
+        }
+        let account =
+            self.accounts.get_mut(&account_id).ok_or(CoreError::UnknownAccount(account_id))?;
+        account.display_name = display_name;
+        self.events.push(CoreEvent::AccountChanged(account_id));
+        Ok(())
+    }
+
     /// Drains events in mutation order for a UI event loop.
     pub fn drain_events(&mut self) -> Vec<CoreEvent> {
         std::mem::take(&mut self.events)
@@ -1099,6 +1160,23 @@ impl MindChatCore {
             .contains_key(&account_id)
             .then_some(())
             .ok_or(CoreError::UnknownAccount(account_id))
+    }
+
+    /// Removes a conversation, its messages, and their reactions without
+    /// emitting an event. Callers emit the appropriate change event so account
+    /// deletion cascades silently while direct conversation deletion notifies.
+    fn remove_conversation_state(&mut self, conversation_id: ConversationId) {
+        let message_ids = self
+            .messages
+            .values()
+            .filter(|message| message.conversation_id == conversation_id)
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        for message_id in message_ids {
+            self.reactions.retain(|_, reaction| reaction.message_id != message_id);
+            self.messages.remove(&message_id);
+        }
+        self.conversations.remove(&conversation_id);
     }
 
     /// Applies an incoming message addressed to a conversation.
@@ -2250,5 +2328,89 @@ mod tests {
                 .expect("empty outbox")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn delete_account_removes_all_account_owned_state() {
+        let mut core = MindChatCore::default();
+        let alice = account(&mut core);
+        let mila = core
+            .add_account(AccountSetup::new("mila@example.net", "example.net", "Mila"))
+            .expect("second account");
+        core.upsert_contact(alice, "bob@example.org", "Bob", ContactPresence::Online, None)
+            .expect("contact");
+        let alice_conversation = core
+            .open_conversation(alice, ConversationKind::Direct, "bob@example.org", "Bob", 1)
+            .expect("alice conversation");
+        let alice_message = core
+            .send_text(alice_conversation, "alice@example.org", "hello", None, 2)
+            .expect("alice message");
+        core.set_capabilities(alice, [ProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(alice_message, "bob@example.org", "👍").expect("reaction");
+        let mila_conversation = core
+            .open_conversation(mila, ConversationKind::Direct, "nina@example.net", "Nina", 3)
+            .expect("mila conversation");
+        core.drain_events();
+
+        core.delete_account(alice).expect("account deleted");
+        assert!(core.accounts().iter().all(|item| item.id != alice));
+        assert!(core.contacts(alice).is_empty());
+        assert!(core.conversations(alice).is_empty());
+        assert!(core.messages(alice_conversation).is_empty());
+        assert!(core.reactions(alice_message).is_empty());
+        assert_eq!(core.accounts()[0].id, mila);
+        assert_eq!(core.conversations(mila), vec![core.conversations(mila)[0].clone()]);
+        assert_eq!(core.conversations(mila)[0].id, mila_conversation);
+        assert_eq!(core.drain_events(), vec![CoreEvent::AccountChanged(alice)]);
+    }
+
+    #[test]
+    fn delete_account_and_conversation_reject_unknown_ids() {
+        let mut core = MindChatCore::default();
+        assert_eq!(core.delete_account(99), Err(CoreError::UnknownAccount(99)));
+        assert_eq!(core.delete_conversation(99), Err(CoreError::UnknownConversation(99)));
+    }
+
+    #[test]
+    fn delete_conversation_removes_messages_and_reactions() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        let conversation_id = core
+            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
+            .expect("conversation");
+        let message_id = core
+            .send_text(conversation_id, "alice@example.org", "hello", None, 2)
+            .expect("message");
+        core.set_capabilities(account_id, [ProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(message_id, "bob@example.org", "👍").expect("reaction");
+        core.drain_events();
+
+        core.delete_conversation(conversation_id).expect("conversation deleted");
+        assert!(core.conversations(account_id).is_empty());
+        assert!(core.messages(conversation_id).is_empty());
+        assert!(core.reactions(message_id).is_empty());
+        assert_eq!(core.drain_events(), vec![CoreEvent::ConversationChanged(conversation_id)]);
+    }
+
+    #[test]
+    fn update_account_display_name_propagates_and_validates() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        core.drain_events();
+
+        assert_eq!(
+            core.update_account_display_name(account_id, "   "),
+            Err(CoreError::EmptyDisplayName)
+        );
+        assert_eq!(
+            core.update_account_display_name(99, "Alicia"),
+            Err(CoreError::UnknownAccount(99))
+        );
+
+        core.update_account_display_name(account_id, "Alicia").expect("display name updated");
+        assert_eq!(core.accounts()[0].display_name, "Alicia");
+        assert_eq!(core.drain_events(), vec![CoreEvent::AccountChanged(account_id)]);
     }
 }
