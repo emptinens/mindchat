@@ -342,10 +342,30 @@ same preferences + non-default initialization), complementing
 `SnapshotDiffingTest` (unchanged-poll fast path). Total unit suite: 70
 tests across 8 suites.
 
-Caveats: About shows `BuildConfig.VERSION_NAME` = 0.1.4 until the release
-bump; privacy/notification rows are placeholders with explicit supporting
-text; the local APK still embeds the previously built native `.so` (no NDK
-on this host, CI does the native assembly).
+Caveats: privacy/notification rows are placeholders with explicit supporting
+text; the locally built APK still embeds the previously built native `.so`
+(no NDK on this host, CI does the native assembly).
+
+## Release 0.1.6 (2026-08-14)
+
+- Version bump: `versionCode` 6, `versionName` "0.1.6" (About now shows
+  0.1.6).
+- Tag: `v0.1.6`.
+- Release artifact (debug-certificate-signed locally, source tree
+  `main@v0.1.6`):
+
+```text
+app/build/outputs/apk/release/mindchat-0.1.6.apk
+SHA-256: a26d5a18047678aeab4901a860a94f3184f87524425cf1ea45f53b1313d39197
+size: 38,622,526 bytes
+signer: Android Debug certificate (local signing only)
+```
+
+- Repository hygiene: removed unreferenced scratch artifacts
+  (`project-dashboard.html` and the one-off research/audit reports in
+  `docs/`); canonical docs are listed in the reference map below.
+- Added `CONTRIBUTING.md` with the build/test setup, definition of done,
+  coding rules, branch/commit style, and the release procedure.
 
 ## Verification already completed for 0.1.4
 
@@ -546,6 +566,7 @@ historical docs solely because they contain 0.1.0–0.1.3 version references.
 | --- | --- |
 | Product scope / roadmap | `PLAN.md` |
 | Overview / local setup | `README.md` |
+| Contribution guide | `CONTRIBUTING.md` |
 | Release 0.1.4 details | `docs/release-0.1.4-report.md` |
 | Earlier transport + persistence rationale | `docs/release-0.1.2-0.1.3-report.md` |
 | Native ABI contract | `docs/NATIVE_BINDING.md`, `crates/mindchat-core/src/ffi.rs` |
