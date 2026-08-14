@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Dark launch theme. The Compose theme drives the in-app colors, but the
+        window theme shows through during startup and system transitions, so it
+        must match the dark scheme's surface (#131316) instead of flashing the
+        light window background. Light status-bar icons stay enabled in dark
+        mode for contrast against the dark window.
+    -->
+    <style name="Theme.MindChat" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
