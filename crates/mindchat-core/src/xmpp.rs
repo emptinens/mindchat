@@ -29,6 +29,7 @@ use tokio_xmpp::{
         message::{Id as XmppMessageId, Lang, Message, MessageType},
         ns,
         presence::{Presence, Show, Type as PresenceType},
+        receipts::{Received as ReceiptReceived, Request as ReceiptRequest},
         roster::{Ask, Item as RosterItem, Roster, Subscription},
     },
     xmlstream::Timeouts,
@@ -526,6 +527,18 @@ async fn handle_client_event(
             false
         }
         TokioXmppEvent::Stanza(Stanza::Message(message)) => {
+            // Receipt payloads are independent of message bodies: a stanza may
+            // carry only <received/>, only <request/>, or both a body and
+            // receipt metadata. Parse each payload defensively so malformed
+            // extensions cannot terminate the worker.
+            for event in translate_incoming_receipts(account_id, &message) {
+                send_event(event_sender, event);
+            }
+            if let Some(acknowledgement) = receipt_acknowledgement(account_id, &message) {
+                // An acknowledgement is best effort. A transient send error
+                // must not break polling of later stanzas.
+                let _ = client.send_stanza(acknowledgement.into()).await;
+            }
             if let Some(event) = translate_incoming_message(account_id, message) {
                 send_event(event_sender, event);
             }
@@ -583,6 +596,11 @@ async fn handle_iq(
 }
 
 async fn send_message(client: &mut Client, message: OutgoingMessage) -> Result<(), TransportError> {
+    let stanza = build_message_stanza(message)?;
+    client.send_stanza(stanza.into()).await.map(|_| ()).map_err(map_io_error)
+}
+
+fn build_message_stanza(message: OutgoingMessage) -> Result<Message, TransportError> {
     let recipient = Jid::from_str(&message.recipient).map_err(|_| {
         TransportError::ProtocolViolation(
             "invalid conversation JID supplied to XMPP transport".to_owned(),
@@ -594,7 +612,12 @@ async fn send_message(client: &mut Client, message: OutgoingMessage) -> Result<(
     };
     stanza.id = Some(XmppMessageId(format!("mindchat-{}", message.message_id)));
     stanza.bodies.insert(Lang::default(), message.body);
-    client.send_stanza(stanza.into()).await.map(|_| ()).map_err(map_io_error)
+    if message.kind == ConversationKind::Direct {
+        // XEP-0184 requests are meaningful for one-to-one messages only. MUC
+        // messages deliberately remain unchanged.
+        stanza.payloads.push(ReceiptRequest.into());
+    }
+    Ok(stanza)
 }
 
 fn translate_incoming_message(account_id: AccountId, message: Message) -> Option<TransportEvent> {
@@ -611,6 +634,67 @@ fn translate_incoming_message(account_id: AccountId, message: Message) -> Option
         body,
         received_at_epoch_ms: now_epoch_ms(),
     })
+}
+
+fn is_direct_receipt_message(message: &Message) -> bool {
+    matches!(message.type_, MessageType::Chat | MessageType::Normal)
+}
+
+/// Converts valid XEP-0184 receipts in a direct message into normalized
+/// account/sender-scoped delivery events. Unknown and malformed IDs are
+/// intentionally ignored here; the domain applies the final ownership check
+/// against its account and conversation projections.
+fn translate_incoming_receipts(account_id: AccountId, message: &Message) -> Vec<TransportEvent> {
+    if !is_direct_receipt_message(message) {
+        return Vec::new();
+    }
+    let Some(sender) = message.from.as_ref().map(|jid| jid.to_bare().to_string()) else {
+        return Vec::new();
+    };
+    message
+        .payloads
+        .iter()
+        .filter(|payload| payload.is("received", ns::RECEIPTS))
+        .filter_map(|payload| ReceiptReceived::try_from(payload.clone()).ok())
+        .filter_map(|receipt| parse_receipt_message_id(&receipt.id))
+        .map(|message_id| TransportEvent::DeliveryUpdated {
+            account_id,
+            sender: sender.clone(),
+            message_id,
+            state: crate::DeliveryState::Delivered,
+        })
+        .collect()
+}
+
+/// Builds the best-effort XEP-0184 acknowledgement for a valid direct message
+/// carrying a `<request/>` payload. A message without a usable stanza ID
+/// cannot be acknowledged and is ignored.
+fn receipt_acknowledgement(account_id: AccountId, message: &Message) -> Option<Message> {
+    if !is_direct_receipt_message(message)
+        || !message.payloads.iter().any(|payload| {
+            payload.is("request", ns::RECEIPTS) && ReceiptRequest::try_from(payload.clone()).is_ok()
+        })
+    {
+        return None;
+    }
+    let sender = message.from.as_ref()?.to_bare();
+    let stanza_id = message.id.as_ref()?.0.as_str();
+    if stanza_id.is_empty() || stanza_id.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let mut acknowledgement = Message::chat(Some(Jid::from(sender.clone())));
+    acknowledgement.id =
+        Some(XmppMessageId(format!("mindchat-receipt-{account_id}-{}", now_epoch_ms())));
+    acknowledgement.payloads.push(ReceiptReceived { id: stanza_id.to_owned() }.into());
+    Some(acknowledgement)
+}
+
+fn parse_receipt_message_id(id: &str) -> Option<u64> {
+    let suffix = id.strip_prefix("mindchat-")?;
+    if suffix.is_empty() || !suffix.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok().filter(|message_id| *message_id != 0)
 }
 
 fn translate_presence(account_id: AccountId, presence: Presence) -> Option<TransportEvent> {
@@ -957,6 +1041,94 @@ mod tests {
                 status: None,
             })
         );
+    }
+
+    #[test]
+    fn outgoing_direct_messages_request_receipts_but_groupchat_does_not() {
+        let direct = build_message_stanza(OutgoingMessage {
+            account_id: 7,
+            conversation_id: 1,
+            message_id: 42,
+            kind: ConversationKind::Direct,
+            recipient: "bob@example.org".to_owned(),
+            body: "Hello".to_owned(),
+            in_reply_to: None,
+        })
+        .expect("direct stanza");
+        assert_eq!(direct.type_, MessageType::Chat);
+        assert_eq!(direct.id.as_ref().map(|id| id.0.as_str()), Some("mindchat-42"));
+        assert!(direct.payloads.iter().any(|payload| payload.is("request", ns::RECEIPTS)));
+
+        let groupchat = build_message_stanza(OutgoingMessage {
+            account_id: 7,
+            conversation_id: 2,
+            message_id: 43,
+            kind: ConversationKind::MultiUserChat,
+            recipient: "room@example.org".to_owned(),
+            body: "Hello room".to_owned(),
+            in_reply_to: None,
+        })
+        .expect("groupchat stanza");
+        assert_eq!(groupchat.type_, MessageType::Groupchat);
+        assert!(!groupchat.payloads.iter().any(|payload| payload.is("request", ns::RECEIPTS)));
+    }
+
+    #[test]
+    fn parses_valid_receipts_and_ignores_malformed_or_non_chat_payloads() {
+        let element: Element = "<message xmlns='jabber:client' from='bob@example.org/phone' type='chat'><received xmlns='urn:xmpp:receipts' id='mindchat-42'/><received xmlns='urn:xmpp:receipts' id='foreign-9'/><received xmlns='urn:xmpp:receipts'/></message>"
+            .parse()
+            .expect("valid message XML");
+        assert_eq!(
+            translate_incoming_receipts(7, &Message::try_from(element).expect("message")),
+            vec![TransportEvent::DeliveryUpdated {
+                account_id: 7,
+                sender: "bob@example.org".to_owned(),
+                message_id: 42,
+                state: crate::DeliveryState::Delivered,
+            }]
+        );
+
+        let groupchat: Element = "<message xmlns='jabber:client' from='room@example.org/nick' type='groupchat'><received xmlns='urn:xmpp:receipts' id='mindchat-42'/></message>"
+            .parse()
+            .expect("valid groupchat XML");
+        assert!(
+            translate_incoming_receipts(7, &Message::try_from(groupchat).expect("message"))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn acknowledges_valid_receipt_requests_only_when_stanza_id_is_usable() {
+        let element: Element = "<message xmlns='jabber:client' from='bob@example.org/phone' id='peer-7' type='chat'><body>Hello</body><request xmlns='urn:xmpp:receipts'/></message>"
+            .parse()
+            .expect("valid message XML");
+        let acknowledgement =
+            receipt_acknowledgement(7, &Message::try_from(element).expect("message"))
+                .expect("acknowledgement");
+        assert_eq!(
+            acknowledgement.to.as_ref().map(ToString::to_string),
+            Some("bob@example.org".to_owned())
+        );
+        assert!(acknowledgement.payloads.iter().any(|payload| {
+            payload.is("received", ns::RECEIPTS)
+                && ReceiptReceived::try_from(payload.clone())
+                    .is_ok_and(|receipt| receipt.id == "peer-7")
+        }));
+
+        let missing_id: Element = "<message xmlns='jabber:client' from='bob@example.org' type='chat'><request xmlns='urn:xmpp:receipts'/></message>"
+            .parse()
+            .expect("valid message XML");
+        assert!(
+            receipt_acknowledgement(7, &Message::try_from(missing_id).expect("message")).is_none()
+        );
+    }
+
+    #[test]
+    fn parse_receipt_message_id_requires_mindchat_numeric_id() {
+        assert_eq!(parse_receipt_message_id("mindchat-42"), Some(42));
+        assert_eq!(parse_receipt_message_id("mindchat-0"), None);
+        assert_eq!(parse_receipt_message_id("foreign-42"), None);
+        assert_eq!(parse_receipt_message_id("mindchat-4 2"), None);
     }
 
     #[test]

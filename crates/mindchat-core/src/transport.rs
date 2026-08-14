@@ -102,6 +102,10 @@ pub enum TransportEvent {
         received_at_epoch_ms: u64,
     },
     DeliveryUpdated {
+        /// Account on which the receipt was received.
+        account_id: AccountId,
+        /// Bare JID of the sender that acknowledged the message.
+        sender: String,
         message_id: MessageId,
         state: DeliveryState,
     },

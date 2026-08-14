@@ -640,8 +640,11 @@ impl MindChatCore {
                     received_at_epoch_ms,
                 )
                 .map(Some),
-            TransportEvent::DeliveryUpdated { message_id, state } => {
-                self.set_delivery_state(message_id, state)?;
+            TransportEvent::DeliveryUpdated { account_id, sender, message_id, state } => {
+                // Receipt events are account- and sender-scoped. A stale,
+                // unknown, malformed, or foreign receipt is harmless and
+                // must not abort the polling loop.
+                self.apply_delivery_update(account_id, &sender, message_id, state)?;
                 Ok(None)
             }
         }
@@ -852,6 +855,50 @@ impl MindChatCore {
         message.delivery_state = delivery_state;
         self.events.push(CoreEvent::MessageChanged(message_id));
         Ok(())
+    }
+
+    /// Applies a scoped delivery update from the transport.
+    ///
+    /// The transport does not own the domain outbox, so it may receive a
+    /// receipt for an unknown, already-restored, or unrelated message. Such
+    /// receipts are ignored rather than surfaced as core errors; this keeps a
+    /// malformed peer stanza from stopping subsequent polling.
+    fn apply_delivery_update(
+        &mut self,
+        account_id: AccountId,
+        sender: &str,
+        message_id: MessageId,
+        delivery_state: DeliveryState,
+    ) -> Result<bool, CoreError> {
+        if !self.accounts.contains_key(&account_id) || validate_jid(sender).is_err() {
+            return Ok(false);
+        }
+        let Some(message) = self.messages.get(&message_id) else {
+            return Ok(false);
+        };
+        if message.direction != MessageDirection::Outgoing {
+            return Ok(false);
+        }
+        let Some(conversation) = self.conversations.get(&message.conversation_id) else {
+            return Ok(false);
+        };
+        // A receipt sender is compared as a bare JID, matching transport
+        // normalization. The conversation address is required to be direct so
+        // a groupchat or another account cannot claim this message ID.
+        if conversation.account_id != account_id
+            || conversation.kind != ConversationKind::Direct
+            || conversation.address != sender
+        {
+            return Ok(false);
+        }
+        // Receipt delivery must never regress a stronger local state (for
+        // example Read -> Delivered) and duplicate receipts are idempotent.
+        let current_state = message.delivery_state;
+        if delivery_rank(delivery_state) <= delivery_rank(current_state) {
+            return Ok(false);
+        }
+        self.set_delivery_state(message_id, delivery_state)?;
+        Ok(true)
     }
 
     /// Returns locally queued outgoing text in message-id order for one
@@ -1215,6 +1262,16 @@ impl<T: XmppTransport> TransportCoordinator<T> {
         };
         self.core.apply_transport_event(event)?;
         Ok(true)
+    }
+}
+
+fn delivery_rank(state: DeliveryState) -> u8 {
+    match state {
+        DeliveryState::Pending => 0,
+        DeliveryState::Failed => 1,
+        DeliveryState::Sent => 2,
+        DeliveryState::Delivered => 3,
+        DeliveryState::Read => 4,
     }
 }
 
@@ -1617,6 +1674,77 @@ mod tests {
     }
 
     #[test]
+    fn scoped_receipts_ignore_unknown_foreign_and_non_direct_messages() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        let other_account = core
+            .add_account(AccountSetup::new("mila@example.net", "example.net", "Mila"))
+            .expect("second account");
+        let conversation_id = core
+            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
+            .expect("conversation");
+        let message_id = core
+            .send_text(conversation_id, "alice@example.org", "queued", None, 2)
+            .expect("message");
+        core.drain_events();
+
+        for event in [
+            TransportEvent::DeliveryUpdated {
+                account_id,
+                sender: "mallory@example.org".to_owned(),
+                message_id,
+                state: DeliveryState::Delivered,
+            },
+            TransportEvent::DeliveryUpdated {
+                account_id: other_account,
+                sender: "bob@example.org".to_owned(),
+                message_id,
+                state: DeliveryState::Delivered,
+            },
+            TransportEvent::DeliveryUpdated {
+                account_id,
+                sender: "bob@example.org".to_owned(),
+                message_id: 999_999,
+                state: DeliveryState::Delivered,
+            },
+            TransportEvent::DeliveryUpdated {
+                account_id,
+                sender: "bob@example.org".to_owned(),
+                message_id,
+                state: DeliveryState::Delivered,
+            },
+        ] {
+            assert_eq!(core.apply_transport_event(event), Ok(None));
+        }
+        assert_eq!(core.messages(conversation_id)[0].delivery_state, DeliveryState::Delivered);
+
+        let room = core
+            .set_capabilities(account_id, [ProtocolCapability::MultiUserChat])
+            .and_then(|()| {
+                core.open_conversation(
+                    account_id,
+                    ConversationKind::MultiUserChat,
+                    "room@example.org",
+                    "Room",
+                    3,
+                )
+            })
+            .expect("groupchat");
+        let group_message =
+            core.send_text(room, "alice@example.org", "group", None, 4).expect("group message");
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::DeliveryUpdated {
+                account_id,
+                sender: "room@example.org".to_owned(),
+                message_id: group_message,
+                state: DeliveryState::Delivered,
+            }),
+            Ok(None)
+        );
+        assert_eq!(core.messages(room)[0].delivery_state, DeliveryState::Pending);
+    }
+
+    #[test]
     fn transport_events_project_connection_incoming_messages_and_receipts() {
         let mut core = MindChatCore::default();
         let account_id = account(&mut core);
@@ -1638,6 +1766,8 @@ mod tests {
 
         assert_eq!(
             core.apply_transport_event(TransportEvent::DeliveryUpdated {
+                account_id,
+                sender: "bob@example.org".to_owned(),
                 message_id: outgoing_id,
                 state: DeliveryState::Sent,
             }),

@@ -314,7 +314,13 @@ class NativeMindChatGateway(
                 }
                 TransportPollResult(core.snapshot(), flushedAccounts)
             } catch (_: MindChatBindingException) {
-                null
+                // A transport batch can apply Connected/Disconnected before a
+                // later malformed roster or presence stanza makes the native
+                // call return an error. Keep the state projection visible even
+                // when that later event is rejected; otherwise the UI can stay
+                // on a stale Connecting snapshot forever.
+                runCatching { TransportPollResult(core.snapshot(), emptySet()) }
+                    .getOrNull()
             }
         }
         result?.let { pollResult ->
