@@ -37,6 +37,10 @@ use tokio_xmpp::{
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for one stanza send inside the worker loop. A dead socket or
+/// a full transmit queue must never stall the single worker task (and with
+/// it the whole account) for longer than this.
+const WORKER_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total wall-clock budget for the DNS resolution phase. getaddrinfo is the
 /// primary path; hickory SRV is only consulted within a shorter inner bound.
 const DNS_TOTAL_TIMEOUT: Duration = Duration::from_secs(8);
@@ -122,7 +126,26 @@ impl XmppTransport for TokioXmppTransport {
                 match runtime {
                     Ok(runtime) => {
                         let _ = ready_sender.send(Ok(()));
-                        runtime.block_on(run_worker(connection, command_receiver, event_sender));
+                        // A panic inside the worker (for example in
+                        // tokio-xmpp) would otherwise kill the thread without
+                        // any terminal event, leaving the account stuck on
+                        // "Connecting" forever. Catch it and emit a
+                        // recoverable Disconnected before the thread dies.
+                        let worker_sender = event_sender.clone();
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            runtime.block_on(run_worker(
+                                connection,
+                                command_receiver,
+                                worker_sender,
+                            ));
+                        }));
+                        if result.is_err() {
+                            let _ = event_sender.send(TransportEvent::Disconnected {
+                                account_id,
+                                recoverable: true,
+                                detail: Some("XMPP worker crashed".to_owned()),
+                            });
+                        }
                     }
                     Err(error) => {
                         let _ = ready_sender
@@ -200,7 +223,25 @@ impl XmppTransport for TokioXmppTransport {
                 }
                 Ok(Some(event))
             }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                // Every worker shares this single event channel, so a
+                // disconnected receiver means every worker is gone (crashed,
+                // or exited without emitting a terminal event). Retire the
+                // tracked workers one at a time, synthesizing a terminal
+                // event for each account so no account is ever left stuck on
+                // "Connecting" forever.
+                if let Some((&account_id, _)) = self.workers.iter().next() {
+                    self.retire_worker(account_id);
+                    Ok(Some(TransportEvent::Disconnected {
+                        account_id,
+                        recoverable: true,
+                        detail: Some("XMPP worker stopped unexpectedly".to_owned()),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -331,15 +372,30 @@ async fn run_worker(
         tokio::select! {
             command = command_receiver.recv() => match command {
                 Some(WorkerCommand::Send { message, response_sender }) => {
-                    let _ = response_sender.send(send_message(&mut client, message).await);
+                    // Bound the send so a dead socket cannot stall the
+                    // command channel longer than WORKER_SEND_TIMEOUT.
+                    let result =
+                        match tokio::time::timeout(WORKER_SEND_TIMEOUT, send_message(&mut client, message)).await {
+                            Ok(result) => result,
+                            Err(_) => Err(TransportError::ConnectionFailed(
+                                "timed out while sending XMPP stanza".to_owned(),
+                            )),
+                        };
+                    let _ = response_sender.send(result);
                 }
                 Some(WorkerCommand::Disconnect { response_sender }) => {
-                    let result = client.send_end().await.map_err(map_xmpp_error);
+                    let result =
+                        match tokio::time::timeout(WORKER_SEND_TIMEOUT, client.send_end()).await {
+                            Ok(result) => result.map_err(map_xmpp_error),
+                            Err(_) => Err(TransportError::ConnectionFailed(
+                                "timed out while closing XMPP connection".to_owned(),
+                            )),
+                        };
                     let _ = response_sender.send(result);
                     break;
                 }
                 None => {
-                    let _ = client.send_end().await;
+                    let _ = tokio::time::timeout(WORKER_SEND_TIMEOUT, client.send_end()).await;
                     break;
                 }
             },
@@ -478,6 +534,23 @@ fn terminal_failure_for_event(event: &TokioXmppEvent) -> Option<ConnectFailure> 
     }
 }
 
+/// Sends a stanza with a bounded timeout so a dead socket or a full transmit
+/// queue can never stall the single worker task indefinitely. Sending is best
+/// effort: a transient failure is deliberately ignored so the worker keeps
+/// processing events (and can still surface the underlying disconnect).
+async fn send_stanza_bounded(client: &mut Client, stanza: Stanza) {
+    let _ = tokio::time::timeout(WORKER_SEND_TIMEOUT, client.send_stanza(stanza)).await;
+}
+
+/// Recoverability of a mid-session disconnect, mirroring the connect path:
+/// only a hard authentication failure (for example rejected credentials) is
+/// non-recoverable; a transient `TemporaryAuthFailure` or any network/IO
+/// failure keeps the account retryable.
+#[must_use]
+fn disconnected_is_recoverable(error: &tokio_xmpp::Error) -> bool {
+    !is_auth_error(error)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_client_event(
     account_id: AccountId,
@@ -493,34 +566,30 @@ async fn handle_client_event(
                 event_sender,
                 TransportEvent::Connected { account_id, capabilities: stream_capabilities.clone() },
             );
-            let _ = client.send_stanza(Presence::available().into()).await;
-            let _ = client
-                .send_stanza(
-                    Iq::from_get(
-                        roster_request_id(account_id),
-                        Roster { ver: None, items: vec![] },
-                    )
+            send_stanza_bounded(client, Presence::available().into()).await;
+            send_stanza_bounded(
+                client,
+                Iq::from_get(roster_request_id(account_id), Roster { ver: None, items: vec![] })
                     .into(),
+            )
+            .await;
+            if let Ok(server_jid) = Jid::from_str(bound_jid.domain().as_str()) {
+                send_stanza_bounded(
+                    client,
+                    Iq::from_get(disco_request_id(account_id), DiscoInfoQuery { node: None })
+                        .with_to(server_jid)
+                        .into(),
                 )
                 .await;
-            if let Ok(server_jid) = Jid::from_str(bound_jid.domain().as_str()) {
-                let _ = client
-                    .send_stanza(
-                        Iq::from_get(disco_request_id(account_id), DiscoInfoQuery { node: None })
-                            .with_to(server_jid)
-                            .into(),
-                    )
-                    .await;
             }
             true
         }
         TokioXmppEvent::Disconnected(error) => {
-            let recoverable = !matches!(error, tokio_xmpp::Error::Auth(_));
             send_event(
                 event_sender,
                 TransportEvent::Disconnected {
                     account_id,
-                    recoverable,
+                    recoverable: disconnected_is_recoverable(&error),
                     detail: Some(error.to_string()),
                 },
             );
@@ -537,7 +606,7 @@ async fn handle_client_event(
             if let Some(acknowledgement) = receipt_acknowledgement(account_id, &message) {
                 // An acknowledgement is best effort. A transient send error
                 // must not break polling of later stanzas.
-                let _ = client.send_stanza(acknowledgement.into()).await;
+                send_stanza_bounded(client, acknowledgement.into()).await;
             }
             if let Some(event) = translate_incoming_message(account_id, message) {
                 send_event(event_sender, event);
@@ -589,7 +658,7 @@ async fn handle_iq(
                 emit_roster(account_id, roster, event_sender);
             }
             let acknowledgement = Iq::Result { from: None, to: from, id, payload: None };
-            let _ = client.send_stanza(acknowledgement.into()).await;
+            send_stanza_bounded(client, acknowledgement.into()).await;
         }
         _ => {}
     }
@@ -1266,5 +1335,85 @@ mod tests {
             }))
         ));
         assert!(transport.connected_accounts().is_empty());
+    }
+
+    #[test]
+    fn disconnected_event_channel_synthesizes_terminal_event_for_tracked_worker() {
+        let mut transport = TokioXmppTransport::new();
+        let (command_sender, _command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        transport
+            .workers
+            .insert(42, WorkerHandle { command_sender, join: std::thread::spawn(|| {}) });
+        // Drop the transport's own sender (swap in a dangling one whose
+        // receiver is already gone) so the event receiver observes a
+        // disconnected channel, exactly as if every worker thread had died
+        // without emitting a terminal event.
+        let (dangling_sender, _dangling_receiver) = mpsc::channel::<TransportEvent>();
+        let _ = std::mem::replace(&mut transport.event_sender, dangling_sender);
+
+        assert!(matches!(
+            transport.next_event(),
+            Ok(Some(TransportEvent::Disconnected {
+                account_id: 42,
+                recoverable: true,
+                detail: Some(_),
+            }))
+        ));
+        assert!(transport.connected_accounts().is_empty(), "the dead worker must be retired");
+        assert!(matches!(transport.next_event(), Ok(None)), "no more workers to retire");
+    }
+
+    #[test]
+    fn disconnected_event_channel_yields_one_terminal_event_per_tracked_worker() {
+        let mut transport = TokioXmppTransport::new();
+        for account_id in [42u64, 43u64] {
+            let (command_sender, _command_receiver) = tokio::sync::mpsc::unbounded_channel();
+            transport.workers.insert(
+                account_id,
+                WorkerHandle { command_sender, join: std::thread::spawn(|| {}) },
+            );
+        }
+        let (dangling_sender, _dangling_receiver) = mpsc::channel::<TransportEvent>();
+        let _ = std::mem::replace(&mut transport.event_sender, dangling_sender);
+
+        // Each poll retires one tracked worker, so every account gets its own
+        // synthesized terminal event instead of a single shared one. The
+        // retirement order is a HashMap artifact and intentionally unspecified.
+        let mut synthesized = Vec::new();
+        while let Ok(Some(TransportEvent::Disconnected { account_id, .. })) = transport.next_event()
+        {
+            synthesized.push(account_id);
+        }
+        synthesized.sort_unstable();
+        assert_eq!(synthesized, vec![42, 43]);
+        assert!(transport.connected_accounts().is_empty());
+    }
+
+    #[test]
+    fn mid_session_disconnect_recoverability_matches_connect_path() {
+        let temporary = tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::TemporaryAuthFailure,
+        ));
+        assert!(
+            disconnected_is_recoverable(&temporary),
+            "a transient server auth failure mid-session must keep the account retryable"
+        );
+
+        let rejected = tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+            tokio_xmpp::parsers::sasl::DefinedCondition::NotAuthorized,
+        ));
+        assert!(
+            !disconnected_is_recoverable(&rejected),
+            "rejected credentials mid-session remain non-recoverable"
+        );
+
+        let network_loss = tokio_xmpp::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "XMPP connection suspended",
+        ));
+        assert!(
+            disconnected_is_recoverable(&network_loss),
+            "a network loss mid-session must be recoverable"
+        );
     }
 }
