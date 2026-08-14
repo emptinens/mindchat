@@ -47,11 +47,8 @@
     <string name="unlock">Разблокировать</string>
     <string name="app_lock_prompt_title">Разблокировать MindChat</string>
     <string name="app_lock_prompt_subtitle">Продолжите с помощью биометрии или блокировки экрана устройства.</string>
-    <string name="diagnostics">Диагностика</string>
-    <string name="diagnostics_summary">Экспортируется только по вашему запросу</string>
     <string name="about">О MindChat</string>
     <string name="privacy_summary">Без аналитики и облачного аккаунта MindChat</string>
-    <string name="coming_soon">Подключение, синхронизация списка контактов и зашифрованное хранилище — следующие этапы ядра.</string>
     <!-- Вход в аккаунт / подключение -->
     <string name="login_subtitle">Войдите с помощью XMPP-аккаунта, чтобы начать общение.</string>
     <string name="login_sign_in">Войти</string>
@@ -99,4 +96,35 @@
     <string name="accent_sunset">Закат</string>
     <string name="accent_berry">Ягода</string>
     <string name="accent_crimson">Малиновый</string>
+    <!-- Подробные настройки и плавающий док 0.1.6 -->
+    <string name="not_implemented_yet">Пока не реализовано</string>
+    <string name="coming_in_later_release">Появится в одном из следующих выпусков</string>
+    <string name="manage_accounts">Управление аккаунтами</string>
+    <string name="manage_accounts_summary">Переключайте, переименовывайте или удаляйте аккаунты на этом устройстве</string>
+    <string name="add_account_summary">Подключить ещё один XMPP-аккаунт</string>
+    <string name="accent_per_account">Выберите цвет для активного аккаунта</string>
+    <string name="edit_profile_summary">Аватар, статус и акцентный цвет для %1$s</string>
+    <string name="message_search">Поиск сообщений</string>
+    <string name="message_search_summary">Поиск по локально сохранённым сообщениям</string>
+    <string name="encryption">Шифрование</string>
+    <string name="encryption_summary">Сквозное шифрование ваших переписок</string>
+    <string name="notifications">Уведомления</string>
+    <string name="message_notifications">Уведомления о сообщениях</string>
+    <string name="group_notifications">Уведомления групповых чатов</string>
+    <string name="storage">Хранилище</string>
+    <string name="local_data_size">Локальные данные</string>
+    <string name="local_data_size_summary">Аватары и сохранённое состояние занимают %1$s</string>
+    <string name="storage_calculating">Подсчёт…</string>
+    <string name="clear_profile_images">Очистить локальные изображения профиля</string>
+    <string name="clear_profile_images_summary">Удалить кэшированные аватары всех аккаунтов</string>
+    <string name="clear_profile_images_confirm">Удалить все локальные изображения профиля? Это действие нельзя отменить.</string>
+    <string name="clear">Очистить</string>
+    <string name="version">Версия</string>
+    <string name="licenses">Лицензии</string>
+    <string name="licenses_summary">Открытые лицензии, используемые в MindChat</string>
+    <string name="licenses_dialog_title">Открытые лицензии</string>
+    <string name="licenses_dialog_body">MindChat распространяется по лицензии Apache 2.0 и включает сторонние компоненты с открытым исходным кодом.</string>
+    <string name="repository">Исходный код</string>
+    <string name="repository_summary">github.com/emptinens/mindchat</string>
+    <string name="close">Закрыть</string>
 </resources>

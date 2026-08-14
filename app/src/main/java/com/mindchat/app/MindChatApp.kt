@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.animateColorAsState
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -59,8 +61,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -87,6 +87,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -412,33 +413,10 @@ private fun MindChatShell(
                 )
             },
             bottomBar = {
-                NavigationBar {
-                    Destination.entries.forEach { item ->
-                        NavigationBarItem(
-                            selected = destination == item,
-                            onClick = { destination = item },
-                            icon = {
-                                Icon(
-                                    imageVector = when (item) {
-                                        Destination.Chats -> Icons.Filled.Home
-                                        Destination.Contacts -> Icons.Filled.Star
-                                        Destination.Settings -> Icons.Filled.Settings
-                                    },
-                                    contentDescription = null,
-                                )
-                            },
-                            label = {
-                                Text(
-                                    when (item) {
-                                        Destination.Chats -> stringResource(R.string.conversations)
-                                        Destination.Contacts -> stringResource(R.string.contacts)
-                                        Destination.Settings -> stringResource(R.string.settings)
-                                    },
-                                )
-                            },
-                        )
-                    }
-                }
+                FloatingDock(
+                    selected = destination,
+                    onSelect = { destination = it },
+                )
             },
             floatingActionButton = {
                 if (state.activeAccountId != 0L) {
@@ -500,6 +478,18 @@ private fun MindChatShell(
                         if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
                             appLockHost?.setAppLockEnabled(enabled)
                             gateway.toggleAppLock()
+                        }
+                    },
+                    onOpenAccountDrawer = {
+                        scope.launch { drawerState.open() }
+                    },
+                    onOpenActiveProfile = {
+                        profileAccountId = state.activeAccountId
+                    },
+                    onAddAccount = { showAddAccount = true },
+                    onClearProfileImages = {
+                        state.profiles.forEach { (accountId, profile) ->
+                            gateway.updateProfile(accountId, profile.copy(avatarUri = null))
                         }
                     },
                 )
@@ -1089,101 +1079,111 @@ private fun EmptyContacts() {
     }
 }
 
+/**
+ * 0.1.6 floating navigation dock: a raised, pill-shaped M3 Expressive dock
+ * with a tonal surfaceContainerHighest container, a 28dp silhouette, a subtle
+ * shadow, safe-area awareness (navigationBarsPadding + bottom offset), and a
+ * secondaryContainer pill behind the selected destination. It is centered and
+ * floats clear of the screen edges, replacing the edge-to-edge NavigationBar.
+ */
 @Composable
-private fun SettingsScreen(
-    state: MindChatUiState,
-    contentPadding: PaddingValues,
-    onDynamicColorChange: () -> Unit,
-    onComfortableLayoutChange: () -> Unit,
-    appLockAvailable: Boolean,
-    onAppLockChange: () -> Unit,
+private fun FloatingDock(
+    selected: Destination,
+    onSelect: (Destination) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(contentPadding),
-        contentPadding = PaddingValues(
-            start = 16.dp,
-            top = 16.dp,
-            end = 16.dp,
-            bottom = 16.dp,
-        ),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .navigationBarsPadding()
+            .padding(top = 8.dp, bottom = 20.dp),
+        contentAlignment = Alignment.BottomCenter,
     ) {
-        item {
-            SettingsSectionTitle(stringResource(R.string.appearance))
-            SettingsSwitch(
-                title = stringResource(R.string.use_dynamic_colors),
-                checked = state.dynamicColor,
-                onCheckedChange = { onDynamicColorChange() },
-            )
-            SettingsSwitch(
-                title = stringResource(R.string.comfortable_layout),
-                checked = state.comfortableLayout,
-                onCheckedChange = { onComfortableLayoutChange() },
-            )
-        }
-        item {
-            SettingsSectionTitle(stringResource(R.string.privacy))
-            SettingsSwitch(
-                title = stringResource(R.string.app_lock),
-                checked = state.appLockEnabled,
-                supportingText = stringResource(
-                    if (appLockAvailable) R.string.app_lock_summary else R.string.app_lock_unavailable,
-                ),
-                enabled = appLockAvailable || state.appLockEnabled,
-                onCheckedChange = { onAppLockChange() },
-            )
-            ListItem(
-                headlineContent = { Text(stringResource(R.string.diagnostics)) },
-                supportingContent = { Text(stringResource(R.string.diagnostics_summary)) },
-            )
-        }
-        item {
-            SettingsSectionTitle(stringResource(R.string.about))
-            ListItem(
-                headlineContent = { Text(stringResource(R.string.app_name)) },
-                supportingContent = { Text(stringResource(R.string.privacy_summary)) },
-            )
-            Text(
-                text = stringResource(R.string.coming_soon),
-                modifier = Modifier.padding(16.dp),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+        Surface(
+            shape = FloatingDockShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            tonalElevation = 3.dp,
+            shadowElevation = 8.dp,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        ) {
+            Row(
+                modifier = Modifier.padding(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Destination.entries.forEach { item ->
+                    FloatingDockItem(
+                        destination = item,
+                        selected = selected == item,
+                        onClick = { onSelect(item) },
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun SettingsSectionTitle(title: String) {
-    Text(
-        text = title,
-        modifier = Modifier.padding(top = 12.dp, start = 16.dp, bottom = 4.dp),
-        style = MaterialTheme.typography.titleSmall,
-        color = MaterialTheme.colorScheme.primary,
+private fun FloatingDockItem(
+    destination: Destination,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    val containerColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.secondaryContainer
+        } else {
+            Color.Transparent
+        },
+        label = "floatingDockContainer",
     )
+    val contentColor by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.onSecondaryContainer
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant
+        },
+        label = "floatingDockContent",
+    )
+    Row(
+        modifier = Modifier
+            .height(52.dp)
+            .clip(FloatingDockItemShape)
+            .background(containerColor)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Icon(
+            imageVector = destinationIcon(destination),
+            contentDescription = null,
+            tint = contentColor,
+            modifier = Modifier.size(22.dp),
+        )
+        Text(
+            text = destinationLabel(destination),
+            style = MaterialTheme.typography.labelLarge,
+            color = contentColor,
+        )
+    }
 }
 
+private val FloatingDockShape = RoundedCornerShape(28.dp)
+private val FloatingDockItemShape = RoundedCornerShape(20.dp)
+
 @Composable
-private fun SettingsSwitch(
-    title: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit,
-    enabled: Boolean = true,
-    supportingText: String? = null,
-) {
-    ListItem(
-        headlineContent = { Text(title) },
-        supportingContent = supportingText?.let { text -> { Text(text) } },
-        trailingContent = {
-            Switch(
-                checked = checked,
-                onCheckedChange = onCheckedChange,
-                enabled = enabled,
-            )
-        },
-    )
+private fun destinationLabel(destination: Destination): String = stringResource(
+    when (destination) {
+        Destination.Chats -> R.string.conversations
+        Destination.Contacts -> R.string.contacts
+        Destination.Settings -> R.string.settings
+    },
+)
+
+private fun destinationIcon(destination: Destination): ImageVector = when (destination) {
+    Destination.Chats -> Icons.Filled.Home
+    Destination.Contacts -> Icons.Filled.Star
+    Destination.Settings -> Icons.Filled.Settings
 }
 
 @Composable
