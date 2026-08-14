@@ -266,6 +266,15 @@ deletion, and profile persistence. This also fixed two contract
 inconsistencies between the preview and native gateways (blank-JID
 registration rejection, stale profile left behind by account deletion).
 
+The Kotlin↔Rust integration boundary is re-validated against the current
+Rust source: `scripts/generate-uniffi-kotlin.sh` rebuilt the release cdylib
+and regenerated the Kotlin bindings with uniffi-bindgen 0.32.0 (task
+`generateUniffiKotlin` executed; output byte-identical to the committed
+binding set), `registerAccount`/`deleteAccount`/`updateAccountDisplayName`/
+`deleteConversation` confirmed present with the exact signatures
+`NativeMindChatGateway` calls, and a full `--rerun-tasks` compile + unit
+tests + lint against the regenerated bindings passed (39/39).
+
 Caveats: the local APK embeds the previously built native `.so` (no NDK on
 this host), so the new Rust methods are compiled into the Kotlin bindings
 but not yet into the embedded library; CI performs the full native assembly.
