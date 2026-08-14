@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,23 @@ pub type MessageId = u64;
 pub type ReactionId = u64;
 
 const MAX_MESSAGE_CHARS: usize = 16_384;
+
+/// Per-flush-call send budget for [`TransportCoordinator::flush_outbox`].
+///
+/// The transport worker owns its own per-send timeout (currently 15 s in
+/// `xmpp.rs`), so a single blocking `send` can still take that long. This
+/// constant is the flush-level budget checked between sends: once it has
+/// elapsed, the flush stops and remaining messages stay pending for the next
+/// call. It deliberately undercuts the transport's 15 s per-send timeout so
+/// the session lock is never held for a whole multi-message queue.
+const FLUSH_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum queued messages sent per [`TransportCoordinator::flush_outbox`] call.
+///
+/// Together with [`FLUSH_SEND_TIMEOUT`] this bounds the session lock hold of
+/// one flush. Worst case is `FLUSH_SEND_TIMEOUT` plus one transport per-send
+/// timeout (15 s), because a send already in flight cannot be interrupted.
+const FLUSH_OUTBOX_MAX_BATCH: usize = 32;
 
 /// Connection status projected to the UI.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -511,16 +529,24 @@ impl MindChatCore {
 
     /// Applies server-confirmed roster metadata while retaining the most
     /// recent presence projection for an already-known contact.
+    ///
+    /// Malformed roster data (an unknown account or an invalid JID) is
+    /// ignored rather than surfaced as an error, so one bad roster stanza
+    /// from a server cannot abort the transport polling loop.
     pub fn sync_roster_contact(
         &mut self,
         account_id: AccountId,
         jid: impl Into<String>,
         display_name: impl Into<String>,
         subscription: RosterSubscription,
-    ) -> Result<(), CoreError> {
-        self.ensure_account(account_id)?;
+    ) -> Result<bool, CoreError> {
+        if !self.accounts.contains_key(&account_id) {
+            return Ok(false);
+        }
         let jid = jid.into();
-        validate_jid(&jid)?;
+        if validate_jid(&jid).is_err() {
+            return Ok(false);
+        }
         let display_name = normalize_contact_name(display_name.into(), &jid);
         let existing = self.contacts.get(&(account_id, jid.clone()));
         let presence = existing.map_or(ContactPresence::Offline, |contact| contact.presence);
@@ -530,21 +556,26 @@ impl MindChatCore {
             Contact { account_id, jid, display_name, presence, status, subscription },
         );
         self.events.push(CoreEvent::RosterChanged(account_id));
-        Ok(())
+        Ok(true)
     }
 
     /// Removes a contact after a server roster removal event.
     ///
     /// A removal for an already absent contact is harmless and does not emit a
-    /// redundant UI event.
+    /// redundant UI event. Malformed roster data (an unknown account or an
+    /// invalid JID) is ignored so a bad roster stanza cannot abort polling.
     pub fn remove_contact(
         &mut self,
         account_id: AccountId,
         jid: impl Into<String>,
     ) -> Result<bool, CoreError> {
-        self.ensure_account(account_id)?;
+        if !self.accounts.contains_key(&account_id) {
+            return Ok(false);
+        }
         let jid = jid.into();
-        validate_jid(&jid)?;
+        if validate_jid(&jid).is_err() {
+            return Ok(false);
+        }
         let removed = self.contacts.remove(&(account_id, jid)).is_some();
         if removed {
             self.events.push(CoreEvent::RosterChanged(account_id));
@@ -555,7 +586,9 @@ impl MindChatCore {
     /// Updates presence received for an existing roster contact.
     ///
     /// Directed presence from a non-roster JID is intentionally ignored so it
-    /// cannot create an unrequested contact projection.
+    /// cannot create an unrequested contact projection. Malformed presence
+    /// (an unknown account or an invalid JID) is also ignored, keeping one bad
+    /// presence stanza from aborting the transport polling loop.
     pub fn update_contact_presence(
         &mut self,
         account_id: AccountId,
@@ -563,9 +596,13 @@ impl MindChatCore {
         presence: ContactPresence,
         status: Option<String>,
     ) -> Result<bool, CoreError> {
-        self.ensure_account(account_id)?;
+        if !self.accounts.contains_key(&account_id) {
+            return Ok(false);
+        }
         let jid = jid.into();
-        validate_jid(&jid)?;
+        if validate_jid(&jid).is_err() {
+            return Ok(false);
+        }
         let Some(contact) = self.contacts.get_mut(&(account_id, jid)) else {
             return Ok(false);
         };
@@ -580,16 +617,20 @@ impl MindChatCore {
     /// The adapter owns parsing and network recovery. This state machine owns
     /// the durable UI projection, so no transport-specific type needs to
     /// reach storage or a generated binding.
+    ///
+    /// Event application is resilient by contract: malformed or unknown
+    /// transport data (an invalid JID, an invalid conversation address, or an
+    /// unknown account) is skipped rather than surfaced as an error, so a
+    /// single bad stanza can never abort the FFI polling loop.
     pub fn apply_transport_event(
         &mut self,
         event: TransportEvent,
     ) -> Result<Option<MessageId>, CoreError> {
         match event {
             TransportEvent::Connected { account_id, capabilities } => {
-                let account = self
-                    .accounts
-                    .get_mut(&account_id)
-                    .ok_or(CoreError::UnknownAccount(account_id))?;
+                let Some(account) = self.accounts.get_mut(&account_id) else {
+                    return Ok(None);
+                };
                 account.connection_state = ConnectionState::Online;
                 account.capabilities = capabilities;
                 account.connection_error = None;
@@ -597,10 +638,9 @@ impl MindChatCore {
                 Ok(None)
             }
             TransportEvent::Disconnected { account_id, recoverable, detail } => {
-                let account = self
-                    .accounts
-                    .get_mut(&account_id)
-                    .ok_or(CoreError::UnknownAccount(account_id))?;
+                let Some(account) = self.accounts.get_mut(&account_id) else {
+                    return Ok(None);
+                };
                 account.connection_state =
                     if recoverable { ConnectionState::Offline } else { ConnectionState::Failed };
                 account.connection_error = detail;
@@ -608,7 +648,11 @@ impl MindChatCore {
                 Ok(None)
             }
             TransportEvent::CapabilitiesDiscovered { account_id, capabilities } => {
-                self.set_capabilities(account_id, capabilities)?;
+                // Capabilities for an account that is not configured locally
+                // are ignored; there is nothing to project them onto.
+                if self.accounts.contains_key(&account_id) {
+                    self.set_capabilities(account_id, capabilities)?;
+                }
                 Ok(None)
             }
             TransportEvent::RosterContactUpsert { account_id, jid, display_name, subscription } => {
@@ -630,16 +674,14 @@ impl MindChatCore {
                 sender,
                 body,
                 received_at_epoch_ms,
-            } => self
-                .receive_transport_text(
-                    account_id,
-                    kind,
-                    address,
-                    sender,
-                    body,
-                    received_at_epoch_ms,
-                )
-                .map(Some),
+            } => self.receive_transport_text(
+                account_id,
+                kind,
+                address,
+                sender,
+                body,
+                received_at_epoch_ms,
+            ),
             TransportEvent::DeliveryUpdated { account_id, sender, message_id, state } => {
                 // Receipt events are account- and sender-scoped. A stale,
                 // unknown, malformed, or foreign receipt is harmless and
@@ -1059,6 +1101,11 @@ impl MindChatCore {
             .ok_or(CoreError::UnknownAccount(account_id))
     }
 
+    /// Applies an incoming message addressed to a conversation.
+    ///
+    /// Incoming data for an unknown account or with an invalid conversation
+    /// address is skipped (`Ok(None)`) rather than surfaced as an error, so a
+    /// malformed message stanza cannot abort the transport polling loop.
     fn receive_transport_text(
         &mut self,
         account_id: AccountId,
@@ -1067,9 +1114,17 @@ impl MindChatCore {
         sender: String,
         body: String,
         received_at_epoch_ms: u64,
-    ) -> Result<MessageId, CoreError> {
-        self.ensure_account(account_id)?;
-        validate_conversation_address(&address)?;
+    ) -> Result<Option<MessageId>, CoreError> {
+        if !self.accounts.contains_key(&account_id) {
+            return Ok(None);
+        }
+        if validate_conversation_address(&address).is_err() {
+            return Ok(None);
+        }
+        // Validate the payload before creating a conversation projection, so
+        // a rejected stanza (for example an empty body) cannot leave a
+        // half-applied conversation behind.
+        validate_body(body.clone())?;
         let existing_conversation_id = self
             .conversations
             .values()
@@ -1099,7 +1154,7 @@ impl MindChatCore {
             self.events.push(CoreEvent::ConversationChanged(id));
             id
         };
-        self.receive_text(conversation_id, sender, body, received_at_epoch_ms)
+        self.receive_text(conversation_id, sender, body, received_at_epoch_ms).map(Some)
     }
 
     fn local_sender_for_conversation(
@@ -1236,14 +1291,28 @@ impl<T: XmppTransport> TransportCoordinator<T> {
         Ok(())
     }
 
-    /// Sends all pending or retryable text for an account in stable message-id order.
+    /// Sends pending or retryable text for an account in stable message-id order.
+    ///
+    /// The flush is bounded so a stalled server cannot freeze the whole app:
+    /// at most [`FLUSH_OUTBOX_MAX_BATCH`] messages are sent per call and the
+    /// call stops once [`FLUSH_SEND_TIMEOUT`] has elapsed between sends. Each
+    /// `send` can itself block up to the transport's own per-send timeout
+    /// (currently 15 s inside the XMPP worker), so the worst-case session lock
+    /// hold is `FLUSH_SEND_TIMEOUT` plus one per-send timeout, roughly 25 s.
+    /// Messages left behind stay pending and are retried by the next flush
+    /// call. A send failure still aborts the batch immediately and marks the
+    /// failing message `Failed`, preserving the abort-on-first-error contract.
     pub fn flush_outbox(
         &mut self,
         account_id: AccountId,
     ) -> Result<usize, TransportCoordinatorError> {
         let pending = self.core.pending_outgoing_messages(account_id)?;
+        let started = Instant::now();
         let mut sent_count = 0;
-        for message in pending {
+        for message in pending.into_iter().take(FLUSH_OUTBOX_MAX_BATCH) {
+            if started.elapsed() >= FLUSH_SEND_TIMEOUT {
+                break;
+            }
             let message_id = message.message_id;
             if let Err(error) = self.transport.send(message) {
                 self.core.set_delivery_state(message_id, DeliveryState::Failed)?;
@@ -1256,12 +1325,42 @@ impl<T: XmppTransport> TransportCoordinator<T> {
     }
 
     /// Polls one normalized transport event and applies it to the domain state.
+    ///
+    /// Returns `Ok(true)` when an event was applied, `Ok(false)` when the
+    /// queue is empty, and `Err` for a transport channel failure or a
+    /// per-event application failure. Application failures are non-fatal:
+    /// [`Self::poll_transport_events`] skips the failing event and keeps
+    /// draining, so a single malformed stanza can never abort the poll loop.
     pub fn poll_next_event(&mut self) -> Result<bool, TransportCoordinatorError> {
         let Some(event) = self.transport.next_event()? else {
             return Ok(false);
         };
         self.core.apply_transport_event(event)?;
         Ok(true)
+    }
+
+    /// Applies up to `max_events` queued transport events to the domain state.
+    ///
+    /// A failing event is consumed and skipped rather than aborting the
+    /// batch. This guarantees `Connected`/`Disconnected` events queued behind
+    /// a malformed stanza are still applied in the same poll cycle. Only a
+    /// transport channel failure (for example a dead worker) aborts the loop
+    /// and propagates as `Err`. Returns the number of events consumed.
+    pub fn poll_transport_events(
+        &mut self,
+        max_events: usize,
+    ) -> Result<usize, TransportCoordinatorError> {
+        let mut processed = 0;
+        while processed < max_events {
+            match self.poll_next_event() {
+                // Applied events and skipped-but-consumed failing events both
+                // advance the batch; only the queue running empty stops it.
+                Ok(true) | Err(TransportCoordinatorError::Core(_)) => processed += 1,
+                Ok(false) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(processed)
     }
 }
 
@@ -2000,5 +2099,156 @@ mod tests {
         coordinator.disconnect(account_id).expect("disconnect");
         assert_eq!(coordinator.transport().disconnected_accounts, [account_id]);
         assert_eq!(coordinator.core().accounts()[0].connection_state, ConnectionState::Offline);
+    }
+
+    #[test]
+    fn malformed_roster_event_is_skipped_without_creating_a_contact() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::RosterContactUpsert {
+                account_id,
+                jid: "not-a-jid".to_owned(),
+                display_name: "Bob".to_owned(),
+                subscription: RosterSubscription::Mutual,
+            }),
+            Ok(None)
+        );
+        assert!(core.contacts(account_id).is_empty());
+    }
+
+    #[test]
+    fn invalid_presence_jid_event_is_skipped() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::ContactPresenceUpdated {
+                account_id,
+                jid: "bad jid".to_owned(),
+                presence: ContactPresence::Online,
+                status: None,
+            }),
+            Ok(None)
+        );
+        assert!(core.contacts(account_id).is_empty());
+    }
+
+    #[test]
+    fn incoming_text_with_invalid_address_is_skipped() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::IncomingText {
+                account_id,
+                kind: ConversationKind::Direct,
+                address: "not-a-jid".to_owned(),
+                sender: "not-a-jid".to_owned(),
+                body: "hello".to_owned(),
+                received_at_epoch_ms: 1,
+            }),
+            Ok(None)
+        );
+        assert!(core.conversations(account_id).is_empty());
+    }
+
+    #[test]
+    fn unknown_account_transport_events_are_skipped() {
+        let mut core = MindChatCore::default();
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::Connected {
+                account_id: 999,
+                capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::Disconnected {
+                account_id: 999,
+                recoverable: true,
+                detail: None,
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::CapabilitiesDiscovered {
+                account_id: 999,
+                capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
+            }),
+            Ok(None)
+        );
+        assert_eq!(
+            core.apply_transport_event(TransportEvent::RosterContactUpsert {
+                account_id: 999,
+                jid: "bob@example.org".to_owned(),
+                display_name: "Bob".to_owned(),
+                subscription: RosterSubscription::Mutual,
+            }),
+            Ok(None)
+        );
+        assert!(core.accounts().is_empty());
+        assert!(core.contacts(999).is_empty());
+    }
+
+    #[test]
+    fn poll_batch_continues_past_a_failing_event() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        let mut coordinator = TransportCoordinator::new(core, FakeTransport::default());
+
+        // A message with an empty body fails core validation (EmptyMessage);
+        // the batch must skip it and still apply the Connected event behind it.
+        coordinator.transport_mut().events.push_back(TransportEvent::IncomingText {
+            account_id,
+            kind: ConversationKind::Direct,
+            address: "bob@example.org".to_owned(),
+            sender: "bob@example.org".to_owned(),
+            body: "   ".to_owned(),
+            received_at_epoch_ms: 1,
+        });
+        coordinator.transport_mut().events.push_back(TransportEvent::Connected {
+            account_id,
+            capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
+        });
+
+        assert_eq!(coordinator.poll_transport_events(4).expect("batch poll"), 2);
+        assert_eq!(coordinator.core().accounts()[0].connection_state, ConnectionState::Online);
+        assert_eq!(coordinator.core().conversations(account_id).len(), 0);
+    }
+
+    #[test]
+    fn flush_outbox_is_bounded_to_a_batch_per_call() {
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        let conversation_id = core
+            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
+            .expect("conversation");
+        let total = FLUSH_OUTBOX_MAX_BATCH + 10;
+        for index in 0..total {
+            core.send_text(
+                conversation_id,
+                "alice@example.org",
+                format!("message {index}"),
+                None,
+                index as u64 + 2,
+            )
+            .expect("queued message");
+        }
+
+        let mut coordinator = TransportCoordinator::new(core, FakeTransport::default());
+        assert_eq!(
+            coordinator.flush_outbox(account_id).expect("first flush"),
+            FLUSH_OUTBOX_MAX_BATCH
+        );
+        assert_eq!(coordinator.transport().sent_messages.len(), FLUSH_OUTBOX_MAX_BATCH);
+
+        assert_eq!(coordinator.flush_outbox(account_id).expect("second flush"), 10);
+        assert_eq!(coordinator.transport().sent_messages.len(), total);
+        assert!(
+            coordinator
+                .core()
+                .pending_outgoing_messages(account_id)
+                .expect("empty outbox")
+                .is_empty()
+        );
     }
 }

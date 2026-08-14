@@ -603,23 +603,27 @@ impl MindChatCoreHandle {
     ///
     /// The bound prevents a busy server from monopolizing the Kotlin caller;
     /// pass zero to perform no work, and values above 128 are clamped.
+    ///
+    /// Polling is resilient: a malformed or unknown event is consumed and
+    /// skipped instead of aborting the batch, so `Connected`/`Disconnected`
+    /// events queued behind a bad stanza are still applied in the same poll
+    /// cycle. Only a transport channel failure or a poisoned session lock
+    /// surfaces as an error. Returns the number of events consumed.
     pub fn poll_transport_events(&self, max_events: u32) -> Result<u32, MindChatBindingError> {
         let mut session = self.lock()?;
         let limit = max_events.min(MAX_TRANSPORT_EVENTS_PER_POLL);
-        let mut applied = 0;
-        while applied < limit {
-            if !session.poll_next_event().map_err(MindChatBindingError::from)? {
-                break;
-            }
-            applied += 1;
-        }
-        Ok(applied)
+        session
+            .poll_transport_events(limit as usize)
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+            .map_err(Into::into)
     }
 
     /// Sends queued or retryable text for an online account in stable message order.
     ///
     /// Offline and connecting accounts keep their queue untouched and return
-    /// zero, so Android can safely invoke this after each polling pass.
+    /// zero, so Android can safely invoke this after each polling pass. The
+    /// send batch is bounded in the coordinator (32 messages, ~10 s budget),
+    /// so a stalled server cannot freeze the session lock for the whole queue.
     pub fn flush_outbox(&self, account_id: u64) -> Result<u32, MindChatBindingError> {
         let mut session = self.lock()?;
         let connection_state = session
