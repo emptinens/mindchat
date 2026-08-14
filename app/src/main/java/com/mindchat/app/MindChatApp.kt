@@ -1,7 +1,15 @@
 package com.mindchat.app
 
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -22,18 +30,23 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
@@ -43,6 +56,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
@@ -53,21 +69,30 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -76,9 +101,15 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
+import com.mindchat.app.theme.ACCENT_DEFAULT_KEY
+import com.mindchat.app.theme.AccentOptions
 import com.mindchat.app.theme.MindChatTheme
+import java.io.File
+import java.io.FileOutputStream
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private enum class Destination {
     Chats,
@@ -112,7 +143,12 @@ private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
             delay(750)
         }
     }
-    MindChatTheme(dynamicColor = state.dynamicColor) {
+    // Per-account accent override: the active account's profile accent seeds
+    // the theme, keeping the dynamic/system default when none is chosen.
+    val activeAccent = state.profiles[state.activeAccountId]
+        ?.accentKey
+        ?.let { key -> AccentOptions.firstOrNull { it.key == key }?.color }
+    MindChatTheme(dynamicColor = state.dynamicColor, accentSeed = activeAccent) {
         Surface(modifier = Modifier.fillMaxSize()) {
             if (appLockHost?.appLockState?.blocksContent == true) {
                 AppLockedScreen(
@@ -191,6 +227,13 @@ private fun MindChatShell(
     var showAddContact by rememberSaveable { mutableStateOf(false) }
     var showNewConversation by rememberSaveable { mutableStateOf(false) }
     var reconnectAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var renameAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var deleteAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var deleteConversationId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var profileAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
+
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
 
     if (showAddAccount) {
         AddAccountDialog(
@@ -239,8 +282,82 @@ private fun MindChatShell(
         )
     }
 
+    renameAccountId?.let { id ->
+        state.accounts.firstOrNull { it.id == id }?.let { account ->
+            RenameAccountDialog(
+                account = account,
+                onDismiss = { renameAccountId = null },
+                onRename = { name ->
+                    runCatching { gateway.renameAccount(account.id, name) }
+                        .onSuccess { renameAccountId = null }
+                        .isSuccess
+                },
+            )
+        }
+    }
+
+    deleteAccountId?.let { id ->
+        state.accounts.firstOrNull { it.id == id }?.let { account ->
+            DeleteAccountDialog(
+                account = account,
+                onDismiss = { deleteAccountId = null },
+                onConfirm = {
+                    runCatching { gateway.deleteAccount(account.id) }
+                        .onSuccess { deleteAccountId = null }
+                        .isSuccess
+                },
+            )
+        }
+    }
+
+    deleteConversationId?.let { id ->
+        state.conversations.firstOrNull { it.id == id }?.let { conversation ->
+            DeleteConversationDialog(
+                conversation = conversation,
+                onDismiss = { deleteConversationId = null },
+                onConfirm = {
+                    runCatching { gateway.deleteConversation(conversation.id) }
+                        .onSuccess {
+                            if (selectedConversationId == conversation.id) {
+                                selectedConversationId = null
+                            }
+                            deleteConversationId = null
+                        }
+                        .isSuccess
+                },
+            )
+        }
+    }
+
+    profileAccountId?.let { id ->
+        state.accounts.firstOrNull { it.id == id }?.let { account ->
+            ProfileSheet(
+                account = account,
+                profile = state.profiles[id],
+                onDismiss = { profileAccountId = null },
+                onSave = { updatedProfile, newDisplayName ->
+                    val trimmedName = newDisplayName.trim()
+                    val renamed = if (trimmedName.isNotEmpty() && trimmedName != account.displayName) {
+                        runCatching { gateway.renameAccount(account.id, trimmedName) }.isSuccess
+                    } else {
+                        true
+                    }
+                    if (renamed) {
+                        gateway.updateProfile(account.id, updatedProfile)
+                        profileAccountId = null
+                    }
+                    renamed
+                },
+            )
+        }
+    }
+
     val selectedConversation = state.conversations.firstOrNull { it.id == selectedConversationId }
     if (selectedConversation != null) {
+        // Clear the unread badge once the conversation becomes visible.
+        LaunchedEffect(selectedConversation.id) {
+            gateway.markConversationRead(selectedConversation.id)
+        }
         // System back returns to the conversation list instead of exiting the app.
         BackHandler {
             selectedConversationId = null
@@ -250,106 +367,142 @@ private fun MindChatShell(
             messages = state.messagesByConversation[selectedConversation.id].orEmpty(),
             onBack = { selectedConversationId = null },
             onSend = { gateway.sendText(selectedConversation.id, it) },
+            onDeleteConversation = { deleteConversationId = selectedConversation.id },
         )
         return
     }
 
-    Scaffold(
-        topBar = {
-            MindChatTopBar(
-                state = state,
-                onAccountSelected = gateway::selectAccount,
-                onAddAccount = { showAddAccount = true },
-                onReconnect = { reconnectAccountId = it },
-                onCancelConnection = gateway::disconnectAccount,
-            )
-        },
-        bottomBar = {
-            NavigationBar {
-                Destination.entries.forEach { item ->
-                    NavigationBarItem(
-                        selected = destination == item,
-                        onClick = { destination = item },
-                        icon = {
-                            Icon(
-                                imageVector = when (item) {
-                                    Destination.Chats -> Icons.Filled.Home
-                                    Destination.Contacts -> Icons.Filled.Star
-                                    Destination.Settings -> Icons.Filled.Settings
-                                },
-                                contentDescription = null,
-                            )
-                        },
-                        label = {
-                            Text(
-                                when (item) {
-                                    Destination.Chats -> stringResource(R.string.conversations)
-                                    Destination.Contacts -> stringResource(R.string.contacts)
-                                    Destination.Settings -> stringResource(R.string.settings)
-                                },
-                            )
-                        },
-                    )
-                }
+    // System back closes the account drawer before leaving the shell.
+    BackHandler(enabled = drawerState.isOpen) {
+        scope.launch { drawerState.close() }
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet {
+                AccountDrawer(
+                    state = state,
+                    onAccountSelected = { accountId ->
+                        gateway.selectAccount(accountId)
+                        scope.launch { drawerState.close() }
+                    },
+                    onAddAccount = {
+                        showAddAccount = true
+                        scope.launch { drawerState.close() }
+                    },
+                    onReconnect = { reconnectAccountId = it },
+                    onDisconnect = gateway::disconnectAccount,
+                    onRename = { renameAccountId = it },
+                    onDelete = { deleteAccountId = it },
+                    onEditProfile = { profileAccountId = it },
+                )
             }
         },
-        floatingActionButton = {
-            if (state.activeAccountId != 0L) {
-                when (destination) {
-                    Destination.Chats -> {
-                        FloatingActionButton(onClick = { showNewConversation = true }) {
-                            Icon(
-                                imageVector = Icons.Filled.Add,
-                                contentDescription = stringResource(R.string.new_chat),
-                            )
-                        }
+    ) {
+        Scaffold(
+            topBar = {
+                MindChatTopBar(
+                    state = state,
+                    onOpenDrawer = { scope.launch { drawerState.open() } },
+                    onAddAccount = { showAddAccount = true },
+                    onReconnect = { reconnectAccountId = it },
+                    onCancelConnection = gateway::disconnectAccount,
+                )
+            },
+            bottomBar = {
+                NavigationBar {
+                    Destination.entries.forEach { item ->
+                        NavigationBarItem(
+                            selected = destination == item,
+                            onClick = { destination = item },
+                            icon = {
+                                Icon(
+                                    imageVector = when (item) {
+                                        Destination.Chats -> Icons.Filled.Home
+                                        Destination.Contacts -> Icons.Filled.Star
+                                        Destination.Settings -> Icons.Filled.Settings
+                                    },
+                                    contentDescription = null,
+                                )
+                            },
+                            label = {
+                                Text(
+                                    when (item) {
+                                        Destination.Chats -> stringResource(R.string.conversations)
+                                        Destination.Contacts -> stringResource(R.string.contacts)
+                                        Destination.Settings -> stringResource(R.string.settings)
+                                    },
+                                )
+                            },
+                        )
                     }
-
-                    Destination.Contacts -> {
-                        FloatingActionButton(onClick = { showAddContact = true }) {
-                            Icon(
-                                imageVector = Icons.Filled.Add,
-                                contentDescription = stringResource(R.string.add_contact),
-                            )
-                        }
-                    }
-
-                    Destination.Settings -> Unit
                 }
-            }
-        },
-    ) { padding ->
-        when (destination) {
-            Destination.Chats -> ConversationsScreen(
-                state = state,
-                contentPadding = padding,
-                onConversationClick = { selectedConversationId = it.id },
-            )
+            },
+            floatingActionButton = {
+                if (state.activeAccountId != 0L) {
+                    when (destination) {
+                        Destination.Chats -> {
+                            FloatingActionButton(onClick = { showNewConversation = true }) {
+                                Icon(
+                                    imageVector = Icons.Filled.Add,
+                                    contentDescription = stringResource(R.string.new_chat),
+                                )
+                            }
+                        }
 
-            Destination.Contacts -> ContactsScreen(
-                state = state,
-                contentPadding = padding,
-                onContactClick = { contact ->
-                    gateway.openConversation(contact.jid, contact.displayName, group = false)?.let {
-                        selectedConversationId = it
-                        destination = Destination.Chats
+                        Destination.Contacts -> {
+                            FloatingActionButton(onClick = { showAddContact = true }) {
+                                Icon(
+                                    imageVector = Icons.Filled.Add,
+                                    contentDescription = stringResource(R.string.add_contact),
+                                )
+                            }
+                        }
+
+                        Destination.Settings -> Unit
                     }
-                },
-            )
-            Destination.Settings -> SettingsScreen(
-                state = state,
-                contentPadding = padding,
-                onDynamicColorChange = gateway::toggleDynamicColor,
-                onComfortableLayoutChange = gateway::toggleComfortableLayout,
-                appLockAvailable = appLockHost?.isAuthenticationAvailable ?: true,
-                onAppLockChange = {
-                    val enabled = !state.appLockEnabled
-                    if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
-                        appLockHost?.setAppLockEnabled(enabled)
-                        gateway.toggleAppLock()
-                    }
-                },
-            )
+                }
+            },
+        ) { padding ->
+            when (destination) {
+                Destination.Chats -> ConversationsScreen(
+                    state = state,
+                    contentPadding = padding,
+                    onConversationClick = { selectedConversationId = it.id },
+                    onMarkRead = { gateway.markConversationRead(it.id) },
+                    onOpenAsGroup = { conversation ->
+                        gateway.openConversation(conversation.address, conversation.title, group = true)
+                            ?.let { selectedConversationId = it }
+                    },
+                    onDeleteConversation = { deleteConversationId = it.id },
+                )
+
+                Destination.Contacts -> ContactsScreen(
+                    state = state,
+                    contentPadding = padding,
+                    onContactClick = { contact ->
+                        gateway.openConversation(contact.jid, contact.displayName, group = false)?.let {
+                            selectedConversationId = it
+                            destination = Destination.Chats
+                        }
+                    },
+                )
+                Destination.Settings -> SettingsScreen(
+                    state = state,
+                    contentPadding = padding,
+                    onDynamicColorChange = gateway::toggleDynamicColor,
+                    onComfortableLayoutChange = gateway::toggleComfortableLayout,
+                    appLockAvailable = appLockHost?.isAuthenticationAvailable ?: true,
+                    onAppLockChange = {
+                        val enabled = !state.appLockEnabled
+                        if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
+                            appLockHost?.setAppLockEnabled(enabled)
+                            gateway.toggleAppLock()
+                        }
+                    },
+                )
+            }
         }
     }
 }
@@ -358,7 +511,7 @@ private fun MindChatShell(
 @Composable
 private fun MindChatTopBar(
     state: MindChatUiState,
-    onAccountSelected: (Long) -> Unit,
+    onOpenDrawer: () -> Unit,
     onAddAccount: () -> Unit,
     onReconnect: (Long) -> Unit,
     onCancelConnection: (Long) -> Unit,
@@ -372,6 +525,41 @@ private fun MindChatTopBar(
             active.connectionState == AccountConnectionState.FAILED ||
             active.connectionError != null)
     TopAppBar(
+        navigationIcon = {
+            val avatarLabel = active?.let {
+                stringResource(R.string.account_avatar, it.displayName)
+            } ?: stringResource(R.string.open_account_menu)
+            // The avatar chip opens the account drawer; the corner dot mirrors
+            // the active account's connection state.
+            IconButton(
+                onClick = onOpenDrawer,
+                modifier = Modifier.size(48.dp),
+            ) {
+                if (active != null) {
+                    Box {
+                        ProfileAvatar(
+                            account = active,
+                            avatarUri = state.profiles[active.id]?.avatarUri,
+                            contentDescription = avatarLabel,
+                            modifier = Modifier.size(40.dp),
+                        )
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .size(12.dp)
+                                .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape)
+                                .clip(CircleShape)
+                                .background(connectionDotColor(active.connectionState)),
+                        )
+                    }
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.Person,
+                        contentDescription = stringResource(R.string.open_account_menu),
+                    )
+                }
+            }
+        },
         title = {
             Column {
                 Text(
@@ -440,38 +628,14 @@ private fun MindChatTopBar(
             containerColor = MaterialTheme.colorScheme.surface,
         ),
     )
-    if (state.accounts.size > 1) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            state.accounts.forEach { account ->
-                AssistChip(
-                    onClick = { onAccountSelected(account.id) },
-                    label = { Text(account.displayName) },
-                    leadingIcon = {
-                        if (account.connectionState == AccountConnectionState.CONNECTING) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        } else {
-                            PresenceDot(account.presence)
-                        }
-                    },
-                    colors = AssistChipDefaults.assistChipColors(
-                        containerColor = if (account.id == state.activeAccountId) {
-                            MaterialTheme.colorScheme.secondaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surface
-                        },
-                    ),
-                )
-            }
-        }
-    }
+}
+
+@Composable
+private fun connectionDotColor(state: AccountConnectionState): Color = when (state) {
+    AccountConnectionState.ONLINE -> Color(0xFF2E7D32)
+    AccountConnectionState.CONNECTING -> Color(0xFFF9A825)
+    AccountConnectionState.FAILED -> Color(0xFFC62828)
+    AccountConnectionState.OFFLINE -> MaterialTheme.colorScheme.outline
 }
 
 private fun accountConnectionLabel(connectionState: AccountConnectionState): Int = when (connectionState) {
@@ -486,6 +650,9 @@ private fun ConversationsScreen(
     state: MindChatUiState,
     contentPadding: PaddingValues,
     onConversationClick: (ConversationUi) -> Unit,
+    onMarkRead: (ConversationUi) -> Unit,
+    onOpenAsGroup: (ConversationUi) -> Unit,
+    onDeleteConversation: (ConversationUi) -> Unit,
 ) {
     val conversations = state.conversations
         .filter { it.accountId == state.activeAccountId }
@@ -508,7 +675,13 @@ private fun ConversationsScreen(
             }
         }
         items(conversations, key = { it.id }) { conversation ->
-            ConversationRow(conversation = conversation, onClick = { onConversationClick(conversation) })
+            ConversationRow(
+                conversation = conversation,
+                onClick = { onConversationClick(conversation) },
+                onMarkRead = { onMarkRead(conversation) },
+                onOpenAsGroup = { onOpenAsGroup(conversation) },
+                onDelete = { onDeleteConversation(conversation) },
+            )
         }
     }
 }
@@ -535,7 +708,14 @@ private fun EmptyConversations() {
 }
 
 @Composable
-private fun ConversationRow(conversation: ConversationUi, onClick: () -> Unit) {
+private fun ConversationRow(
+    conversation: ConversationUi,
+    onClick: () -> Unit,
+    onMarkRead: () -> Unit,
+    onOpenAsGroup: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -545,7 +725,7 @@ private fun ConversationRow(conversation: ConversationUi, onClick: () -> Unit) {
         ),
     ) {
         Row(
-            modifier = Modifier.padding(14.dp),
+            modifier = Modifier.padding(start = 14.dp, top = 14.dp, end = 6.dp, bottom = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Avatar(conversation.title, conversation.isGroup)
@@ -590,6 +770,52 @@ private fun ConversationRow(conversation: ConversationUi, onClick: () -> Unit) {
                     }
                 }
             }
+            // Overflow menu: mark read, open as group, delete. The icon button
+            // keeps its own 48dp touch target and consumes its own taps.
+            // GAP (0.1.5): pinning/archiving are NOT offered here because the
+            // domain core has no pin/archive model yet; do not fake them with
+            // local-only state until the core supports them.
+            IconButton(onClick = { menuExpanded = true }) {
+                Icon(
+                    imageVector = Icons.Filled.MoreVert,
+                    contentDescription = stringResource(R.string.conversation_actions),
+                )
+            }
+            DropdownMenu(
+                expanded = menuExpanded,
+                onDismissRequest = { menuExpanded = false },
+            ) {
+                if (conversation.unreadCount > 0) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.mark_read)) },
+                        onClick = {
+                            menuExpanded = false
+                            onMarkRead()
+                        },
+                    )
+                }
+                if (!conversation.isGroup) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.open_as_group)) },
+                        onClick = {
+                            menuExpanded = false
+                            onOpenAsGroup()
+                        },
+                    )
+                }
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = stringResource(R.string.delete_conversation),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onDelete()
+                    },
+                )
+            }
         }
     }
 }
@@ -601,6 +827,7 @@ private fun ChatScreen(
     messages: List<MessageUi>,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
+    onDeleteConversation: () -> Unit,
 ) {
     var draft by rememberSaveable(conversation.id) { mutableStateOf("") }
     Scaffold(
@@ -625,6 +852,37 @@ private fun ChatScreen(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = stringResource(R.string.conversations),
+                        )
+                    }
+                },
+                actions = {
+                    var menuExpanded by remember { mutableStateOf(false) }
+                    // Group detail offers "Leave group"; direct chats offer
+                    // "Delete conversation". Both remove the local record via
+                    // the deleteConversation hook once wired (0.1.5).
+                    IconButton(onClick = { menuExpanded = true }) {
+                        Icon(
+                            imageVector = Icons.Filled.MoreVert,
+                            contentDescription = stringResource(R.string.conversation_actions),
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = menuExpanded,
+                        onDismissRequest = { menuExpanded = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    text = stringResource(
+                                        if (conversation.isGroup) R.string.leave_group else R.string.delete_conversation,
+                                    ),
+                                    color = MaterialTheme.colorScheme.error,
+                                )
+                            },
+                            onClick = {
+                                menuExpanded = false
+                                onDeleteConversation()
+                            },
                         )
                     }
                 },
@@ -1287,6 +1545,666 @@ private fun NewConversationDialog(
             TextButton(onClick = onDismiss) {
                 Text(stringResource(R.string.cancel))
             }
+        },
+    )
+}
+
+/* ===================================================================== *
+ * 0.1.5 account management: drawer, per-account profiles, chat actions. *
+ * ===================================================================== */
+
+@Composable
+private fun AccountDrawer(
+    state: MindChatUiState,
+    onAccountSelected: (Long) -> Unit,
+    onAddAccount: () -> Unit,
+    onReconnect: (Long) -> Unit,
+    onDisconnect: (Long) -> Unit,
+    onRename: (Long) -> Unit,
+    onDelete: (Long) -> Unit,
+    onEditProfile: (Long) -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Text(
+            text = stringResource(R.string.accounts),
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.padding(start = 24.dp, top = 24.dp, bottom = 8.dp),
+        )
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            items(state.accounts, key = { it.id }) { account ->
+                AccountDrawerRow(
+                    account = account,
+                    profile = state.profiles[account.id],
+                    isActive = account.id == state.activeAccountId,
+                    onClick = { onAccountSelected(account.id) },
+                    onReconnect = { onReconnect(account.id) },
+                    onDisconnect = { onDisconnect(account.id) },
+                    onRename = { onRename(account.id) },
+                    onDelete = { onDelete(account.id) },
+                    onEditProfile = { onEditProfile(account.id) },
+                )
+            }
+        }
+        HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+        ListItem(
+            modifier = Modifier.clickable(onClick = onAddAccount),
+            leadingContent = {
+                Icon(
+                    imageVector = Icons.Filled.Add,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            },
+            headlineContent = { Text(stringResource(R.string.add_account)) },
+        )
+    }
+}
+
+@Composable
+private fun AccountDrawerRow(
+    account: AccountUi,
+    profile: AccountProfile?,
+    isActive: Boolean,
+    onClick: () -> Unit,
+    onReconnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onEditProfile: () -> Unit,
+) {
+    var menuExpanded by remember { mutableStateOf(false) }
+    ListItem(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(
+                onClickLabel = stringResource(R.string.switch_to_account, account.displayName),
+                onClick = onClick,
+            )
+            .background(
+                if (isActive) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent,
+            ),
+        leadingContent = {
+            Box {
+                ProfileAvatar(
+                    account = account,
+                    avatarUri = profile?.avatarUri,
+                    contentDescription = stringResource(R.string.account_avatar, account.displayName),
+                    modifier = Modifier.size(44.dp),
+                )
+                ConnectionStatusIndicator(
+                    state = account.connectionState,
+                    modifier = Modifier.align(Alignment.BottomEnd),
+                )
+            }
+        },
+        headlineContent = {
+            Text(
+                text = account.displayName,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        supportingContent = {
+            Text(
+                text = "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}",
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        trailingContent = {
+            IconButton(onClick = { menuExpanded = true }) {
+                Icon(
+                    imageVector = Icons.Filled.MoreVert,
+                    contentDescription = stringResource(R.string.actions_for_account, account.displayName),
+                )
+            }
+            DropdownMenu(
+                expanded = menuExpanded,
+                onDismissRequest = { menuExpanded = false },
+            ) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.edit_profile)) },
+                    onClick = {
+                        menuExpanded = false
+                        onEditProfile()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.reconnect)) },
+                    onClick = {
+                        menuExpanded = false
+                        onReconnect()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.disconnect)) },
+                    onClick = {
+                        menuExpanded = false
+                        onDisconnect()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.rename_account)) },
+                    onClick = {
+                        menuExpanded = false
+                        onRename()
+                    },
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            text = stringResource(R.string.delete_account),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    },
+                    onClick = {
+                        menuExpanded = false
+                        onDelete()
+                    },
+                )
+            }
+        },
+    )
+}
+
+/** Initials or picked-image avatar for an account, with an accessible label. */
+@Composable
+private fun ProfileAvatar(
+    account: AccountUi,
+    avatarUri: String?,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+) {
+    if (avatarUri != null) {
+        AvatarImage(
+            uri = avatarUri,
+            contentDescription = contentDescription,
+            modifier = modifier,
+        )
+    } else {
+        Box(
+            modifier = modifier
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.secondaryContainer)
+                .semantics { contentDescription?.let { this.contentDescription = it } },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = account.displayName.take(1).uppercase(),
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+        }
+    }
+}
+
+/**
+ * Decodes a local avatar (content URI or copied file path) off the main
+ * thread with downsampling so large gallery images stay cheap to render.
+ */
+@Composable
+private fun AvatarImage(
+    uri: String,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val bitmap by produceState<ImageBitmap?>(initialValue = null, uri) {
+        value = withContext(Dispatchers.IO) {
+            runCatching { decodeSampledAvatar(context, Uri.parse(uri)) }.getOrNull()
+        }
+    }
+    val image = bitmap
+    if (image != null) {
+        Image(
+            bitmap = image,
+            contentDescription = contentDescription,
+            modifier = modifier.clip(CircleShape),
+            contentScale = ContentScale.Crop,
+        )
+    } else {
+        Box(
+            modifier = modifier
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                .semantics { contentDescription?.let { this.contentDescription = it } },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Person,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+private fun decodeSampledAvatar(context: Context, uri: Uri, targetSize: Int = 256): ImageBitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        BitmapFactory.decodeStream(input, null, bounds)
+    }
+    var sample = 1
+    while (bounds.outWidth / (sample * 2) >= targetSize || bounds.outHeight / (sample * 2) >= targetSize) {
+        sample *= 2
+    }
+    val options = BitmapFactory.Options().apply { inSampleSize = sample }
+    return context.contentResolver.openInputStream(uri)?.use { input ->
+        BitmapFactory.decodeStream(input, null, options)?.asImageBitmap()
+    }
+}
+
+/**
+ * Copies a picked avatar into app-private storage so it survives the picker's
+ * temporary read grant. Falls back to the original URI when the copy fails.
+ */
+private fun persistAvatarCopy(context: Context, accountId: Long, uri: String?): String? {
+    if (uri == null) return null
+    return runCatching {
+        val dir = File(context.filesDir, "avatars").apply { mkdirs() }
+        val target = File(dir, "account_$accountId.img")
+        context.contentResolver.openInputStream(Uri.parse(uri))?.use { input ->
+            FileOutputStream(target).use { output -> input.copyTo(output) }
+        }
+        target.absolutePath
+    }.getOrElse { uri }
+}
+
+/** Small dot or spinner that mirrors an account's connection state. */
+@Composable
+private fun ConnectionStatusIndicator(
+    state: AccountConnectionState,
+    modifier: Modifier = Modifier,
+) {
+    when (state) {
+        AccountConnectionState.CONNECTING -> CircularProgressIndicator(
+            modifier = modifier.size(16.dp),
+            strokeWidth = 2.dp,
+        )
+
+        else -> Box(
+            modifier = modifier
+                .size(10.dp)
+                .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape)
+                .clip(CircleShape)
+                .background(connectionDotColor(state)),
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ProfileSheet(
+    account: AccountUi,
+    profile: AccountProfile?,
+    onDismiss: () -> Unit,
+    onSave: (profile: AccountProfile, displayName: String) -> Boolean,
+) {
+    val context = LocalContext.current
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val scope = rememberCoroutineScope()
+    var displayName by rememberSaveable(account.id) { mutableStateOf(account.displayName) }
+    var statusMessage by rememberSaveable(account.id) { mutableStateOf(profile?.statusMessage.orEmpty()) }
+    var accentKey by rememberSaveable(account.id) { mutableStateOf(profile?.accentKey) }
+    var avatarUri by rememberSaveable(account.id) { mutableStateOf(profile?.avatarUri) }
+    var saving by remember { mutableStateOf(false) }
+    var failed by remember { mutableStateOf(false) }
+
+    val avatarPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        uri?.let { avatarUri = it.toString() }
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        shape = MaterialTheme.shapes.extraLarge,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 24.dp, end = 24.dp, bottom = 32.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.profile_title),
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            Text(
+                text = account.jid,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(20.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ProfileAvatar(
+                    account = account,
+                    avatarUri = avatarUri,
+                    contentDescription = stringResource(R.string.account_avatar, account.displayName),
+                    modifier = Modifier.size(72.dp),
+                )
+                Spacer(Modifier.width(16.dp))
+                Column {
+                    FilledTonalButton(
+                        onClick = {
+                            avatarPicker.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                            )
+                        },
+                    ) {
+                        Text(stringResource(R.string.change_avatar))
+                    }
+                    if (avatarUri != null) {
+                        TextButton(onClick = { avatarUri = null }) {
+                            Text(stringResource(R.string.remove_avatar))
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+            OutlinedTextField(
+                value = displayName,
+                onValueChange = {
+                    displayName = it
+                    failed = false
+                },
+                label = { Text(stringResource(R.string.display_name)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = statusMessage,
+                onValueChange = { statusMessage = it },
+                label = { Text(stringResource(R.string.status_message)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(20.dp))
+            Text(
+                text = stringResource(R.string.accent_color),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Spacer(Modifier.height(8.dp))
+            AccentSelector(selectedKey = accentKey, onSelect = { accentKey = it })
+            if (failed) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = stringResource(R.string.not_available_yet),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onDismiss, enabled = !saving) {
+                    Text(stringResource(R.string.cancel))
+                }
+                Spacer(Modifier.width(8.dp))
+                FilledTonalButton(
+                    onClick = {
+                        saving = true
+                        failed = false
+                        scope.launch {
+                            val persistedAvatar = withContext(Dispatchers.IO) {
+                                persistAvatarCopy(context, account.id, avatarUri)
+                            }
+                            val saved = onSave(
+                                AccountProfile(
+                                    avatarUri = persistedAvatar,
+                                    statusMessage = statusMessage.trim().ifBlank { null },
+                                    accentKey = accentKey?.takeIf { it != ACCENT_DEFAULT_KEY },
+                                ),
+                                displayName.trim(),
+                            )
+                            saving = false
+                            if (!saved) failed = true
+                        }
+                    },
+                    enabled = displayName.isNotBlank() && !saving,
+                ) {
+                    Text(
+                        text = if (saving) {
+                            stringResource(R.string.saving)
+                        } else {
+                            stringResource(R.string.save)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccentSelector(
+    selectedKey: String?,
+    onSelect: (String) -> Unit,
+) {
+    val isDefault = selectedKey == null || selectedKey == ACCENT_DEFAULT_KEY
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(MaterialTheme.shapes.medium)
+                .clickable { onSelect(ACCENT_DEFAULT_KEY) }
+                .padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                    .border(1.dp, MaterialTheme.colorScheme.outline, CircleShape),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Refresh,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Text(
+                text = stringResource(R.string.accent_default),
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.weight(1f),
+            )
+            if (isDefault) {
+                Icon(
+                    imageVector = Icons.Filled.Check,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            AccentOptions.forEach { option ->
+                val label = stringResource(option.labelRes)
+                val selected = option.key == selectedKey
+                Column(
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(option.color)
+                            .then(
+                                if (selected) {
+                                    Modifier.border(3.dp, MaterialTheme.colorScheme.primary, CircleShape)
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .clickable { onSelect(option.key) }
+                            .semantics { contentDescription = label },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (selected) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (selected) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RenameAccountDialog(
+    account: AccountUi,
+    onDismiss: () -> Unit,
+    onRename: (displayName: String) -> Boolean,
+) {
+    var name by rememberSaveable(account.id) { mutableStateOf(account.displayName) }
+    var failed by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
+        title = { Text(stringResource(R.string.rename_account)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = {
+                        name = it
+                        failed = false
+                    },
+                    label = { Text(stringResource(R.string.display_name)) },
+                    singleLine = true,
+                    isError = failed,
+                    supportingText = if (failed) {
+                        { Text(stringResource(R.string.not_available_yet)) }
+                    } else {
+                        null
+                    },
+                )
+            }
+        },
+        confirmButton = {
+            FilledTonalButton(
+                onClick = { if (!onRename(name)) failed = true },
+                enabled = name.isNotBlank(),
+            ) {
+                Text(stringResource(R.string.save))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+private fun DeleteAccountDialog(
+    account: AccountUi,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Boolean,
+) {
+    var failed by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
+        title = { Text(stringResource(R.string.delete_account)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(stringResource(R.string.delete_account_confirm, account.displayName))
+                if (failed) {
+                    Text(
+                        text = stringResource(R.string.not_available_yet),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            FilledTonalButton(
+                onClick = { if (!onConfirm()) failed = true },
+            ) {
+                Text(
+                    text = stringResource(R.string.delete_account),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
+@Composable
+private fun DeleteConversationDialog(
+    conversation: ConversationUi,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Boolean,
+) {
+    var failed by remember { mutableStateOf(false) }
+    val actionLabel = if (conversation.isGroup) R.string.leave_group else R.string.delete_conversation
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
+        title = { Text(stringResource(actionLabel)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    stringResource(
+                        if (conversation.isGroup) {
+                            R.string.leave_group_confirm
+                        } else {
+                            R.string.delete_conversation_confirm
+                        },
+                    ),
+                )
+                if (failed) {
+                    Text(
+                        text = stringResource(R.string.not_available_yet),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            FilledTonalButton(
+                onClick = { if (!onConfirm()) failed = true },
+            ) {
+                Text(
+                    text = stringResource(actionLabel),
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
         },
     )
 }

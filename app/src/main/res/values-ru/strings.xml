@@ -65,4 +65,35 @@
     <string name="retry">Повторить</string>
     <string name="connection_stalled">Подключение занимает больше времени, чем ожидалось</string>
     <string name="group_create_failed">Не удалось создать чат. Проверьте адрес и попробуйте снова.</string>
+    <!-- Управление аккаунтами и профили 0.1.5 -->
+    <string name="accounts">Аккаунты</string>
+    <string name="open_account_menu">Открыть меню аккаунтов</string>
+    <string name="account_avatar">Аватар: %1$s</string>
+    <string name="edit_profile">Изменить профиль</string>
+    <string name="profile_title">Профиль</string>
+    <string name="status_message">Статусное сообщение</string>
+    <string name="accent_color">Акцентный цвет</string>
+    <string name="accent_default">Системный</string>
+    <string name="change_avatar">Изменить аватар</string>
+    <string name="remove_avatar">Убрать аватар</string>
+    <string name="rename_account">Переименовать аккаунт</string>
+    <string name="delete_account">Удалить аккаунт</string>
+    <string name="delete_account_confirm">Удалить %1$s и его локальные данные? Это действие нельзя отменить.</string>
+    <string name="delete_conversation">Удалить переписку</string>
+    <string name="delete_conversation_confirm">Удалить эту переписку и её сообщения?</string>
+    <string name="leave_group">Покинуть группу</string>
+    <string name="leave_group_confirm">Удалить эту группу и её локальные сообщения?</string>
+    <string name="mark_read">Отметить прочитанным</string>
+    <string name="disconnect">Отключиться</string>
+    <string name="open_as_group">Открыть как группу</string>
+    <string name="not_available_yet">Это действие пока недоступно.</string>
+    <string name="switch_to_account">Переключиться на %1$s</string>
+    <string name="actions_for_account">Действия для %1$s</string>
+    <string name="conversation_actions">Действия с перепиской</string>
+    <string name="saving">Сохранение…</string>
+    <string name="accent_ocean">Океан</string>
+    <string name="accent_forest">Лес</string>
+    <string name="accent_sunset">Закат</string>
+    <string name="accent_berry">Ягода</string>
+    <string name="accent_crimson">Малиновый</string>
 </resources>

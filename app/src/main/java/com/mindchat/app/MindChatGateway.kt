@@ -79,6 +79,7 @@ data class MindChatUiState(
     val activeAccountId: Long,
     val conversations: List<ConversationUi>,
     val messagesByConversation: Map<Long, List<MessageUi>>,
+    val profiles: Map<Long, AccountProfile> = emptyMap(),
     val dynamicColor: Boolean = true,
     val comfortableLayout: Boolean = true,
     val appLockEnabled: Boolean = false,
@@ -126,6 +127,14 @@ interface MindChatGateway {
     fun addContact(jid: String, displayName: String)
     fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
+    fun markConversationRead(conversationId: Long)
+    fun updateProfile(accountId: Long, profile: AccountProfile)
+    // TODO 0.1.5-ffi: the following hooks throw until the coordinator wires
+    // core.registerAccount/deleteAccount/updateAccountDisplayName/
+    // deleteConversation after UniFFI binding regeneration.
+    fun deleteAccount(accountId: Long)
+    fun renameAccount(accountId: Long, displayName: String)
+    fun deleteConversation(conversationId: Long)
     suspend fun pollTransport()
     suspend fun persistNow()
     fun toggleDynamicColor()
@@ -242,6 +251,52 @@ class NativeMindChatGateway(
             // The account clears through transport events; keep the UI current.
             refresh()
         }
+    }
+
+    override fun markConversationRead(conversationId: Long) {
+        try {
+            core.markConversationRead(conversationId.toULong())
+            markDirty()
+            refresh()
+        } catch (_: MindChatBindingException) {
+            // The unread count is cosmetic; a rejected call just keeps the badge.
+            refresh()
+        }
+    }
+
+    override fun updateProfile(accountId: Long, profile: AccountProfile) {
+        preferences.writeProfile(accountId, profile)
+        refresh()
+    }
+
+    /**
+     * TODO 0.1.5-ffi: account deletion is wired to the UI but the native call
+     * is not available in the current generated bindings. The coordinator
+     * replaces this body with `core.deleteAccount(accountId.toULong())` after
+     * UniFFI binding regeneration.
+     */
+    override fun deleteAccount(accountId: Long) {
+        throw UnsupportedOperationException("TODO 0.1.5-ffi")
+    }
+
+    /**
+     * TODO 0.1.5-ffi: display-name renames are wired to the UI but the native
+     * call is not available in the current generated bindings. The coordinator
+     * replaces this body with `core.updateAccountDisplayName(accountId, ...)`
+     * after UniFFI binding regeneration.
+     */
+    override fun renameAccount(accountId: Long, displayName: String) {
+        throw UnsupportedOperationException("TODO 0.1.5-ffi")
+    }
+
+    /**
+     * TODO 0.1.5-ffi: conversation deletion is wired to the UI but the native
+     * call is not available in the current generated bindings. The coordinator
+     * replaces this body with `core.deleteConversation(conversationId.toULong())`
+     * after UniFFI binding regeneration.
+     */
+    override fun deleteConversation(conversationId: Long) {
+        throw UnsupportedOperationException("TODO 0.1.5-ffi")
     }
 
     override fun addContact(jid: String, displayName: String) {
@@ -453,6 +508,7 @@ class NativeMindChatGateway(
 
     private fun snapshotToUiState(snapshot: FfiCoreSnapshot = core.snapshot()): MindChatUiState {
         val now = System.currentTimeMillis()
+        val profiles = preferences.readProfiles()
         val accounts = snapshot.accounts.map { account ->
             val accountId = account.id.toLong()
             val connectionState = account.connectionState.toUiModel()
@@ -546,6 +602,7 @@ class NativeMindChatGateway(
             activeAccountId = activeAccountId,
             conversations = conversations,
             messagesByConversation = messagesByConversation,
+            profiles = profiles,
             dynamicColor = customization.dynamicColor,
             comfortableLayout = customization.comfortableLayout,
             appLockEnabled = customization.appLockEnabled,
@@ -579,7 +636,9 @@ class PreviewMindChatGateway(
 ) : MindChatGateway {
     private var customization = preferences.readCustomization()
 
-    override var state by mutableStateOf(seedState().withCustomization(customization))
+    override var state by mutableStateOf(
+        seedState().withCustomization(customization).copy(profiles = preferences.readProfiles()),
+    )
         private set
 
     override fun selectAccount(accountId: Long) {
@@ -637,6 +696,59 @@ class PreviewMindChatGateway(
                     it
                 }
             },
+        )
+    }
+
+    override fun markConversationRead(conversationId: Long) {
+        state = state.copy(
+            conversations = state.conversations.map {
+                if (it.id == conversationId) it.copy(unreadCount = 0) else it
+            },
+        )
+    }
+
+    override fun updateProfile(accountId: Long, profile: AccountProfile) {
+        preferences.writeProfile(accountId, profile)
+        state = state.copy(profiles = state.profiles + (accountId to profile))
+    }
+
+    /** Preview-only implementation; the native gateway throws until FFI wiring lands. */
+    override fun deleteAccount(accountId: Long) {
+        val remainingAccounts = state.accounts.filterNot { it.id == accountId }
+        val remainingConversationIds = state.conversations
+            .filterNot { it.accountId == accountId }
+            .map(ConversationUi::id)
+            .toSet()
+        state = state.copy(
+            accounts = remainingAccounts,
+            activeAccountId = if (state.activeAccountId == accountId) {
+                remainingAccounts.firstOrNull()?.id ?: 0L
+            } else {
+                state.activeAccountId
+            },
+            conversations = state.conversations.filterNot { it.accountId == accountId },
+            contacts = state.contacts.filterNot { it.accountId == accountId },
+            messagesByConversation = state.messagesByConversation.filterKeys { it in remainingConversationIds },
+            profiles = state.profiles - accountId,
+        )
+    }
+
+    /** Preview-only implementation; the native gateway throws until FFI wiring lands. */
+    override fun renameAccount(accountId: Long, displayName: String) {
+        val trimmed = displayName.trim()
+        if (trimmed.isEmpty()) return
+        state = state.copy(
+            accounts = state.accounts.map {
+                if (it.id == accountId) it.copy(displayName = trimmed) else it
+            },
+        )
+    }
+
+    /** Preview-only implementation; the native gateway throws until FFI wiring lands. */
+    override fun deleteConversation(conversationId: Long) {
+        state = state.copy(
+            conversations = state.conversations.filterNot { it.id == conversationId },
+            messagesByConversation = state.messagesByConversation - conversationId,
         )
     }
 
