@@ -257,6 +257,15 @@ no-default-features 41, clippy `-D warnings`, fmt; Android
 `compileDebugAndroidTestKotlin` all pass with the regenerated UniFFI
 bindings (`app/build/generated/source/uniffi/`).
 
+The management surface is additionally pinned through its public
+`MindChatGateway` contract in `GatewayManagementContractTest` (11 tests):
+registration validation and CONNECTING creation, account deletion cascading
+to conversations/contacts/messages and the stored per-account profile (new
+`MindChatPreferences.removeProfile`), rename trimming, conversation
+deletion, and profile persistence. This also fixed two contract
+inconsistencies between the preview and native gateways (blank-JID
+registration rejection, stale profile left behind by account deletion).
+
 Caveats: the local APK embeds the previously built native `.so` (no NDK on
 this host), so the new Rust methods are compiled into the Kotlin bindings
 but not yet into the embedded library; CI performs the full native assembly.

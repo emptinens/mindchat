@@ -35,6 +35,9 @@ interface MindChatPreferences {
 
     /** Stores one per-account profile. */
     fun writeProfile(accountId: Long, profile: AccountProfile)
+
+    /** Removes one per-account profile; a no-op when the account had none. */
+    fun removeProfile(accountId: Long)
 }
 
 /** Android-backed storage for non-secret UI preferences only. */
@@ -83,6 +86,17 @@ class SharedPreferencesMindChatPreferences(context: Context) : MindChatPreferenc
         }
     }
 
+    override fun removeProfile(accountId: Long) {
+        preferences.edit {
+            val ids = (preferences.getStringSet(KEY_PROFILE_ACCOUNT_IDS, emptySet()).orEmpty()).toMutableSet()
+            ids.remove(accountId.toString())
+            putStringSet(KEY_PROFILE_ACCOUNT_IDS, ids)
+            remove(profileKey(accountId, KEY_AVATAR))
+            remove(profileKey(accountId, KEY_STATUS))
+            remove(profileKey(accountId, KEY_ACCENT))
+        }
+    }
+
     private fun android.content.SharedPreferences.Editor.writeOrRemove(key: String, value: String?) {
         if (value == null) remove(key) else putString(key, value)
     }
@@ -122,5 +136,9 @@ class InMemoryMindChatPreferences(
         } else {
             profiles[accountId] = profile
         }
+    }
+
+    override fun removeProfile(accountId: Long) {
+        profiles.remove(accountId)
     }
 }
