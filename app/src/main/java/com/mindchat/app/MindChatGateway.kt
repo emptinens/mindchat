@@ -252,16 +252,16 @@ class NativeMindChatGateway(
         displayName: String,
         password: String,
     ): String? {
-        if (password.isEmpty()) return "password required"
-        val normalizedJid = jid.trim()
-        val username = normalizedJid.substringBefore('@').ifBlank { return "invalid JID" }
-        val normalizedServer = server.trim()
+        val input = when (val validation = validateRegistration(jid, server, displayName, password)) {
+            is RegistrationValidation.Refused -> return validation.refusal.toUiDetail()
+            is RegistrationValidation.Valid -> validation.input
+        }
         return try {
             val accountId = core.registerAccount(
-                username,
-                normalizedServer,
-                displayName.trim().ifBlank { username },
-                password,
+                input.username,
+                input.server,
+                input.displayName,
+                input.password,
             ).toLong()
             activeAccountId = accountId
             markDirty()
@@ -321,10 +321,7 @@ class NativeMindChatGateway(
             profilesCache = preferences.readProfiles()
             markDirty()
             refresh()
-            if (activeAccountId == accountId) {
-                val remaining = state.accounts.filter { it.id != accountId }
-                activeAccountId = remaining.firstOrNull()?.id ?: 0L
-            }
+            activeAccountId = nextActiveAccountId(state.accounts, accountId, activeAccountId)
             // The next poll/persist cycle persists the removal (persistNow is
             // suspend; account deletion stays synchronous for the UI).
         } catch (e: MindChatBindingException) {
@@ -792,14 +789,15 @@ class PreviewMindChatGateway(
         displayName: String,
         password: String,
     ): String? {
-        if (password.isEmpty()) return "password required"
-        val normalizedJid = jid.trim()
-        if (normalizedJid.substringBefore('@').isBlank()) return "invalid JID"
+        val input = when (val validation = validateRegistration(jid, server, displayName, password)) {
+            is RegistrationValidation.Refused -> return validation.refusal.toUiDetail()
+            is RegistrationValidation.Valid -> validation.input
+        }
         val nextId = (state.accounts.maxOfOrNull { it.id } ?: 0) + 1
         val account = AccountUi(
             id = nextId,
-            jid = normalizedJid,
-            displayName = displayName.trim().ifBlank { normalizedJid.substringBefore('@') },
+            jid = input.fullJid,
+            displayName = input.displayName,
             presence = Presence.OFFLINE,
             connectionState = AccountConnectionState.CONNECTING,
             supportsGroupChats = true,
@@ -863,11 +861,7 @@ class PreviewMindChatGateway(
         preferences.removeProfile(accountId)
         state = state.copy(
             accounts = remainingAccounts,
-            activeAccountId = if (state.activeAccountId == accountId) {
-                remainingAccounts.firstOrNull()?.id ?: 0L
-            } else {
-                state.activeAccountId
-            },
+            activeAccountId = nextActiveAccountId(state.accounts, accountId, state.activeAccountId),
             conversations = state.conversations.filterNot { it.accountId == accountId },
             contacts = state.contacts.filterNot { it.accountId == accountId },
             messagesByConversation = state.messagesByConversation.filterKeys { it in remainingConversationIds },

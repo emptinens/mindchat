@@ -266,6 +266,12 @@ deletion, and profile persistence. This also fixed two contract
 inconsistencies between the preview and native gateways (blank-JID
 registration rejection, stale profile left behind by account deletion).
 
+The shared decision rules now live in one place (`GatewayInput.kt`:
+`validateRegistration`, `nextActiveAccountId`), so both gateway
+implementations are structurally identical instead of merely similar;
+`GatewayInputTest` (9 tests) pins the rules, including the exact UI-safe
+refusal strings.
+
 The Kotlin↔Rust integration boundary is re-validated against the current
 Rust source: `scripts/generate-uniffi-kotlin.sh` rebuilt the release cdylib
 and regenerated the Kotlin bindings with uniffi-bindgen 0.32.0 (task
