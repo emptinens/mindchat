@@ -214,6 +214,55 @@ defects. Merged commits: `f3f8474` (transport), `465ec81` (core/FFI),
 8. **CI additions:** `:app:testDebugUnitTest` and `cargo test
    --no-default-features` now run in `verify.yml`.
 
+## 0.1.5 in progress (registration, management, profiles; 2026-08-14)
+
+Three parallel agents delivered the first 0.1.5 slice; merged commits
+`0cf29fb` (UI: management/profiles), `4a64ada` (M3 Expressive theme),
+`6709f4e` (Rust: registration + management primitives).
+
+1. **XEP-0077 in-band registration** (`crates/mindchat-core/src/xmpp.rs`):
+   a bounded one-shot registration session reusing the DNS/TLS machinery,
+   gated on the server advertising `jabber:iq:register`; no captcha or xdata
+   form support by design (a server that requires extra fields gets a UI-safe
+   refusal). Live run against jabber.ru (`MINDCHAT_LIVE_REGISTER=1`)
+   completed in ~1.2 s with the terminal detail "server requires additional
+   registration fields"; legacy username/password submission is unit-tested
+   (construct/parse round trip).
+2. **New FFI methods on `MindChatCoreHandle`**: `register_account`
+   (creates the account and connects it; empty inputs rejected),
+   `delete_account`, `update_account_display_name`, `delete_conversation`;
+   deletion removes conversations/messages/reactions from the snapshot and
+   emits the existing change events. `ffi.rs` documents the full method list.
+3. **Account management UI (Telegram-style)**: M3 Expressive modal drawer
+   opened by a top-bar avatar chip; per-account rows with connection state,
+   one-tap switching, overflow (Edit profile, Reconnect, Disconnect, Rename,
+   Delete with confirmation), "Add account" reuses the existing dialog.
+4. **Profiles**: per-account avatar (local image picker, copied into app
+   storage), status message, display name, and a fixed M3 Expressive accent
+   set plumbed through `MindChatTheme(accentSeed)`; prefs keyed by account id
+   in `MindChatPreferences`.
+5. **Chat/group management**: conversation overflow (Mark read, Open as
+   group, Delete with confirmation), group-chat Leave/Delete; pinning and
+   archiving are documented as a domain gap (no core support yet).
+6. **M3 Expressive theme pass**: `theme/` split into Color/Shape/Type/Theme;
+   static light/dark schemes generated from the brand seed with the full
+   tonal surface role set (WCAG AA-verified on* pairs), expressive type
+   scale, expressive shape scale, dark launch theme in `values-night`.
+7. **Strings**: EN/RU parity maintained (98/98 after registration strings).
+
+Verification on the merged tree: Rust all-features 76 lib unit + 7
+integration tests (2 live FFI + 4 live transport + 1 live registration),
+no-default-features 41, clippy `-D warnings`, fmt; Android
+`compileDebugKotlin`, `testDebugUnitTest` (9), `lintDebug`,
+`compileDebugAndroidTestKotlin` all pass with the regenerated UniFFI
+bindings (`app/build/generated/source/uniffi/`).
+
+Caveats: the local APK embeds the previously built native `.so` (no NDK on
+this host), so the new Rust methods are compiled into the Kotlin bindings
+but not yet into the embedded library; CI performs the full native assembly.
+Registration UI on `LoginScreen` (sign-in/register toggle) is wired to
+`gateway.registerAccount`.
+
 ## Verification already completed for 0.1.4
 
 All listed Rust checks were run successfully against the current source using
@@ -271,17 +320,23 @@ surface is unchanged). The NDK is not installed on this host, so the Rust
 reused; CI performs the full native assembly. The APK and generated sources
 remain ignored build output.
 
-### Fresh 0.1.4 APK
+### Current debug APK
 
-The current generated artifact is a fresh debug build from the 2026-08-14 fix
-tree (source HEAD committed with this status update):
+Current generated artifact (2026-08-14, 0.1.5 tree; note the embedded native
+library is still the 0.1.4 `.so` because this host has no NDK):
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
 versionCode: 5
 versionName: 0.1.4
+SHA-256: 62f6c0a7a8e6cc7c0ef3a808405ce381e27d48da686e95a0aa3800e2406379c6
+size: 42,844,136 bytes
+```
+
+The 0.1.4 release artifact (source `d79f0d5`) was:
+
+```text
 SHA-256: f939cf7df4e3477d6b90a2ef0fa9cab6a6d2cb26e80d5b46a4aff5265f7d1336
-size: 42,318,770 bytes
 ```
 
 `aapt dump badging` confirms application ID `com.mindchat.app`, compile SDK 36,

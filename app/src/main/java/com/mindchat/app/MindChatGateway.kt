@@ -122,6 +122,13 @@ interface MindChatGateway {
 
     fun selectAccount(accountId: Long)
     fun addAccount(jid: String, server: String, displayName: String, password: String): Boolean
+    /**
+     * XEP-0077 in-band registration (no captcha support). [jid] is the full
+     * desired JID; the local part is used as the username. Returns a UI-safe
+     * error detail on failure (for example "server requires additional
+     * registration fields"), or null on success (account created and Online).
+     */
+    fun registerAccount(jid: String, server: String, displayName: String, password: String): String?
     fun reconnectAccount(accountId: Long, password: String): Boolean
     fun disconnectAccount(accountId: Long)
     fun addContact(jid: String, displayName: String)
@@ -229,6 +236,33 @@ class NativeMindChatGateway(
         }
     }
 
+    override fun registerAccount(
+        jid: String,
+        server: String,
+        displayName: String,
+        password: String,
+    ): String? {
+        if (password.isEmpty()) return "password required"
+        val normalizedJid = jid.trim()
+        val username = normalizedJid.substringBefore('@').ifBlank { return "invalid JID" }
+        val normalizedServer = server.trim()
+        return try {
+            val accountId = core.registerAccount(
+                username,
+                normalizedServer,
+                displayName.trim().ifBlank { username },
+                password,
+            ).toLong()
+            activeAccountId = accountId
+            markDirty()
+            refresh()
+            null
+        } catch (e: MindChatBindingException) {
+            refresh()
+            e.message?.takeIf { it.isNotBlank() } ?: "registration failed"
+        }
+    }
+
     override fun reconnectAccount(accountId: Long, password: String): Boolean {
         if (password.isEmpty()) return false
         return try {
@@ -269,34 +303,43 @@ class NativeMindChatGateway(
         refresh()
     }
 
-    /**
-     * TODO 0.1.5-ffi: account deletion is wired to the UI but the native call
-     * is not available in the current generated bindings. The coordinator
-     * replaces this body with `core.deleteAccount(accountId.toULong())` after
-     * UniFFI binding regeneration.
-     */
     override fun deleteAccount(accountId: Long) {
-        throw UnsupportedOperationException("TODO 0.1.5-ffi")
+        try {
+            core.deleteAccount(accountId.toULong())
+            markDirty()
+            refresh()
+            if (activeAccountId == accountId) {
+                val remaining = state.accounts.filter { it.id != accountId }
+                activeAccountId = remaining.firstOrNull()?.id ?: 0L
+            }
+            // The next poll/persist cycle persists the removal (persistNow is
+            // suspend; account deletion stays synchronous for the UI).
+        } catch (e: MindChatBindingException) {
+            refresh()
+            throw e
+        }
     }
 
-    /**
-     * TODO 0.1.5-ffi: display-name renames are wired to the UI but the native
-     * call is not available in the current generated bindings. The coordinator
-     * replaces this body with `core.updateAccountDisplayName(accountId, ...)`
-     * after UniFFI binding regeneration.
-     */
     override fun renameAccount(accountId: Long, displayName: String) {
-        throw UnsupportedOperationException("TODO 0.1.5-ffi")
+        val name = displayName.trim()
+        if (name.isEmpty()) return
+        try {
+            core.updateAccountDisplayName(accountId.toULong(), name)
+            markDirty()
+            refresh()
+        } catch (_: MindChatBindingException) {
+            refresh()
+        }
     }
 
-    /**
-     * TODO 0.1.5-ffi: conversation deletion is wired to the UI but the native
-     * call is not available in the current generated bindings. The coordinator
-     * replaces this body with `core.deleteConversation(conversationId.toULong())`
-     * after UniFFI binding regeneration.
-     */
     override fun deleteConversation(conversationId: Long) {
-        throw UnsupportedOperationException("TODO 0.1.5-ffi")
+        try {
+            core.deleteConversation(conversationId.toULong())
+            markDirty()
+            refresh()
+        } catch (_: MindChatBindingException) {
+            refresh()
+        }
     }
 
     override fun addContact(jid: String, displayName: String) {
@@ -668,6 +711,29 @@ class PreviewMindChatGateway(
             activeAccountId = nextId,
         )
         return true
+    }
+
+    override fun registerAccount(
+        jid: String,
+        server: String,
+        displayName: String,
+        password: String,
+    ): String? {
+        if (password.isEmpty()) return "password required"
+        val nextId = (state.accounts.maxOfOrNull { it.id } ?: 0) + 1
+        val account = AccountUi(
+            id = nextId,
+            jid = jid.trim(),
+            displayName = displayName.trim().ifBlank { jid.substringBefore('@') },
+            presence = Presence.OFFLINE,
+            connectionState = AccountConnectionState.CONNECTING,
+            supportsGroupChats = true,
+        )
+        state = state.copy(
+            accounts = state.accounts + account,
+            activeAccountId = nextId,
+        )
+        return null
     }
 
     override fun reconnectAccount(accountId: Long, password: String): Boolean {

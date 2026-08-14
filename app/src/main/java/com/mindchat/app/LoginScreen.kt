@@ -26,6 +26,9 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -50,13 +53,17 @@ import androidx.compose.ui.unit.dp
 
 /**
  * Full-screen Material 3 Expressive login shown whenever the account list is
- * empty. Submitting a valid form calls [onConnect]; on success the accounts
+ * empty. Submitting a valid form calls [onConnect] (sign in) or [onRegister]
+ * (XEP-0077 in-band registration, no captcha support); [onRegister] returns a
+ * UI-safe error detail on failure or null on success. On success the accounts
  * list becomes non-empty and this screen is replaced by the main shell.
  */
 @Composable
 fun LoginScreen(
     onConnect: (jid: String, server: String, displayName: String, password: String) -> Boolean,
+    onRegister: (jid: String, server: String, displayName: String, password: String) -> String?,
 ) {
+    var registerMode by rememberSaveable { mutableStateOf(false) }
     var jid by rememberSaveable { mutableStateOf("") }
     var server by rememberSaveable { mutableStateOf("") }
     var serverTouched by rememberSaveable { mutableStateOf(false) }
@@ -65,7 +72,8 @@ fun LoginScreen(
     var password by remember { mutableStateOf("") }
     var passwordVisible by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
-    var connectError by remember { mutableStateOf(false) }
+    var connectErrorMessage by remember { mutableStateOf<String?>(null) }
+    var connectFailed by remember { mutableStateOf(false) }
 
     val jidInvalid = !jid.contains('@')
     val serverEmpty = server.isBlank()
@@ -77,11 +85,20 @@ fun LoginScreen(
 
     fun submit() {
         connecting = true
-        connectError = false
-        val success = onConnect(jid.trim(), server.trim(), displayName.trim(), password)
-        connecting = false
-        if (!success) {
-            connectError = true
+        connectErrorMessage = null
+        connectFailed = false
+        if (registerMode) {
+            val error = onRegister(jid.trim(), server.trim(), displayName.trim(), password)
+            connecting = false
+            if (error != null) {
+                connectErrorMessage = error
+            }
+        } else {
+            val success = onConnect(jid.trim(), server.trim(), displayName.trim(), password)
+            connecting = false
+            if (!success) {
+                connectFailed = true
+            }
         }
     }
 
@@ -137,11 +154,37 @@ fun LoginScreen(
                     textAlign = TextAlign.Center,
                 )
                 Spacer(Modifier.height(24.dp))
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    SegmentedButton(
+                        selected = !registerMode,
+                        onClick = {
+                            registerMode = false
+                            connectErrorMessage = null
+                        connectFailed = false
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                    ) {
+                        Text(stringResource(R.string.login_sign_in))
+                    }
+                    SegmentedButton(
+                        selected = registerMode,
+                        onClick = {
+                            registerMode = true
+                            connectErrorMessage = null
+                        connectFailed = false
+                        },
+                        shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                    ) {
+                        Text(stringResource(R.string.login_register))
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
                 OutlinedTextField(
                     value = jid,
                     onValueChange = { newJid ->
                         jid = newJid
-                        connectError = false
+                        connectErrorMessage = null
+                        connectFailed = false
                         val at = newJid.indexOf('@')
                         if (at >= 0 && !serverTouched) {
                             server = newJid.substring(at + 1)
@@ -171,7 +214,8 @@ fun LoginScreen(
                         onValueChange = { newServer ->
                             server = newServer
                             serverTouched = true
-                            connectError = false
+                            connectErrorMessage = null
+                        connectFailed = false
                         },
                         modifier = Modifier
                             .fillMaxWidth()
@@ -191,7 +235,8 @@ fun LoginScreen(
                     value = displayName,
                     onValueChange = {
                         displayName = it
-                        connectError = false
+                        connectErrorMessage = null
+                        connectFailed = false
                     },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text(stringResource(R.string.display_name_optional)) },
@@ -202,12 +247,13 @@ fun LoginScreen(
                     value = password,
                     onValueChange = {
                         password = it
-                        connectError = false
+                        connectErrorMessage = null
+                        connectFailed = false
                     },
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text(stringResource(R.string.password)) },
                     singleLine = true,
-                    isError = passwordEmpty || connectError,
+                    isError = passwordEmpty || connectErrorMessage != null,
                     supportingText = if (passwordEmpty) {
                         { Text(stringResource(R.string.login_password_required)) }
                     } else {
@@ -246,10 +292,10 @@ fun LoginScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                } else if (connectError) {
+                } else if (connectErrorMessage != null || connectFailed) {
                     Spacer(Modifier.height(16.dp))
                     Text(
-                        text = stringResource(R.string.account_connection_error),
+                        text = connectErrorMessage ?: stringResource(R.string.account_connection_error),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                         textAlign = TextAlign.Center,
@@ -268,7 +314,9 @@ fun LoginScreen(
                     enabled = formValid && !connecting,
                 ) {
                     Text(
-                        text = stringResource(R.string.login_connect),
+                        text = stringResource(
+                            if (registerMode) R.string.login_register_action else R.string.login_connect,
+                        ),
                         style = MaterialTheme.typography.titleMedium,
                     )
                 }

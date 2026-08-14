@@ -54,6 +54,9 @@
     <string name="coming_soon">Connection, roster synchronization, and encrypted storage are the next core milestones.</string>
     <!-- Login / account connection -->
     <string name="login_subtitle">Sign in with your XMPP account to start chatting.</string>
+    <string name="login_sign_in">Sign in</string>
+    <string name="login_register">Register</string>
+    <string name="login_register_action">Create account</string>
     <string name="login_connect">Connect</string>
     <string name="login_connecting">Connecting…</string>
     <string name="login_jid_invalid">Enter a full JID, for example user@example.com</string>

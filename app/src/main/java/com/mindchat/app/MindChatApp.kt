@@ -161,6 +161,7 @@ private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
                 // this composable is replaced by the main shell automatically.
                 LoginScreen(
                     onConnect = gateway::addAccount,
+                    onRegister = gateway::registerAccount,
                 )
             } else {
                 MindChatShell(

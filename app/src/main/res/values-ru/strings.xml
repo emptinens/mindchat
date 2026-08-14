@@ -54,6 +54,9 @@
     <string name="coming_soon">Подключение, синхронизация списка контактов и зашифрованное хранилище — следующие этапы ядра.</string>
     <!-- Вход в аккаунт / подключение -->
     <string name="login_subtitle">Войдите с помощью XMPP-аккаунта, чтобы начать общение.</string>
+    <string name="login_sign_in">Войти</string>
+    <string name="login_register">Регистрация</string>
+    <string name="login_register_action">Создать аккаунт</string>
     <string name="login_connect">Подключиться</string>
     <string name="login_connecting">Подключение…</string>
     <string name="login_jid_invalid">Укажите полный JID, например user@example.com</string>
