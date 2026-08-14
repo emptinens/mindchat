@@ -239,7 +239,13 @@ git diff --check
 
 Recorded results (re-run 2026-08-14 on the merged fix tree):
 
-- all-features: 63 unit tests plus 4 feature-gated live transport tests passed;
+- all-features: 63 unit tests plus 6 feature-gated live tests passed (4
+  `live_login` transport tests and 2 new `live_ffi` tests that drive the exact
+  `MindChatCoreHandle` boundary the Android app uses);
+- live observations against jabber.ru (real network): bogus credentials reach
+  terminal `Failed` with `NotAuthorized` in ~0.6 s (retry: ~0.45 s), never
+  stuck on `Connecting`; `disconnect_account` during an in-flight connect to a
+  non-routable host completes in ~0.6 ms and projects the account `Offline`;
 - no-default-features: 37 tests passed;
 - clippy, rustfmt, and `git diff --check` passed.
 
@@ -365,9 +371,16 @@ The following are real gaps, not regressions to paper over:
    flush batch is capped (32), but `flush_outbox` still holds the core lock
    while a send waits; at-least-once delivery without wire-level dedup remains
    (a timed-out send can later complete and be re-sent on reconnect).
-6. **Extensions:** no actual plugin runtime/package sandbox/catalog/consent or
+6. **Vendored regression test not in workspace CI:** the vendored
+   `tokio-xmpp` unit test for `Suspended` → terminal `Disconnected`
+   (`vendor/tokio-xmpp/src/client/worker.rs`) cannot run through the workspace
+   (the vendor crate is a patched dependency, not a member, and its standalone
+   offline resolution needs `ktls` metadata absent from the local registry
+   cache). The behavior is covered by source review, the workspace
+   terminal-event unit tests, and the live FFI tests.
+7. **Extensions:** no actual plugin runtime/package sandbox/catalog/consent or
    signing/revocation flow; only a policy seam exists.
-7. **Test coverage:** Android instrumented coverage is limited; add device or
+8. **Test coverage:** Android instrumented coverage is limited; add device or
    emulator persistence and lifecycle tests when Android builds are available.
 
 `PLAN.md` remains the aspirational implementation contract. Do not mass-rewrite

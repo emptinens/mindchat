@@ -105,3 +105,102 @@ layout density and navigation are retained.
   MUC, MAM, SM reconnection, upload, OMEMO, and push fallback.
 - Release verification builds all ABI variants, rejects Google-only runtime
   dependencies, and checks a reproducible F-Droid-compatible APK path.
+
+## Roadmap: 0.1.5 and 0.1.6 (decided 2026-08-14)
+
+The 0.1.4 cycle fixed the always-Connecting defect, hardened the transport and
+gateway, and reworked the login flow (Material 3 Expressive only). The next two
+releases are scoped below. Each item names its layers (Rust core/FFI, Kotlin UI)
+and its acceptance criterion. Requirements marked "(confirm)" still have open
+questions that must be answered by the maintainer before implementation.
+
+### 0.1.5 — Accounts, registration, management, profiles
+
+1. **Account registration (XEP-0077 in-band registration).**
+   - Rust core/transport: XEP-0077 `register` IQ flow (query fields, submit
+     username/password, map server errors to UI-safe details), gated behind a
+     capability/feature check (disco#info / XEP-0115 caps): registration is
+     offered only when the server advertises `jabber:iq:register`; no captcha
+     or form-extension support (decided 2026-08-14). Registration creates a
+     local account and starts the session without a separate login step.
+   - Kotlin UI: "Register" entry on `LoginScreen` (switch between sign-in and
+     registration), inline validation, progress, inline error + retry, EN/RU
+     parity; a "register on server website" fallback link when the server
+     does not advertise in-band registration.
+   - Acceptance: registering a fresh JID on a server with IB enabled produces
+     a connected account in the snapshot; duplicate/denied responses surface
+     a precise error and leave no half-created account.
+2. **Management: Telegram-style, no separate bulky screen (decided 2026-08-14).**
+   - Accounts: left drawer (M3 Expressive modal drawer) reachable from the
+     avatar chip in the top bar; drawer lists profiles with connection state,
+     one-tap switching, and per-account actions (connect/disconnect/edit/
+     delete); destructive actions require confirmation.
+   - Chats: management via long-press/overflow menus in the chat list (pin,
+     archive, delete, clear unread); groups via chat-detail menu (leave,
+     rename display, delete local record) and list actions (create/join).
+   - Kotlin UI: M3 Expressive drawer, menus, empty states, EN/RU parity.
+   - Acceptance: every management action round-trips through the gateway into
+     the snapshot and persists across restart where the domain supports it.
+3. **Profile customization and convenient profile switching.**
+   - A profile = account + local appearance (avatar, display name, status
+     message) + per-profile theme/accent. The client is maximally
+     customization-oriented (decided 2026-08-14). Customization UI: avatar
+     picker (local images), display name, status text, per-profile
+     accent/theme toggle.
+   - Switching: Telegram-style (decided 2026-08-14): avatar chip in the top
+     bar opens the account drawer; tapping a profile switches instantly.
+     Switching keeps the background connection state of each profile, does
+     not leak passwords, and restores the per-profile UI.
+   - Acceptance: switching profiles swaps identity, avatar, and theme without
+     re-entering passwords; the switch survives process restart.
+4. **Convenience pass across existing screens.**
+   - Action overflow menus, back-stack consistency, loading/empty/error
+     states everywhere, keyboard handling in forms, better list item
+     semantics, and screen-reader labels; audit and fix any legacy Material
+     leftovers (confirm list if any are found during the audit).
+
+### 0.1.6 — Navigation, settings, M3E optimization
+
+5. **Floating dock in Material 3 Expressive style.**
+   - Replace the `NavigationBar` footer with a floating dock (raised pill-style
+     bar with M3E tonal/container treatment, safe-area aware). Dock tabs:
+     Chats, Contacts (accounts + groups live in the drawer/contact list),
+     Settings (tab set decided by the maintainer on 2026-08-14; adjustable).
+     The dock adapts to each screen's content insets.
+   - Acceptance: the dock floats above content with correct insets, has M3E
+     focus/hover/selected states, and all three sections are reachable with
+     back-stack integrity.
+6. **Detailed settings screen with subgroups and categories.**
+   - A dedicated Settings tab with categorized sections (Appearance, Accounts,
+     Privacy, Notifications, Storage, About/Licenses), expandable subgroups,
+     switches/radio rows, and reset-to-default where sensible. Persist via
+     existing preferences and dynamic color where available.
+   - Acceptance: every setting persists across restart and immediately
+     affects the UI (theme, density, privacy toggles, notification
+     preferences).
+7. **Profile customization, extended.**
+   - Per-profile color/theme accent, optional per-profile density, profile
+     import/export of appearance-only settings (no credentials, no secrets).
+   - Acceptance: appearance-only export/import restores theme/avatar/name on a
+     fresh install without touching credentials.
+8. **Optimization and deeper M3 Expressive polish (everywhere, decided 2026-08-14).**
+   - Performance everywhere: snapshot diffing to avoid full-list
+     recomposition, lazy lists for conversations/contacts, debounced outbox
+     flush, reduced allocations in hot poll path (Rust), scroll performance,
+     startup speed, memory, and battery (polling frequency).
+   - M3E polish: expressive shape scale, tonal surfaces, animated
+     selection/transitions, motion specs, updated iconography within the
+     icons-core dependency only (no material-icons-extended).
+   - Acceptance: the conversation list renders without jank on a mid-range
+     device; profiling shows no full-snapshot recomposition on message
+     arrival; EN/RU strings stay in parity.
+
+### Version boundaries
+
+- Nothing in 0.1.6 depends on 0.1.5 features; the split is purely delivery
+  sequencing. The maintainer confirmed the feature-to-version mapping after
+  the questions below were answered.
+- Every release keeps: Rust checks (clippy `-D warnings`, fmt, all-features
+  and no-default-features tests, live tests), Android build (compile, unit
+  tests, lint, assemble), EN/RU string parity, and the M3-Expressive-only
+  dependency rule.

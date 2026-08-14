@@ -42,3 +42,7 @@ required-features = ["live-login-tests"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "live_ffi"
+required-features = ["live-login-tests", "uniffi"]
