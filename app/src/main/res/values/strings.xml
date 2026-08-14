@@ -47,11 +47,8 @@
     <string name="unlock">Unlock</string>
     <string name="app_lock_prompt_title">Unlock MindChat</string>
     <string name="app_lock_prompt_subtitle">Use biometrics or your device screen lock to continue.</string>
-    <string name="diagnostics">Diagnostics</string>
-    <string name="diagnostics_summary">Export only when you choose to share it</string>
     <string name="about">About MindChat</string>
     <string name="privacy_summary">No analytics or MindChat cloud account</string>
-    <string name="coming_soon">Connection, roster synchronization, and encrypted storage are the next core milestones.</string>
     <!-- Login / account connection -->
     <string name="login_subtitle">Sign in with your XMPP account to start chatting.</string>
     <string name="login_sign_in">Sign in</string>
@@ -99,4 +96,35 @@
     <string name="accent_sunset">Sunset</string>
     <string name="accent_berry">Berry</string>
     <string name="accent_crimson">Crimson</string>
+    <!-- 0.1.6 detailed settings and floating dock -->
+    <string name="not_implemented_yet">Not implemented yet</string>
+    <string name="coming_in_later_release">Coming in a later release</string>
+    <string name="manage_accounts">Manage accounts</string>
+    <string name="manage_accounts_summary">Switch, rename, or remove accounts on this device</string>
+    <string name="add_account_summary">Connect another XMPP account</string>
+    <string name="accent_per_account">Choose a color for the active account</string>
+    <string name="edit_profile_summary">Avatar, status, and accent for %1$s</string>
+    <string name="message_search">Message search</string>
+    <string name="message_search_summary">Search within your locally stored messages</string>
+    <string name="encryption">Encryption</string>
+    <string name="encryption_summary">End-to-end encryption for your conversations</string>
+    <string name="notifications">Notifications</string>
+    <string name="message_notifications">Message notifications</string>
+    <string name="group_notifications">Group chat notifications</string>
+    <string name="storage">Storage</string>
+    <string name="local_data_size">Local data</string>
+    <string name="local_data_size_summary">Avatars and saved state use %1$s</string>
+    <string name="storage_calculating">Calculating…</string>
+    <string name="clear_profile_images">Clear local profile images</string>
+    <string name="clear_profile_images_summary">Remove cached avatar images for all accounts</string>
+    <string name="clear_profile_images_confirm">Remove all locally stored profile images? This cannot be undone.</string>
+    <string name="clear">Clear</string>
+    <string name="version">Version</string>
+    <string name="licenses">Licenses</string>
+    <string name="licenses_summary">Open source licenses used by MindChat</string>
+    <string name="licenses_dialog_title">Open source licenses</string>
+    <string name="licenses_dialog_body">MindChat is distributed under the Apache License 2.0 and includes third-party open source components.</string>
+    <string name="repository">Source code</string>
+    <string name="repository_summary">github.com/emptinens/mindchat</string>
+    <string name="close">Close</string>
 </resources>
