@@ -46,3 +46,7 @@ workspace = true
 [[test]]
 name = "live_ffi"
 required-features = ["live-login-tests", "uniffi"]
+
+[[test]]
+name = "live_register"
+required-features = ["live-login-tests", "uniffi"]

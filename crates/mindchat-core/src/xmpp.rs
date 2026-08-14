@@ -6,9 +6,10 @@
 
 use crate::{
     AccountId, ConnectionRequest, ContactPresence, ConversationKind, OutgoingMessage,
-    ProtocolCapability, RosterSubscription, TransportError, TransportEvent, XmppTransport,
+    ProtocolCapability, RosterSubscription, SecretString, TransportError, TransportEvent,
+    XmppTransport,
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use hickory_resolver::{TokioResolver, config::LookupIpStrategy, proto::rr::RData};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -21,9 +22,13 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_xmpp::{
     Client, Event as TokioXmppEvent, Stanza,
-    connect::DnsConfig,
+    connect::{
+        AsyncReadAndWrite, DirectTlsServerConnector, DnsConfig, ServerConnector,
+        StartTlsServerConnector,
+    },
     parsers::{
         disco::{DiscoInfoQuery, DiscoInfoResult},
+        ibr::{FieldsQuery, FormQuery, LegacyQuery},
         iq::Iq,
         jid::{BareJid, Jid},
         message::{Id as XmppMessageId, Lang, Message, MessageType},
@@ -31,8 +36,9 @@ use tokio_xmpp::{
         presence::{Presence, Show, Type as PresenceType},
         receipts::{Received as ReceiptReceived, Request as ReceiptRequest},
         roster::{Ask, Item as RosterItem, Roster, Subscription},
+        stanza_error::{DefinedCondition, StanzaError},
     },
-    xmlstream::Timeouts,
+    xmlstream::{FallibleStreamElement, Timeouts, XmppStream, XmppStreamElement},
 };
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,6 +60,30 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard deadline for the whole connect phase (DNS plus all candidate
 /// handshakes). A terminal `Disconnected` is always emitted when it elapses.
 const CONNECT_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard deadline for one XEP-0077 in-band registration session (DNS, stream
+/// setup, fields query, and submission). Registration is a one-shot exchange,
+/// so a single timeout guarantees the FFI call returns a terminal result.
+const REGISTRATION_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound for reading one element during the registration exchange. A
+/// silent server must not stall the session past the phase deadline.
+const REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Backstop for the registration worker channel: slightly longer than the
+/// phase deadline so the worker's own timeout wins with a precise reason.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(35);
+
+/// One-shot XEP-0077 in-band registration request.
+///
+/// The password is wrapped in [`SecretString`] and consumed at the single
+/// hand-off point into the registration worker, mirroring the connect path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegisterRequest {
+    /// Requested account localpart, without the `@domain` suffix.
+    pub username: String,
+    /// XMPP server domain that offers in-band registration.
+    pub server: String,
+    /// Password to register; never persisted and never logged.
+    pub password: SecretString,
+}
 
 /// Tokio-backed XMPP client implementation used by the Android native core.
 ///
@@ -104,6 +134,58 @@ impl TokioXmppTransport {
         // loop. Dropping an unfinished JoinHandle detaches only that exiting
         // thread and, crucially, frees the account slot for an explicit retry.
         let _ = self.workers.remove(&account_id);
+    }
+
+    /// Runs a one-shot XEP-0077 in-band registration session.
+    ///
+    /// This is a synchronous, bounded call: the whole session (DNS, stream
+    /// setup, fields query, and submission) runs on a dedicated current-thread
+    /// Tokio runtime under [`REGISTRATION_PHASE_TIMEOUT`], so the caller always
+    /// gets a terminal result and never hangs. The password is consumed by the
+    /// registration worker and never retained by this transport.
+    ///
+    /// Registration is only attempted when the server advertises
+    /// `jabber:iq:register` in its stream features. Servers that require a
+    /// data form or captcha are refused with a UI-safe detail, because MindChat
+    /// deliberately implements only username/password registration.
+    pub fn register(&mut self, request: RegisterRequest) -> Result<(), TransportError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("mindchat-xmpp-register".to_owned())
+            .spawn(move || {
+                let runtime = RuntimeBuilder::new_current_thread().enable_all().build();
+                let result = match runtime {
+                    Ok(runtime) => {
+                        // A panic inside the registration worker would
+                        // otherwise kill the thread without any result,
+                        // leaving the caller blocked until the channel
+                        // backstop. Catch it and report a terminal failure.
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                runtime.block_on(run_registration_bounded(request))
+                            }));
+                        match outcome {
+                            Ok(result) => result,
+                            Err(_) => Err(TransportError::ConnectionFailed(
+                                "XMPP registration worker crashed".to_owned(),
+                            )),
+                        }
+                    }
+                    Err(error) => Err(TransportError::ConnectionFailed(error.to_string())),
+                };
+                let _ = sender.send(result);
+            })
+            .map_err(|error| TransportError::ConnectionFailed(error.to_string()))?;
+
+        match receiver.recv_timeout(REGISTRATION_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(TransportError::ConnectionFailed(
+                "registration did not finish within its time bound".to_owned(),
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TransportError::ConnectionFailed(
+                "XMPP registration worker stopped unexpectedly".to_owned(),
+            )),
+        }
     }
 }
 
@@ -490,6 +572,256 @@ async fn connect_attempt(
         }
     }
     Err(ConnectFailure { detail: last_error, recoverable: true })
+}
+
+/// Bounded wrapper around the full registration session so a stalled server
+/// can never hang the synchronous [`TokioXmppTransport::register`] call.
+async fn run_registration_bounded(request: RegisterRequest) -> Result<(), TransportError> {
+    match tokio::time::timeout(REGISTRATION_PHASE_TIMEOUT, run_registration(request)).await {
+        Ok(result) => result,
+        Err(_) => Err(TransportError::ConnectionFailed(format!(
+            "registration exceeded {} seconds",
+            REGISTRATION_PHASE_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Runs the XEP-0077 exchange against the first reachable endpoint.
+///
+/// Registration cannot reuse the [`Client`]-based `connect_attempt` path:
+/// tokio-xmpp's `Client` always performs SASL authentication and resource
+/// binding before exposing stanzas, while XEP-0077 must run on the unbound,
+/// pre-authentication stream. This session therefore reuses the same
+/// `resolve_endpoints` machinery and tokio-xmpp connectors directly.
+async fn run_registration(request: RegisterRequest) -> Result<(), TransportError> {
+    install_rustls_provider();
+    // The password leaves its SecretString wrapper here, the single hand-off
+    // point into the registration worker, mirroring WorkerConnection.
+    let RegisterRequest { username, server, password } = request;
+    let password = password.into_inner();
+    let jid = Jid::from_str(&format!("{username}@{server}")).map_err(|_| {
+        TransportError::ProtocolViolation(
+            "invalid username or server supplied for XMPP registration".to_owned(),
+        )
+    })?;
+    let attempts = resolve_endpoints(&server).await.map_err(TransportError::ConnectionFailed)?;
+    let mut last_connection_error = String::from("no connection candidates");
+    for (endpoint, direct_tls) in attempts {
+        match registration_attempt_for_endpoint(&username, &password, &jid, endpoint, direct_tls)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(RegistrationAttemptError::Protocol(detail)) => {
+                // The server decided (refused, requires a form, or the
+                // username is taken); retrying another candidate cannot help.
+                return Err(TransportError::ConnectionFailed(detail));
+            }
+            Err(RegistrationAttemptError::Connection(detail)) => {
+                last_connection_error = detail;
+            }
+        }
+    }
+    Err(TransportError::ConnectionFailed(last_connection_error))
+}
+
+/// A failure within one registration candidate attempt.
+enum RegistrationAttemptError {
+    /// Transport-level failure (DNS, TCP, TLS, stream setup). Another
+    /// candidate may still succeed.
+    Connection(String),
+    /// The server decided on the registration; further candidates cannot help.
+    Protocol(String),
+}
+
+async fn registration_attempt_for_endpoint(
+    username: &str,
+    password: &str,
+    jid: &Jid,
+    endpoint: SocketAddr,
+    direct_tls: bool,
+) -> Result<(), RegistrationAttemptError> {
+    if direct_tls {
+        registration_attempt(
+            username,
+            password,
+            jid,
+            DirectTlsServerConnector::from(DnsConfig::addr(&endpoint.to_string())),
+        )
+        .await
+    } else {
+        registration_attempt(
+            username,
+            password,
+            jid,
+            StartTlsServerConnector::from(DnsConfig::addr(&endpoint.to_string())),
+        )
+        .await
+    }
+}
+
+/// Performs one full XEP-0077 exchange over a freshly established stream.
+async fn registration_attempt<C: ServerConnector>(
+    username: &str,
+    password: &str,
+    jid: &Jid,
+    connector: C,
+) -> Result<(), RegistrationAttemptError> {
+    let (pending, _channel_binding) = connector
+        .connect(jid, ns::JABBER_CLIENT, Timeouts::default())
+        .await
+        .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
+    let (features, mut stream) = pending
+        .recv_features::<FallibleStreamElement>()
+        .await
+        .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
+    if let Some(detail) = registration_refusal(&features) {
+        return Err(RegistrationAttemptError::Protocol(detail));
+    }
+
+    let fields_id = format!("mindchat-register-get-{}", now_epoch_ms());
+    let fields_query: Stanza = Iq::from_get(fields_id.clone(), FieldsQuery).into();
+    stream
+        .send(&fields_query)
+        .await
+        .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
+
+    let fields_response = loop {
+        let element = read_registration_element(&mut stream).await?;
+        if let XmppStreamElement::Stanza(Stanza::Iq(iq)) = element
+            && iq.id() == fields_id
+        {
+            break iq;
+        }
+    };
+
+    // Parse the fields response. A data form (XEP-0077 form or captcha) is
+    // deliberately unsupported; only the legacy username/password flow is.
+    let submit = match fields_response {
+        Iq::Result { payload: Some(payload), .. } => {
+            if FormQuery::try_from(payload.clone()).is_ok() {
+                return Err(RegistrationAttemptError::Protocol(
+                    "server requires additional registration fields".to_owned(),
+                ));
+            }
+            let mut query = LegacyQuery::try_from(payload).map_err(|_| {
+                RegistrationAttemptError::Protocol(
+                    "unexpected response to registration fields query".to_owned(),
+                )
+            })?;
+            if query.registered {
+                return Err(RegistrationAttemptError::Protocol(
+                    "this username is already registered".to_owned(),
+                ));
+            }
+            query.username = Some(username.to_owned());
+            query.password = Some(password.to_owned());
+            query
+        }
+        Iq::Error { error, .. } => {
+            return Err(RegistrationAttemptError::Protocol(registration_error_detail(&error)));
+        }
+        _ => {
+            return Err(RegistrationAttemptError::Protocol(
+                "unexpected response to registration fields query".to_owned(),
+            ));
+        }
+    };
+
+    let submit_id = format!("mindchat-register-set-{}", now_epoch_ms());
+    let submit_query: Stanza = Iq::from_set(submit_id.clone(), submit).into();
+    stream
+        .send(&submit_query)
+        .await
+        .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
+
+    let submit_response = loop {
+        let element = read_registration_element(&mut stream).await?;
+        if let XmppStreamElement::Stanza(Stanza::Iq(iq)) = element
+            && iq.id() == submit_id
+        {
+            break iq;
+        }
+    };
+    let result = match submit_response {
+        Iq::Result { .. } => Ok(()),
+        Iq::Error { error, .. } => {
+            Err(RegistrationAttemptError::Protocol(registration_error_detail(&error)))
+        }
+        _ => Err(RegistrationAttemptError::Protocol(
+            "unexpected response to registration submission".to_owned(),
+        )),
+    };
+    // Best-effort polite stream close; the transport is dropped either way.
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.shutdown()).await;
+    result
+}
+
+/// UI-safe refusal when the server does not advertise in-band registration.
+///
+/// XEP-0077 mandates that servers offering registration include the
+/// `http://jabber.org/features/iq-register` feature in their stream features,
+/// so the stream-features check alone gates registration. A disco#info
+/// fallback is deliberately not implemented: a server that hides registration
+/// from stream features is not offering the legacy flow this client supports.
+#[must_use]
+fn registration_refusal(
+    features: &xmpp_parsers::stream_features::StreamFeatures,
+) -> Option<String> {
+    (!features.in_band_registration)
+        .then(|| "this server does not support in-band registration".to_owned())
+}
+
+/// Maps a stanza error condition from the registration exchange to a UI-safe
+/// detail string.
+#[must_use]
+fn registration_error_detail(error: &StanzaError) -> String {
+    match error.defined_condition {
+        DefinedCondition::Conflict => "this username is already registered".to_owned(),
+        DefinedCondition::NotAcceptable => {
+            "the server did not accept the registration details".to_owned()
+        }
+        DefinedCondition::NotAllowed | DefinedCondition::Forbidden => {
+            "this server does not allow registration".to_owned()
+        }
+        DefinedCondition::ServiceUnavailable => {
+            "registration is temporarily unavailable".to_owned()
+        }
+        DefinedCondition::FeatureNotImplemented => {
+            "this server does not support in-band registration".to_owned()
+        }
+        _ => "the server refused the registration".to_owned(),
+    }
+}
+
+/// Reads one stream element during the registration exchange, bounded so a
+/// silent server cannot stall the session. A stream error is a terminal
+/// protocol-level failure for the registration.
+async fn read_registration_element<S: AsyncReadAndWrite>(
+    stream: &mut XmppStream<S>,
+) -> Result<XmppStreamElement, RegistrationAttemptError> {
+    let item = tokio::time::timeout(REGISTRATION_READ_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| {
+            RegistrationAttemptError::Connection(
+                "timed out waiting for the server during registration".to_owned(),
+            )
+        })?
+        .ok_or_else(|| {
+            RegistrationAttemptError::Connection(
+                "the server closed the stream during registration".to_owned(),
+            )
+        })?;
+    let element = item.and_then(FallibleStreamElement::into_read_error).map_err(|error| {
+        RegistrationAttemptError::Connection(format!(
+            "invalid data from the server during registration: {error}"
+        ))
+    })?;
+    if let XmppStreamElement::StreamError(error) = &element {
+        return Err(RegistrationAttemptError::Protocol(format!(
+            "the server closed the stream during registration: {error}"
+        )));
+    }
+    Ok(element)
 }
 
 /// Removes duplicate `(address, use_direct_tls)` candidates while preserving
@@ -1414,6 +1746,98 @@ mod tests {
         assert!(
             disconnected_is_recoverable(&network_loss),
             "a network loss mid-session must be recoverable"
+        );
+    }
+
+    #[test]
+    fn registration_queries_build_and_parse_with_xmpp_parsers() {
+        // The fields request serializes to <iq type='get'><query
+        // xmlns='jabber:iq:register'/></iq> and round-trips.
+        let get_iq = Iq::from_get("mindchat-register-get-1".to_owned(), FieldsQuery);
+        let element: Element = get_iq.into();
+        let parsed = Iq::try_from(element).expect("fields request parses");
+        assert_eq!(parsed.id(), "mindchat-register-get-1");
+        assert!(matches!(parsed, Iq::Get { payload, .. } if payload.is("query", ns::REGISTER)));
+
+        // A legacy fields response (username + password) parses into
+        // LegacyQuery and can be resubmitted as a set with credentials.
+        let response: Element = "<iq xmlns='jabber:client' type='result' id='mindchat-register-get-1'><query xmlns='jabber:iq:register'><username/><password/></query></iq>"
+            .parse()
+            .expect("valid fields response XML");
+        let Iq::Result { payload: Some(payload), .. } =
+            Iq::try_from(response).expect("fields response parses")
+        else {
+            panic!("expected a result IQ");
+        };
+        let mut query = LegacyQuery::try_from(payload).expect("legacy fields");
+        assert!(query.username.is_some());
+        assert!(query.password.is_some());
+        query.username = Some("alice".to_owned());
+        query.password = Some("s3cret".to_owned());
+        let set_iq = Iq::from_set("mindchat-register-set-1".to_owned(), query);
+        let element: Element = set_iq.into();
+        let parsed = Iq::try_from(element).expect("submission parses");
+        assert_eq!(parsed.id(), "mindchat-register-set-1");
+        assert!(matches!(parsed, Iq::Set { payload, .. } if payload.is("query", ns::REGISTER)));
+
+        // A data-form response (xdata/captcha) parses into FormQuery, the
+        // signal for "server requires additional registration fields".
+        let form: Element = "<iq xmlns='jabber:client' type='result' id='form'><query xmlns='jabber:iq:register'><x xmlns='jabber:x:data' type='form'/></query></iq>"
+            .parse()
+            .expect("valid form response XML");
+        let Iq::Result { payload: Some(payload), .. } =
+            Iq::try_from(form).expect("form response parses")
+        else {
+            panic!("expected a result IQ");
+        };
+        assert!(FormQuery::try_from(payload).is_ok());
+    }
+
+    #[test]
+    fn registration_is_gated_on_advertised_stream_features() {
+        // A server that does not advertise jabber:iq:register in its stream
+        // features must be refused with a UI-safe detail before any exchange.
+        let features = xmpp_parsers::stream_features::StreamFeatures::default();
+        assert_eq!(
+            registration_refusal(&features).as_deref(),
+            Some("this server does not support in-band registration")
+        );
+
+        let features = xmpp_parsers::stream_features::StreamFeatures {
+            in_band_registration: true,
+            ..Default::default()
+        };
+        assert_eq!(registration_refusal(&features), None);
+    }
+
+    #[test]
+    fn registration_error_conditions_map_to_ui_safe_details() {
+        let error = |condition: DefinedCondition| {
+            StanzaError::new(xmpp_parsers::stanza_error::ErrorType::Cancel, condition, "en", "")
+        };
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::Conflict)),
+            "this username is already registered"
+        );
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::NotAcceptable)),
+            "the server did not accept the registration details"
+        );
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::NotAllowed)),
+            "this server does not allow registration"
+        );
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::ServiceUnavailable)),
+            "registration is temporarily unavailable"
+        );
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::FeatureNotImplemented)),
+            "this server does not support in-band registration"
+        );
+        assert_eq!(
+            registration_error_detail(&error(DefinedCondition::InternalServerError)),
+            "the server refused the registration"
         );
     }
 }
