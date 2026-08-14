@@ -3,6 +3,11 @@
 //! MindChat does not load third-party code in the base application. These
 //! types define the manifest, permission, command, and event vocabulary that
 //! a future sandboxed extension runtime must enforce.
+//!
+//! This module is the canonical home of the extension contract
+//! (`EXTENSION_API_VERSION = 1`, manifest shape, permissions; no third-party
+//! loader). It is referenced by `ROADMAP.md`; the repository keeps no
+//! separate extensions document by design.
 
 use crate::{AccountId, ConversationId, CoreCommand, CoreError, CoreEvent, MessageId};
 use std::collections::BTreeSet;

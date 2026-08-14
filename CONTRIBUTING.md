@@ -20,6 +20,14 @@ reviewable, the verification honest, and the release bar consistent.
 - Decision logic that both gateways must share lives in one place (for
   example `GatewayInput.kt`). Keep it that way: duplicated inline logic
   between the two implementations has already drifted once.
+- `vendor/tokio-xmpp/` — a deliberate, patched vendored copy of the XMPP
+  library, selected via `[patch.crates-io]` in the root `Cargo.toml` (see the
+  rationale comment there): the patch surfaces terminal auth failure as
+  `Suspended` instead of silent retry. Keep vendor diffs minimal and marked
+  `// MindChat patch:`. Upstreaming the patch is tracked in `ROADMAP.md`.
+- The repository has **no `docs/` directory by design**. Canonical knowledge
+  lives in `README.md`, `ROADMAP.md`, `CHANGELOG.md`, this file, and code
+  comments; session notes belong in git commit messages.
 - `app/build/generated/source/uniffi/` — generated Kotlin bindings, produced
   by `scripts/generate-uniffi-kotlin.sh` (uniffi-bindgen 0.32.x). Never edit
   generated files; regenerate and commit the source side instead.
@@ -37,6 +45,15 @@ reviewable, the verification honest, and the release bar consistent.
   authoritative native assembly.
 
 ## Build and test
+
+Native build (ABI targets: `aarch64-linux-android`, `armv7-linux-androideabi`,
+`x86_64-linux-android`; UniFFI pinned at 0.32.0; see
+`rust-toolchain.toml` and `gradle/libs.versions.toml`):
+
+```sh
+scripts/build-rust-android.sh   # cargo-ndk cross-build + staging jniLibs
+scripts/generate-uniffi-kotlin.sh  # uniffi-bindgen -> generated Kotlin
+```
 
 Rust:
 
@@ -82,14 +99,36 @@ scripts/generate-uniffi-kotlin.sh
 3. Strings: every new UI string exists in both `values/strings.xml` and
    `values-ru/strings.xml` (keys must match 1:1).
 4. Material rule: M3 Expressive only, icons-core only.
-5. Docs: user-visible behavior changes are reflected in `STATUS.md` (and
-   `PLAN.md` when the roadmap moves).
+5. Zero-log rule: no logging statements of any kind (no `println`,
+   `eprintln`, `android.util.Log`, `Timber`, `env_logger`, `tracing`, log
+   files, or diagnostics zips) anywhere in the tracked tree. Debugging
+   happens through typed errors, unit tests, and the gated live suite.
+   A CI grep gate (`scripts/check-zero-log.sh`, planned for 0.1.8) enforces
+   this mechanically; today it is a review requirement.
+6. Docs: user-visible behavior changes are reflected in `CHANGELOG.md`
+   (Unreleased section), and `ROADMAP.md` when the roadmap moves.
+
+## Security invariants
+
+The following are not style preferences; they are the product's privacy
+contract and are enforced by tests where possible:
+
+- **Passwords never persist.** The Android side hands credentials straight
+  to the Rust session startup call and never stores them (no preferences,
+  no saved Compose state, no vault, no logs).
+- **`SecretString` Debug output is redacted** and regression-tested; secrets
+  never appear in snapshots, errors, events, or diagnostics.
+- **The connect phase is bounded**: per-attempt 10 s, whole phase 30 s, and
+  every branch of the worker emits a terminal event, so an account can never
+  stick in Connecting.
+- **Typed errors only.** UI-safe detail strings from the binding layer are
+  display-only; classification and control flow come from typed enums.
+- **Local state is atomic and versioned** with a size bound and corrupt-file
+  quarantine; the state file contains no secrets by design (storage
+  encryption lands in 0.1.9).
 
 ## Coding rules
 
-- No passwords or secrets in preferences, Compose state, logs, or commits.
-  The Android side hands credentials straight to the Rust session startup
-  call and never stores them.
 - Errors surfaced to the UI are UI-safe detail strings from the binding
   layer; don't leak internal error plumbing into Compose.
 - Keep the gateway fast path honest: a poll cycle with an unchanged snapshot
@@ -113,6 +152,11 @@ scripts/generate-uniffi-kotlin.sh
 
 Releases are tagged `v<version>` after the Android version bump
 (`versionCode`/`versionName` in `app/build.gradle.kts`), a full green
-verification run, and a `STATUS.md` update with the release artifact hash.
+verification run, and a `CHANGELOG.md` entry recording the release (with the
+artifact hash in the release report / GitHub release description). Release
+notes are assembled from `CHANGELOG.md`; keep its Unreleased section current
+as features land.
 Local hosts without an NDK produce an APK with the previously built native
-library; the CI-native assembly is the authoritative artifact.
+library; the CI-native assembly is the authoritative artifact. The release
+process will be formalized in scripts and a CI release job at 0.2.0 (see
+`ROADMAP.md`).

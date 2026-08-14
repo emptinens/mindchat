@@ -18,11 +18,13 @@ target/
 # Native-library staging
 app/src/main/jniLibs/
 
-# Secrets and diagnostics
+# Secrets
 *.keystore
 *.jks
 *.log
-mindchat-diagnostics-*.zip
+*.hprof
+*.cprof
+*.idsig
 
 # Local machine config
 .scratch/

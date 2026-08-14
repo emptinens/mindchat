@@ -5,11 +5,14 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/mindchat/mindchat"
+repository = "https://github.com/emptinens/mindchat"
 rust-version = "1.88"
 
-# Patched tokio-xmpp 6.0.0: authentication failures are terminal instead of
-# retrying forever, and cancelled connection tasks stop retrying promptly.
+# Patched tokio-xmpp 6.0.0, vendored deliberately at vendor/tokio-xmpp:
+# authentication failures are terminal instead of retrying forever, and
+# cancelled connection tasks stop retrying promptly (Suspended is surfaced
+# to the UI as a terminal state). The tree must stay minimal and every diff
+# marked `// MindChat patch:`; upstreaming is tracked in ROADMAP.md.
 [patch.crates-io]
 tokio-xmpp = { path = "vendor/tokio-xmpp" }
 
