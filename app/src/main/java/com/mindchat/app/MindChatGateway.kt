@@ -182,6 +182,18 @@ class NativeMindChatGateway(
     /** When each account entered CONNECTING (epoch ms), used for stall detection. */
     private val connectingSince = mutableMapOf<Long, Long>()
 
+    /** Profiles backing the current UI state; [updateProfile] is the only writer. */
+    private var profilesCache = preferences.readProfiles()
+
+    /**
+     * The raw snapshot, profiles, and customization that produced the current
+     * [state]. Poll cycles compare against these so an unchanged core skips
+     * rebuilding the whole UI state (and the recomposition that would cause).
+     */
+    private var lastSnapshot: FfiCoreSnapshot? = null
+    private var lastProfiles: Map<Long, AccountProfile> = emptyMap()
+    private var lastCustomization: MindChatCustomization = customization
+
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
     private val persistenceTracker = PersistenceStateTracker()
@@ -300,6 +312,7 @@ class NativeMindChatGateway(
 
     override fun updateProfile(accountId: Long, profile: AccountProfile) {
         preferences.writeProfile(accountId, profile)
+        profilesCache = preferences.readProfiles()
         refresh()
     }
 
@@ -511,9 +524,34 @@ class NativeMindChatGateway(
         }
     }
 
+    /**
+     * Rebuilds the UI state only when something actually changed. The raw
+     * snapshot is compared structurally against the last mapped one; identical
+     * data keeps the previous [state] instance so Compose skips the whole
+     * recomposition pass that a fresh instance would trigger.
+     */
     private fun refresh(snapshot: FfiCoreSnapshot = core.snapshot()) {
-        state = snapshotToUiState(snapshot)
+        // The core event queue is drained on every refresh (unchanged state
+        // included) so a later mutation's notifications start from an empty
+        // queue, exactly as before the fast path.
         core.drainEvents()
+        if (shouldSkipUiRebuild(
+                snapshot = snapshot,
+                lastSnapshot = lastSnapshot,
+                publishedActiveAccountId = state.activeAccountId,
+                activeAccountId = activeAccountId,
+                customization = customization,
+                lastCustomization = lastCustomization,
+                profiles = profilesCache,
+                lastProfiles = lastProfiles,
+            )
+        ) {
+            return
+        }
+        state = snapshotToUiState(snapshot, profilesCache)
+        lastSnapshot = snapshot
+        lastProfiles = profilesCache
+        lastCustomization = customization
     }
 
     private fun markDirty() {
@@ -549,9 +587,11 @@ class NativeMindChatGateway(
         refresh()
     }
 
-    private fun snapshotToUiState(snapshot: FfiCoreSnapshot = core.snapshot()): MindChatUiState {
+    private fun snapshotToUiState(
+        snapshot: FfiCoreSnapshot = core.snapshot(),
+        profiles: Map<Long, AccountProfile> = profilesCache,
+    ): MindChatUiState {
         val now = System.currentTimeMillis()
-        val profiles = preferences.readProfiles()
         val accounts = snapshot.accounts.map { account ->
             val accountId = account.id.toLong()
             val connectionState = account.connectionState.toUiModel()
@@ -586,15 +626,19 @@ class NativeMindChatGateway(
         if (activeAccountId == 0L || accounts.none { it.id == activeAccountId }) {
             activeAccountId = accounts.firstOrNull()?.id ?: 0L
         }
+        // Index reactions by message id once; the previous per-message
+        // `filter` made message mapping O(messages x reactions) and allocated
+        // a list per message on every rebuild.
+        val reactionsByMessage = snapshot.reactions.groupBy { it.messageId }
         val messagesByConversation = snapshot.messages
             .groupBy { it.conversationId.toLong() }
             .mapValues { (_, messages) ->
                 messages.map { message ->
-                    val reactionLabels = snapshot.reactions
-                        .filter { it.messageId == message.id }
-                        .groupingBy { it.emoji }
-                        .eachCount()
-                        .map { (emoji, count) -> "$emoji $count" }
+                    val reactionLabels = reactionsByMessage[message.id]
+                        ?.groupingBy { it.emoji }
+                        ?.eachCount()
+                        ?.map { (emoji, count) -> "$emoji $count" }
+                        ?: emptyList()
                     MessageUi(
                         id = message.id.toLong(),
                         sender = message.sender,
@@ -671,6 +715,35 @@ private fun FfiDeliveryState.toUiModel(): MessageDelivery = when (this) {
 private fun formatTimestamp(epochMs: Long): String = DateFormat
     .getTimeInstance(DateFormat.SHORT, Locale.getDefault())
     .format(Date(epochMs))
+
+/**
+ * Pure decision behind [NativeMindChatGateway.refresh]'s no-op fast path.
+ *
+ * A poll cycle can skip rebuilding the UI state only when every input that
+ * feeds the mapping is unchanged: the raw snapshot, the active account, the
+ * customization flags, and the stored profiles. Snapshots with an account in
+ * CONNECTING always rebuild so the wall-clock stall detection keeps working.
+ * The structural snapshot comparison is a serialize-free, allocation-free
+ * field-by-field compare (same lengths, then per-record equals).
+ */
+internal fun shouldSkipUiRebuild(
+    snapshot: FfiCoreSnapshot,
+    lastSnapshot: FfiCoreSnapshot?,
+    publishedActiveAccountId: Long,
+    activeAccountId: Long,
+    customization: MindChatCustomization,
+    lastCustomization: MindChatCustomization,
+    profiles: Map<Long, AccountProfile>,
+    lastProfiles: Map<Long, AccountProfile>,
+): Boolean {
+    if (snapshot !== lastSnapshot) {
+        if (lastSnapshot == null || snapshot != lastSnapshot) return false
+    }
+    if (activeAccountId != publishedActiveAccountId) return false
+    if (customization != lastCustomization) return false
+    if (profiles != lastProfiles) return false
+    return snapshot.accounts.none { it.connectionState == FfiConnectionState.CONNECTING }
+}
 
 /** Compose-previewable fallback for design previews and native-free debug tests. */
 @Stable
