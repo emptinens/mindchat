@@ -333,6 +333,15 @@ Verification on the merged tree: Rust all-targets tests + clippy
 `testDebugUnitTest` (28 tests, 4 suites), `lintDebug` (0 errors),
 `assembleDebug` all pass. APK SHA-256 `54876b1e…`.
 
+The settings surface is additionally pinned through the public
+`MindChatGateway` contract: `GatewayCustomizationContractTest` (6 tests)
+covers the dynamic-color / comfortable-layout / app-lock toggles (state flip
++ preferences persistence + flag independence + gateway restart with the
+same preferences + non-default initialization), complementing
+`SettingsStorageTest` (storage estimate, avatar-image clearing) and
+`SnapshotDiffingTest` (unchanged-poll fast path). Total unit suite: 70
+tests across 8 suites.
+
 Caveats: About shows `BuildConfig.VERSION_NAME` = 0.1.4 until the release
 bump; privacy/notification rows are placeholders with explicit supporting
 text; the local APK still embeds the previously built native `.so` (no NDK
