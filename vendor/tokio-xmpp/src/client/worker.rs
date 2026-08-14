@@ -7,9 +7,10 @@
 use crate::client::iq;
 use crate::stanzastream::StanzaReceiver;
 use crate::stanzastream::{Event as StanzaStreamEvent, StreamEvent};
-use crate::{Event, Stanza};
+use crate::{Error, Event, Stanza};
 use core::ops::ControlFlow;
 use futures::StreamExt;
+use std::io;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use xmpp_parsers::jid::FullJid;
@@ -98,7 +99,20 @@ impl ClientWorker {
                 features: self.features.as_ref().unwrap().clone(),
                 resumed: true,
             },
-            StanzaStreamEvent::Stream(StreamEvent::Suspended) => return,
+            // MindChat patch: network loss (Suspended) is surfaced as a
+            // terminal Disconnected instead of being silently dropped. The
+            // stanzastream emits Suspended whenever the underlying connection
+            // dies, before its internal reconnector takes over; dropping it
+            // made client.next() park in Pending forever with no terminal
+            // event, leaving hosts stuck on a stale "Online" state. Surfacing
+            // it lets the host observe the loss and decide whether to
+            // reconnect.
+            StanzaStreamEvent::Stream(StreamEvent::Suspended) => Event::Disconnected(
+                Error::Io(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "XMPP connection suspended",
+                )),
+            ),
             // MindChat patch: surface the stanzastream's terminal connector
             // failure (e.g. rejected authentication) as a Disconnected event
             // instead of dropping the stream and hanging client.next().
@@ -108,5 +122,36 @@ impl ClientWorker {
         let Ok(()) = self.stanza_w2f_tx.send(send_event).await else {
             panic!("All clients have been dropped.");
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stanzastream::StanzaStream;
+
+    #[tokio::test]
+    async fn suspended_stream_event_is_surfaced_as_terminal_disconnected() {
+        // MindChat patch regression test: a Suspended stream event (network
+        // loss before the internal reconnector takes over) must surface as a
+        // terminal Event::Disconnected instead of being silently dropped, so
+        // client.next() never parks in Pending forever.
+        let stream = StanzaStream::new(Box::new(|_, _| {}), 16);
+        let (_sender, stream_rx) = stream.split();
+        let (mut worker, _shutdown_tx, mut frontend_rx) =
+            ClientWorker::new(stream_rx, iq::IqResponseTracker::new(), 16);
+
+        worker
+            .handle_event(StanzaStreamEvent::Stream(StreamEvent::Suspended))
+            .await;
+
+        let event = frontend_rx
+            .recv()
+            .await
+            .expect("worker must forward the suspended event");
+        assert!(
+            matches!(&event, Event::Disconnected(Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionReset),
+            "expected a terminal I/O Disconnected, got {event:?}"
+        );
     }
 }
