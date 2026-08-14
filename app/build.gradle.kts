@@ -23,6 +23,27 @@ val buildRustAndroid by tasks.registering(Exec::class) {
         rootProject.fileTree(rootProject.file("crates")),
     )
     outputs.dir(nativeJniLibsDir)
+    // Local hosts without cargo-ndk/NDK reuse the previously staged jniLibs
+    // (CONTRIBUTING "Development setup"). CI always has the toolchain, so the
+    // authoritative native assembly still runs there; the script keeps its
+    // hard failure for anyone invoking it directly without the toolchain.
+    onlyIf {
+        val toolchainOk = try {
+            ProcessBuilder(
+                "sh", "-c",
+                "command -v cargo-ndk >/dev/null 2>&1 || cargo ndk --version >/dev/null 2>&1",
+            ).start().waitFor() == 0
+        } catch (e: Exception) {
+            false
+        }
+        if (!toolchainOk) {
+            logger.warn(
+                "cargo-ndk/NDK not available; skipping native assembly and " +
+                    "reusing staged jniLibs. CI performs the authoritative build.",
+            )
+        }
+        toolchainOk
+    }
 }
 
 val generateUniffiKotlin by tasks.registering(Exec::class) {
