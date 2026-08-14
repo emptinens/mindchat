@@ -52,4 +52,17 @@
     <string name="about">About MindChat</string>
     <string name="privacy_summary">No analytics or MindChat cloud account</string>
     <string name="coming_soon">Connection, roster synchronization, and encrypted storage are the next core milestones.</string>
+    <!-- Login / account connection -->
+    <string name="login_subtitle">Sign in with your XMPP account to start chatting.</string>
+    <string name="login_connect">Connect</string>
+    <string name="login_connecting">Connecting…</string>
+    <string name="login_jid_invalid">Enter a full JID, for example user@example.com</string>
+    <string name="login_server_required">Server is required</string>
+    <string name="login_password_required">Password is required</string>
+    <string name="display_name_optional">Display name (optional)</string>
+    <string name="password_show">Show</string>
+    <string name="password_hide">Hide</string>
+    <string name="retry">Retry</string>
+    <string name="connection_stalled">Connection is taking longer than expected</string>
+    <string name="group_create_failed">Could not create this chat. Check the address and try again.</string>
 </resources>

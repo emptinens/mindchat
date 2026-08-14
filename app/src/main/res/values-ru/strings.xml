@@ -52,4 +52,17 @@
     <string name="about">О MindChat</string>
     <string name="privacy_summary">Без аналитики и облачного аккаунта MindChat</string>
     <string name="coming_soon">Подключение, синхронизация списка контактов и зашифрованное хранилище — следующие этапы ядра.</string>
+    <!-- Вход в аккаунт / подключение -->
+    <string name="login_subtitle">Войдите с помощью XMPP-аккаунта, чтобы начать общение.</string>
+    <string name="login_connect">Подключиться</string>
+    <string name="login_connecting">Подключение…</string>
+    <string name="login_jid_invalid">Укажите полный JID, например user@example.com</string>
+    <string name="login_server_required">Укажите сервер</string>
+    <string name="login_password_required">Введите пароль</string>
+    <string name="display_name_optional">Имя (необязательно)</string>
+    <string name="password_show">Показать</string>
+    <string name="password_hide">Скрыть</string>
+    <string name="retry">Повторить</string>
+    <string name="connection_stalled">Подключение занимает больше времени, чем ожидалось</string>
+    <string name="group_create_failed">Не удалось создать чат. Проверьте адрес и попробуйте снова.</string>
 </resources>

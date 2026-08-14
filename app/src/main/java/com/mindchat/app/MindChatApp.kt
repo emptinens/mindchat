@@ -1,5 +1,6 @@
 package com.mindchat.app
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -32,8 +33,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -67,6 +70,7 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -114,6 +118,13 @@ private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
                 AppLockedScreen(
                     state = appLockHost.appLockState,
                     onUnlock = appLockHost::requestAppUnlock,
+                )
+            } else if (state.accounts.isEmpty()) {
+                // First-run experience: no account yet, show the full-screen login.
+                // Once addAccount succeeds the account list becomes non-empty and
+                // this composable is replaced by the main shell automatically.
+                LoginScreen(
+                    onConnect = gateway::addAccount,
                 )
             } else {
                 MindChatShell(
@@ -213,8 +224,7 @@ private fun MindChatShell(
                 ?.supportsGroupChats == true,
             onDismiss = { showNewConversation = false },
             onSave = { address, title, isGroup ->
-                gateway.openConversation(address, title, isGroup)
-                showNewConversation = false
+                gateway.openConversation(address, title, isGroup) != null
             },
         )
     }
@@ -231,6 +241,10 @@ private fun MindChatShell(
 
     val selectedConversation = state.conversations.firstOrNull { it.id == selectedConversationId }
     if (selectedConversation != null) {
+        // System back returns to the conversation list instead of exiting the app.
+        BackHandler {
+            selectedConversationId = null
+        }
         ChatScreen(
             conversation = selectedConversation,
             messages = state.messagesByConversation[selectedConversation.id].orEmpty(),
@@ -247,6 +261,7 @@ private fun MindChatShell(
                 onAccountSelected = gateway::selectAccount,
                 onAddAccount = { showAddAccount = true },
                 onReconnect = { reconnectAccountId = it },
+                onCancelConnection = gateway::disconnectAccount,
             )
         },
         bottomBar = {
@@ -346,8 +361,16 @@ private fun MindChatTopBar(
     onAccountSelected: (Long) -> Unit,
     onAddAccount: () -> Unit,
     onReconnect: (Long) -> Unit,
+    onCancelConnection: (Long) -> Unit,
 ) {
     val active = state.accounts.firstOrNull { it.id == state.activeAccountId }
+    // A connecting account that has exceeded the stall threshold needs explicit
+    // cancel/retry affordances instead of an endless spinner.
+    val stalled = active?.connectionStalled == true
+    val needsReconnect = active != null &&
+        (stalled ||
+            active.connectionState == AccountConnectionState.FAILED ||
+            active.connectionError != null)
     TopAppBar(
         title = {
             Column {
@@ -355,17 +378,26 @@ private fun MindChatTopBar(
                     text = active?.displayName ?: stringResource(R.string.app_name),
                     style = MaterialTheme.typography.titleLarge,
                 )
-                Text(
-                    text = active?.let { account ->
-                        "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}"
-                    }.orEmpty(),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (active?.connectionState == AccountConnectionState.FAILED) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = active?.let { account ->
+                            "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}"
+                        }.orEmpty(),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (active?.connectionState == AccountConnectionState.FAILED) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                    )
+                    if (active?.connectionState == AccountConnectionState.CONNECTING) {
+                        Spacer(Modifier.width(6.dp))
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    }
+                }
                 active?.connectionError?.let { detail ->
                     Text(
                         text = detail,
@@ -375,18 +407,26 @@ private fun MindChatTopBar(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+                if (stalled) {
+                    Text(
+                        text = stringResource(R.string.connection_stalled),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
         },
         actions = {
-            // Offer retry both for hard failures (Failed) and for recoverable
-            // connect errors (Offline with a reason), so a wedged DNS or a
-            // timed-out handshake always has a visible retry affordance.
-            val needsReconnect = active != null &&
-                (active.connectionState == AccountConnectionState.FAILED ||
-                    active.connectionError != null)
+            // A stalled connection can be cancelled outright; both stalled and
+            // failed states offer a retry through the Reconnect dialog.
+            if (stalled) {
+                TextButton(onClick = { active?.let { onCancelConnection(it.id) } }) {
+                    Text(stringResource(R.string.cancel))
+                }
+            }
             if (needsReconnect) {
                 TextButton(onClick = { active?.let { onReconnect(it.id) } }) {
-                    Text(stringResource(R.string.reconnect))
+                    Text(stringResource(if (stalled) R.string.retry else R.string.reconnect))
                 }
             }
             IconButton(onClick = onAddAccount) {
@@ -412,7 +452,14 @@ private fun MindChatTopBar(
                     onClick = { onAccountSelected(account.id) },
                     label = { Text(account.displayName) },
                     leadingIcon = {
-                        PresenceDot(account.presence)
+                        if (account.connectionState == AccountConnectionState.CONNECTING) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        } else {
+                            PresenceDot(account.presence)
+                        }
                     },
                     colors = AssistChipDefaults.assistChipColors(
                         containerColor = if (account.id == state.activeAccountId) {
@@ -938,30 +985,62 @@ private fun AddAccountDialog(
 ) {
     var jid by rememberSaveable { mutableStateOf("") }
     var server by rememberSaveable { mutableStateOf("") }
+    var serverTouched by rememberSaveable { mutableStateOf(false) }
     var displayName by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
     var failedToStartSession by remember { mutableStateOf(false) }
+
+    val jidInvalid = !jid.contains('@')
+    val serverEmpty = server.isBlank()
+    val passwordEmpty = password.isEmpty()
     AlertDialog(
         onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
         title = { Text(stringResource(R.string.add_account)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = jid,
-                    onValueChange = { jid = it },
+                    onValueChange = { newJid ->
+                        jid = newJid
+                        failedToStartSession = false
+                        // The server is normally the JID domain; derive it until
+                        // the user edits the server field explicitly.
+                        val at = newJid.indexOf('@')
+                        if (at >= 0 && !serverTouched) {
+                            server = newJid.substring(at + 1)
+                        }
+                    },
                     label = { Text(stringResource(R.string.account_jid)) },
                     singleLine = true,
+                    isError = jidInvalid && jid.isNotEmpty(),
+                    supportingText = if (jidInvalid && jid.isNotEmpty()) {
+                        { Text(stringResource(R.string.login_jid_invalid)) }
+                    } else {
+                        null
+                    },
                 )
                 OutlinedTextField(
                     value = server,
-                    onValueChange = { server = it },
+                    onValueChange = {
+                        server = it
+                        serverTouched = true
+                        failedToStartSession = false
+                    },
                     label = { Text(stringResource(R.string.server)) },
                     singleLine = true,
+                    isError = serverEmpty,
+                    supportingText = if (serverEmpty) {
+                        { Text(stringResource(R.string.login_server_required)) }
+                    } else {
+                        null
+                    },
                 )
                 OutlinedTextField(
                     value = displayName,
                     onValueChange = { displayName = it },
-                    label = { Text(stringResource(R.string.display_name)) },
+                    label = { Text(stringResource(R.string.display_name_optional)) },
                     singleLine = true,
                 )
                 OutlinedTextField(
@@ -971,9 +1050,28 @@ private fun AddAccountDialog(
                         failedToStartSession = false
                     },
                     label = { Text(stringResource(R.string.password)) },
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (passwordVisible) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        TextButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Text(
+                                text = stringResource(
+                                    if (passwordVisible) R.string.password_hide else R.string.password_show,
+                                ),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    },
                     singleLine = true,
-                    isError = failedToStartSession,
+                    isError = failedToStartSession || passwordEmpty,
+                    supportingText = if (passwordEmpty) {
+                        { Text(stringResource(R.string.login_password_required)) }
+                    } else {
+                        null
+                    },
                 )
                 if (failedToStartSession) {
                     Text(
@@ -985,7 +1083,7 @@ private fun AddAccountDialog(
             }
         },
         confirmButton = {
-            TextButton(
+            FilledTonalButton(
                 onClick = {
                     if (onSave(jid, server, displayName, password)) {
                         onDismiss()
@@ -993,7 +1091,7 @@ private fun AddAccountDialog(
                         failedToStartSession = true
                     }
                 },
-                enabled = jid.contains('@') && server.isNotBlank() && password.isNotEmpty(),
+                enabled = !jidInvalid && !serverEmpty && password.isNotEmpty(),
             ) { Text(stringResource(R.string.save)) }
         },
         dismissButton = {
@@ -1009,9 +1107,11 @@ private fun ReconnectDialog(
     onReconnect: (password: String) -> Boolean,
 ) {
     var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
     var failedToReconnect by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
         title = { Text(stringResource(R.string.reconnect_title)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1027,9 +1127,28 @@ private fun ReconnectDialog(
                         failedToReconnect = false
                     },
                     label = { Text(stringResource(R.string.password)) },
-                    visualTransformation = PasswordVisualTransformation(),
+                    visualTransformation = if (passwordVisible) {
+                        VisualTransformation.None
+                    } else {
+                        PasswordVisualTransformation()
+                    },
+                    trailingIcon = {
+                        TextButton(onClick = { passwordVisible = !passwordVisible }) {
+                            Text(
+                                text = stringResource(
+                                    if (passwordVisible) R.string.password_hide else R.string.password_show,
+                                ),
+                                style = MaterialTheme.typography.labelLarge,
+                            )
+                        }
+                    },
                     singleLine = true,
-                    isError = failedToReconnect,
+                    isError = failedToReconnect || password.isEmpty(),
+                    supportingText = if (password.isEmpty()) {
+                        { Text(stringResource(R.string.login_password_required)) }
+                    } else {
+                        null
+                    },
                 )
                 if (failedToReconnect) {
                     Text(
@@ -1041,7 +1160,7 @@ private fun ReconnectDialog(
             }
         },
         confirmButton = {
-            TextButton(
+            FilledTonalButton(
                 onClick = {
                     if (onReconnect(password)) {
                         onDismiss()
@@ -1100,21 +1219,32 @@ private fun AddContactDialog(
 private fun NewConversationDialog(
     canCreateGroup: Boolean,
     onDismiss: () -> Unit,
-    onSave: (address: String, title: String, isGroup: Boolean) -> Unit,
+    onSave: (address: String, title: String, isGroup: Boolean) -> Boolean,
 ) {
     var address by rememberSaveable { mutableStateOf("") }
     var title by rememberSaveable { mutableStateOf("") }
     var isGroup by rememberSaveable { mutableStateOf(false) }
+    var failed by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
         title = { Text(stringResource(R.string.new_chat)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = address,
-                    onValueChange = { address = it },
+                    onValueChange = {
+                        address = it
+                        failed = false
+                    },
                     label = { Text(stringResource(R.string.conversation_address)) },
                     singleLine = true,
+                    isError = failed,
+                    supportingText = if (failed) {
+                        { Text(stringResource(R.string.group_create_failed)) }
+                    } else {
+                        null
+                    },
                 )
                 OutlinedTextField(
                     value = title,
@@ -1140,8 +1270,14 @@ private fun NewConversationDialog(
             }
         },
         confirmButton = {
-            TextButton(
-                onClick = { onSave(address, title, isGroup) },
+            FilledTonalButton(
+                onClick = {
+                    if (onSave(address, title, isGroup)) {
+                        onDismiss()
+                    } else {
+                        failed = true
+                    }
+                },
                 enabled = address.isNotBlank(),
             ) {
                 Text(stringResource(R.string.create))
