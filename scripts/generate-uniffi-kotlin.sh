@@ -3,7 +3,14 @@
 set -eu
 
 if ! command -v uniffi-bindgen >/dev/null 2>&1; then
-    echo "uniffi-bindgen is required; install it with: cargo install uniffi --features cli --locked" >&2
+    echo "uniffi-bindgen is required; install it with: cargo install uniffi --version 0.32.0 --features cli --locked" >&2
+    exit 1
+fi
+
+# The generated Kotlin must match the UniFFI version pinned in Cargo.toml and
+# CI; a mismatched CLI produces bindings that fail at link time.
+if ! uniffi-bindgen --version 2>/dev/null | grep -q "0\.32\."; then
+    echo "uniffi-bindgen 0.32.x is required; found: $(uniffi-bindgen --version 2>&1)" >&2
     exit 1
 fi
 

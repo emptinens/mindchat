@@ -20,6 +20,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - run: cargo test --workspace --no-default-features
 
   android:
     runs-on: ubuntu-latest
@@ -38,4 +39,4 @@ jobs:
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
       - run: cargo install cargo-ndk --version 4.1.2 --locked && cargo install uniffi --version 0.32.0 --features cli --locked
       - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh
-      - run: ./gradlew :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug --no-daemon --max-workers=2
+      - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug --no-daemon --max-workers=2

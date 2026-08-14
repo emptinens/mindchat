@@ -5,6 +5,7 @@ build/
 local.properties
 .idea/
 *.iml
+.kotlin/
 
 # Android artifacts
 *.apk
@@ -24,7 +25,6 @@ app/src/main/jniLibs/
 mindchat-diagnostics-*.zip
 
 # Local machine config
-local.properties
 .scratch/
 .DS_Store
 
