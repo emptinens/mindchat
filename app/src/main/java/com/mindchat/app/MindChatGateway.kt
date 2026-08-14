@@ -19,6 +19,7 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -38,6 +39,7 @@ data class AccountUi(
     val connectionState: AccountConnectionState = AccountConnectionState.OFFLINE,
     val supportsGroupChats: Boolean = false,
     val connectionError: String? = null,
+    val connectionStalled: Boolean = false,
 )
 
 data class ContactUi(
@@ -120,6 +122,7 @@ interface MindChatGateway {
     fun selectAccount(accountId: Long)
     fun addAccount(jid: String, server: String, displayName: String, password: String): Boolean
     fun reconnectAccount(accountId: Long, password: String): Boolean
+    fun disconnectAccount(accountId: Long)
     fun addContact(jid: String, displayName: String)
     fun openConversation(address: String, title: String, group: Boolean): Long?
     fun sendText(conversationId: Long, text: String)
@@ -159,6 +162,9 @@ class NativeMindChatGateway(
     private var activeAccountId = 0L
     private var customization = preferences.readCustomization()
     private val pendingOutboxAccounts = mutableSetOf<Long>()
+
+    /** When each account entered CONNECTING (epoch ms), used for stall detection. */
+    private val connectingSince = mutableMapOf<Long, Long>()
 
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
@@ -227,6 +233,17 @@ class NativeMindChatGateway(
         }
     }
 
+    override fun disconnectAccount(accountId: Long) {
+        try {
+            core.disconnectAccount(accountId.toULong())
+            markDirty()
+            refresh()
+        } catch (_: MindChatBindingException) {
+            // The account clears through transport events; keep the UI current.
+            refresh()
+        }
+    }
+
     override fun addContact(jid: String, displayName: String) {
         if (activeAccountId == 0L) return
         try {
@@ -267,71 +284,91 @@ class NativeMindChatGateway(
      * Snapshot state is only assigned after the coroutine resumes on that dispatcher.
      */
     override suspend fun pollTransport() {
-        val pendingAccounts = pendingOutboxAccounts.toSet()
-        val onlineBefore = state.accounts
-            .asSequence()
-            .filter { it.connectionState == AccountConnectionState.ONLINE }
-            .map(AccountUi::id)
-            .toSet()
-        val result = withContext(Dispatchers.IO) {
-            try {
-                val processedEvents = core.pollTransportEvents(32U)
+        try {
+            val pendingAccounts = pendingOutboxAccounts.toSet()
+            val onlineBefore = state.accounts
+                .asSequence()
+                .filter { it.connectionState == AccountConnectionState.ONLINE }
+                .map(AccountUi::id)
+                .toSet()
+            val result = withContext(Dispatchers.IO) {
+                try {
+                    val processedEvents = core.pollTransportEvents(32U)
 
-                // Flush the outbox before persisting so delivery transitions are
-                // captured in the saved snapshot.
-                val hasTransportWork = processedEvents > 0U || pendingAccounts.any { it in onlineBefore }
-                val flushedAccounts = if (hasTransportWork) {
-                    val beforeFlush = core.snapshot()
-                    val onlineNow = beforeFlush.accounts
-                        .asSequence()
-                        .filter { it.connectionState == FfiConnectionState.ONLINE }
-                        .map { it.id.toLong() }
-                        .toSet()
-                    val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
-                        .intersect(onlineNow)
-                    accountsToFlush.forEach { accountId ->
-                        try {
-                            core.flushOutbox(accountId.toULong())
-                        } catch (_: MindChatBindingException) {
-                            // The core has already projected a failed delivery state when applicable.
+                    // Flush the outbox before persisting so delivery transitions are
+                    // captured in the saved snapshot.
+                    val hasTransportWork = processedEvents > 0U || pendingAccounts.any { it in onlineBefore }
+                    val flushedAccounts = if (hasTransportWork) {
+                        val beforeFlush = core.snapshot()
+                        val onlineNow = beforeFlush.accounts
+                            .asSequence()
+                            .filter { it.connectionState == FfiConnectionState.ONLINE }
+                            .map { it.id.toLong() }
+                            .toSet()
+                        val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
+                            .intersect(onlineNow)
+                        accountsToFlush.forEach { accountId ->
+                            try {
+                                core.flushOutbox(accountId.toULong())
+                            } catch (_: MindChatBindingException) {
+                                // The core has already projected a failed delivery state when applicable.
+                            }
                         }
+                        accountsToFlush
+                    } else {
+                        emptySet()
                     }
-                    accountsToFlush
-                } else {
-                    emptySet()
-                }
 
-                if (processedEvents > 0U || flushedAccounts.isNotEmpty()) {
-                    markDirty()
-                }
-                val stateChanged = persistenceTracker.requiresSave()
-                if (stateChanged) {
-                    saveSnapshot()
-                }
+                    if (processedEvents > 0U || flushedAccounts.isNotEmpty()) {
+                        markDirty()
+                    }
+                    val stateChanged = persistenceTracker.requiresSave()
+                    if (stateChanged) {
+                        saveSnapshot()
+                    }
 
-                if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
-                    return@withContext null
+                    if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
+                        return@withContext null
+                    }
+                    TransportPollResult(core.snapshot(), flushedAccounts)
+                } catch (_: MindChatBindingException) {
+                    // A transport batch can apply Connected/Disconnected before a
+                    // later malformed roster or presence stanza makes the native
+                    // call return an error. Keep the state projection visible even
+                    // when that later event is rejected; otherwise the UI can stay
+                    // on a stale Connecting snapshot forever.
+                    val fallbackSnapshot = runCatching { core.snapshot() }.getOrNull()
+                    if (fallbackSnapshot != null) {
+                        // Events applied before the failed batch are visible but
+                        // would be lost on process death; make them durable now.
+                        markDirty()
+                        saveSnapshot()
+                        TransportPollResult(fallbackSnapshot, emptySet())
+                    } else {
+                        null
+                    }
                 }
-                TransportPollResult(core.snapshot(), flushedAccounts)
-            } catch (_: MindChatBindingException) {
-                // A transport batch can apply Connected/Disconnected before a
-                // later malformed roster or presence stanza makes the native
-                // call return an error. Keep the state projection visible even
-                // when that later event is rejected; otherwise the UI can stay
-                // on a stale Connecting snapshot forever.
-                runCatching { TransportPollResult(core.snapshot(), emptySet()) }
-                    .getOrNull()
             }
-        }
-        result?.let { pollResult ->
-            pendingOutboxAccounts.removeAll(pollResult.flushedAccounts)
-            refresh(pollResult.snapshot)
+            result?.let { pollResult ->
+                pendingOutboxAccounts.removeAll(pollResult.flushedAccounts)
+                refresh(pollResult.snapshot)
+            }
+        } catch (throwable: Throwable) {
+            // MindChatApp polls inside an infinite LaunchedEffect loop; an
+            // exception escaping here kills that loop and freezes the UI on a
+            // stale Connecting state forever. Survive by refreshing when a
+            // snapshot is still obtainable; the next cycle simply polls again.
+            if (throwable is CancellationException) throw throwable
+            runCatching { refresh() }
         }
     }
 
     override suspend fun persistNow() {
         withContext(Dispatchers.IO) {
-            saveSnapshot()
+            // Skip the write when nothing mutated since the last persisted snapshot.
+            if (persistenceTracker.requiresSave()) {
+                saveSnapshot()
+            }
         }
     }
 
@@ -415,9 +452,21 @@ class NativeMindChatGateway(
     }
 
     private fun snapshotToUiState(snapshot: FfiCoreSnapshot = core.snapshot()): MindChatUiState {
+        val now = System.currentTimeMillis()
         val accounts = snapshot.accounts.map { account ->
+            val accountId = account.id.toLong()
+            val connectionState = account.connectionState.toUiModel()
+            // Record when each account entered CONNECTING so a connection that
+            // never reaches a terminal state can be surfaced as stalled.
+            val connectingStart = if (connectionState == AccountConnectionState.CONNECTING) {
+                connectingSince.putIfAbsent(accountId, now)
+                connectingSince[accountId] ?: now
+            } else {
+                connectingSince.remove(accountId)
+                null
+            }
             AccountUi(
-                id = account.id.toLong(),
+                id = accountId,
                 jid = account.jid,
                 displayName = account.displayName,
                 presence = when (account.connectionState) {
@@ -427,9 +476,12 @@ class NativeMindChatGateway(
                     FfiConnectionState.FAILED,
                     -> Presence.OFFLINE
                 },
-                connectionState = account.connectionState.toUiModel(),
+                connectionState = connectionState,
                 supportsGroupChats = account.capabilities.contains(FfiProtocolCapability.MULTI_USER_CHAT),
                 connectionError = account.connectionError,
+                connectionStalled = connectionState == AccountConnectionState.CONNECTING &&
+                    connectingStart != null &&
+                    now - connectingStart > 35_000L,
             )
         }
         if (activeAccountId == 0L || accounts.none { it.id == activeAccountId }) {
@@ -571,6 +623,21 @@ class PreviewMindChatGateway(
             },
         )
         return true
+    }
+
+    override fun disconnectAccount(accountId: Long) {
+        state = state.copy(
+            accounts = state.accounts.map {
+                if (it.id == accountId) {
+                    it.copy(
+                        connectionState = AccountConnectionState.OFFLINE,
+                        connectionError = null,
+                    )
+                } else {
+                    it
+                }
+            },
+        )
     }
 
     override fun addContact(jid: String, displayName: String) {
