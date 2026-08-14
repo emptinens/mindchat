@@ -588,110 +588,156 @@ class NativeMindChatGateway(
         snapshot: FfiCoreSnapshot = core.snapshot(),
         profiles: Map<Long, AccountProfile> = profilesCache,
     ): MindChatUiState {
-        val now = System.currentTimeMillis()
-        val accounts = snapshot.accounts.map { account ->
-            val accountId = account.id.toLong()
-            val connectionState = account.connectionState.toUiModel()
-            // Record when each account entered CONNECTING so a connection that
-            // never reaches a terminal state can be surfaced as stalled.
-            val connectingStart = if (connectionState == AccountConnectionState.CONNECTING) {
-                connectingSince.putIfAbsent(accountId, now)
-                connectingSince[accountId] ?: now
-            } else {
-                connectingSince.remove(accountId)
-                null
-            }
-            AccountUi(
-                id = accountId,
-                jid = account.jid,
-                displayName = account.displayName,
-                presence = when (account.connectionState) {
-                    FfiConnectionState.ONLINE -> Presence.ONLINE
-                    FfiConnectionState.OFFLINE,
-                    FfiConnectionState.CONNECTING,
-                    FfiConnectionState.FAILED,
-                    -> Presence.OFFLINE
-                },
-                connectionState = connectionState,
-                supportsGroupChats = account.capabilities.contains(FfiProtocolCapability.MULTI_USER_CHAT),
-                connectionError = account.connectionError,
-                connectionStalled = connectionState == AccountConnectionState.CONNECTING &&
-                    connectingStart != null &&
-                    now - connectingStart > 35_000L,
-            )
+        val mapping = mapSnapshotToUiState(
+            snapshot = snapshot,
+            profiles = profiles,
+            activeAccountId = activeAccountId,
+            connectingSince = connectingSince,
+            customization = customization,
+            now = System.currentTimeMillis(),
+            timestampFormatter = ::formatTimestamp,
+        )
+        activeAccountId = mapping.activeAccountId
+        connectingSince.clear()
+        connectingSince.putAll(mapping.connectingSince)
+        return mapping.state
+    }
+}
+
+/**
+ * Pure mapping from the raw FFI snapshot to the Compose UI model. This is the
+ * data contract between the Rust core and the Android UI, extracted so both
+ * the semantics (presence translation, stall detection, reaction grouping,
+ * unread/preview derivation) and the [connectingSince] bookkeeping are
+ * deterministic and unit-testable. [now] and [timestampFormatter] are injected
+ * to keep the mapping pure; the instance method feeds wall-clock time and the
+ * locale formatter and swaps in the returned [SnapshotMapping.connectingSince].
+ */
+internal data class SnapshotMapping(
+    val state: MindChatUiState,
+    val connectingSince: Map<Long, Long>,
+    val activeAccountId: Long,
+)
+
+internal fun mapSnapshotToUiState(
+    snapshot: FfiCoreSnapshot,
+    profiles: Map<Long, AccountProfile>,
+    activeAccountId: Long,
+    connectingSince: Map<Long, Long>,
+    customization: MindChatCustomization,
+    now: Long,
+    timestampFormatter: (Long) -> String,
+): SnapshotMapping {
+    val tracking = connectingSince.toMutableMap()
+    val accounts = snapshot.accounts.map { account ->
+        val accountId = account.id.toLong()
+        val connectionState = account.connectionState.toUiModel()
+        // Record when each account entered CONNECTING so a connection that
+        // never reaches a terminal state can be surfaced as stalled.
+        val connectingStart = if (connectionState == AccountConnectionState.CONNECTING) {
+            tracking.putIfAbsent(accountId, now)
+            tracking[accountId] ?: now
+        } else {
+            tracking.remove(accountId)
+            null
         }
+        AccountUi(
+            id = accountId,
+            jid = account.jid,
+            displayName = account.displayName,
+            presence = when (account.connectionState) {
+                FfiConnectionState.ONLINE -> Presence.ONLINE
+                FfiConnectionState.OFFLINE,
+                FfiConnectionState.CONNECTING,
+                FfiConnectionState.FAILED,
+                -> Presence.OFFLINE
+            },
+            connectionState = connectionState,
+            supportsGroupChats = account.capabilities.contains(FfiProtocolCapability.MULTI_USER_CHAT),
+            connectionError = account.connectionError,
+            connectionStalled = connectionState == AccountConnectionState.CONNECTING &&
+                connectingStart != null &&
+                now - connectingStart > 35_000L,
+        )
+    }
+    val resolvedActiveAccountId =
         if (activeAccountId == 0L || accounts.none { it.id == activeAccountId }) {
-            activeAccountId = accounts.firstOrNull()?.id ?: 0L
+            accounts.firstOrNull()?.id ?: 0L
+        } else {
+            activeAccountId
         }
-        // Index reactions by message id once; the previous per-message
-        // `filter` made message mapping O(messages x reactions) and allocated
-        // a list per message on every rebuild.
-        val reactionsByMessage = snapshot.reactions.groupBy { it.messageId }
-        val messagesByConversation = snapshot.messages
-            .groupBy { it.conversationId.toLong() }
-            .mapValues { (_, messages) ->
-                messages.map { message ->
-                    val reactionLabels = reactionsByMessage[message.id]
-                        ?.groupingBy { it.emoji }
-                        ?.eachCount()
-                        ?.map { (emoji, count) -> "$emoji $count" }
-                        ?: emptyList()
-                    MessageUi(
-                        id = message.id.toLong(),
-                        sender = message.sender,
-                        body = message.body,
-                        timestamp = formatTimestamp(message.sentAtEpochMs.toLong()),
-                        mine = message.direction == FfiMessageDirection.OUTGOING,
-                        delivery = if (message.direction == FfiMessageDirection.OUTGOING) {
-                            message.deliveryState.toUiModel()
-                        } else {
-                            null
-                        },
-                        reactions = reactionLabels,
-                    )
-                }
+    // Index reactions by message id once; the previous per-message
+    // `filter` made message mapping O(messages x reactions) and allocated
+    // a list per message on every rebuild.
+    val reactionsByMessage = snapshot.reactions.groupBy { it.messageId }
+    val messagesByConversation = snapshot.messages
+        .groupBy { it.conversationId.toLong() }
+        .mapValues { (_, messages) ->
+            messages.map { message ->
+                val reactionLabels = reactionsByMessage[message.id]
+                    ?.groupingBy { it.emoji }
+                    ?.eachCount()
+                    ?.map { (emoji, count) -> "$emoji $count" }
+                    ?: emptyList()
+                MessageUi(
+                    id = message.id.toLong(),
+                    sender = message.sender,
+                    body = message.body,
+                    timestamp = timestampFormatter(message.sentAtEpochMs.toLong()),
+                    mine = message.direction == FfiMessageDirection.OUTGOING,
+                    delivery = if (message.direction == FfiMessageDirection.OUTGOING) {
+                        message.deliveryState.toUiModel()
+                    } else {
+                        null
+                    },
+                    reactions = reactionLabels,
+                )
             }
-        val contacts = snapshot.contacts.map { contact ->
-            ContactUi(
-                accountId = contact.accountId.toLong(),
-                jid = contact.jid,
-                displayName = contact.displayName,
-                presence = when (contact.presence) {
-                    FfiContactPresence.ONLINE -> Presence.ONLINE
-                    FfiContactPresence.AWAY -> Presence.AWAY
-                    FfiContactPresence.DO_NOT_DISTURB -> Presence.DO_NOT_DISTURB
-                    FfiContactPresence.OFFLINE,
-                    -> Presence.OFFLINE
-                },
-                status = contact.status,
-            )
         }
-        val conversations = snapshot.conversations.map { conversation ->
-            val messages = messagesByConversation[conversation.id.toLong()].orEmpty()
-            ConversationUi(
-                id = conversation.id.toLong(),
-                accountId = conversation.accountId.toLong(),
-                title = conversation.title,
-                address = conversation.address,
-                preview = messages.lastOrNull()?.body.orEmpty(),
-                timestamp = formatTimestamp(conversation.lastActivityEpochMs.toLong()),
-                unreadCount = conversation.unreadCount.toInt(),
-                isGroup = conversation.kind == FfiConversationKind.MULTI_USER_CHAT,
-                lastActivityEpochMs = conversation.lastActivityEpochMs.toLong(),
-            )
-        }
-        return MindChatUiState(
+    val contacts = snapshot.contacts.map { contact ->
+        ContactUi(
+            accountId = contact.accountId.toLong(),
+            jid = contact.jid,
+            displayName = contact.displayName,
+            presence = when (contact.presence) {
+                FfiContactPresence.ONLINE -> Presence.ONLINE
+                FfiContactPresence.AWAY -> Presence.AWAY
+                FfiContactPresence.DO_NOT_DISTURB -> Presence.DO_NOT_DISTURB
+                FfiContactPresence.OFFLINE,
+                -> Presence.OFFLINE
+            },
+            status = contact.status,
+        )
+    }
+    val conversations = snapshot.conversations.map { conversation ->
+        val messages = messagesByConversation[conversation.id.toLong()].orEmpty()
+        ConversationUi(
+            id = conversation.id.toLong(),
+            accountId = conversation.accountId.toLong(),
+            title = conversation.title,
+            address = conversation.address,
+            preview = messages.lastOrNull()?.body.orEmpty(),
+            timestamp = timestampFormatter(conversation.lastActivityEpochMs.toLong()),
+            unreadCount = conversation.unreadCount.toInt(),
+            isGroup = conversation.kind == FfiConversationKind.MULTI_USER_CHAT,
+            lastActivityEpochMs = conversation.lastActivityEpochMs.toLong(),
+        )
+    }
+    return SnapshotMapping(
+        state = MindChatUiState(
             accounts = accounts,
             contacts = contacts,
-            activeAccountId = activeAccountId,
+            activeAccountId = resolvedActiveAccountId,
             conversations = conversations,
             messagesByConversation = messagesByConversation,
             profiles = profiles,
             dynamicColor = customization.dynamicColor,
             comfortableLayout = customization.comfortableLayout,
             appLockEnabled = customization.appLockEnabled,
-        )
-    }
+        ),
+        connectingSince = tracking,
+        activeAccountId = resolvedActiveAccountId,
+    )
 }
 
 private fun FfiConnectionState.toUiModel(): AccountConnectionState = when (this) {

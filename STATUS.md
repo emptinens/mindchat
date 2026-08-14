@@ -272,6 +272,16 @@ implementations are structurally identical instead of merely similar;
 `GatewayInputTest` (9 tests) pins the rules, including the exact UI-safe
 refusal strings.
 
+The Kotlin↔Rust data contract is pinned by `SnapshotMappingTest` (16 tests):
+the pure `mapSnapshotToUiState` mapping from the generated `FfiCoreSnapshot`
+DTOs to the Compose UI model covers presence/connection translation,
+CONNECTING stall tracking (35 s threshold, cleanup on terminal state),
+active-account resolution, message direction/delivery, reaction grouping by
+emoji, conversation preview/unread/group derivation, contact presence, and
+profile/customization flow-through. Time and the timestamp formatter are
+injected, so the rules are deterministic; the native gateway now delegates
+to the same pure function with wall-clock time and the locale formatter.
+
 The Kotlin↔Rust integration boundary is re-validated against the current
 Rust source: `scripts/generate-uniffi-kotlin.sh` rebuilt the release cdylib
 and regenerated the Kotlin bindings with uniffi-bindgen 0.32.0 (task
