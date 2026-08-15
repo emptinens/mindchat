@@ -80,57 +80,11 @@ rustls-any-backend = ["dep:tokio-rustls"]
 rustls-native-certs = ["dep:rustls-native-certs"]
 serde = ["xmpp-parsers/serde"]
 starttls = ["dns"]
-syntax-highlighting = ["syntect"]
 webpki-roots = ["dep:webpki-roots"]
 
 [lib]
 name = "tokio_xmpp"
 path = "src/lib.rs"
-
-[[example]]
-name = "contact_addr"
-path = "examples/contact_addr.rs"
-required-features = [
-    "starttls",
-    "aws_lc_rs",
-]
-
-[[example]]
-name = "download_avatars"
-path = "examples/download_avatars.rs"
-required-features = [
-    "starttls",
-    "aws_lc_rs",
-]
-
-[[example]]
-name = "echo_bot"
-path = "examples/echo_bot.rs"
-required-features = [
-    "starttls",
-    "aws_lc_rs",
-]
-
-[[example]]
-name = "echo_component"
-path = "examples/echo_component.rs"
-required-features = [
-    "starttls",
-    "insecure-tcp",
-]
-
-[[example]]
-name = "echo_server"
-path = "examples/echo_server.rs"
-required-features = [
-    "starttls",
-    "aws_lc_rs",
-]
-
-[[example]]
-name = "keep_connection"
-path = "examples/keep_connection.rs"
-required-features = ["starttls"]
 
 [dependencies.bytes]
 version = "1"
@@ -149,9 +103,6 @@ optional = true
 [dependencies.ktls]
 version = "6"
 optional = true
-
-[dependencies.log]
-version = "0.4"
 
 [dependencies.native-tls]
 version = "0.2"
@@ -177,10 +128,6 @@ features = [
 [dependencies.sasl]
 version = "0.5"
 
-[dependencies.syntect]
-version = "5"
-optional = true
-
 [dependencies.thiserror]
 version = "2.0"
 
@@ -201,7 +148,6 @@ optional = true
 [dependencies.tokio-rustls]
 version = "0.26"
 features = [
-    "logging",
     "tls12",
 ]
 optional = true
@@ -217,23 +163,13 @@ optional = true
 
 [dependencies.xmpp-parsers]
 version = "0.23"
-features = ["log"]
 
 [dependencies.xso]
 version = "0.4"
 
-[dev-dependencies.env_logger]
-version = "0.11"
-features = [
-    "auto-color",
-    "humantime",
-]
-default-features = false
-
 [dev-dependencies.tokio]
 version = "1"
 features = [
-    "signal",
     "test-util",
 ]
 

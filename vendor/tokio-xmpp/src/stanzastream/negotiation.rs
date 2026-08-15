@@ -107,8 +107,6 @@ impl NegotiationState {
                     sm_state: Some(sm_state),
                     bound_jid: None,
                 });
-            } else {
-                log::warn!("Peer is not offering stream management anymore. Dropping state.");
             }
         }
 
@@ -231,7 +229,6 @@ impl NegotiationState {
                                 }
                                 _ => "Unexpected IQ type in response to bind request".to_owned(),
                             };
-                            log::warn!("Received IQ matching the bind request, but parsing failed ({error})! Emitting stream error.");
                             Poll::Ready(Break(NegotiationResult::StreamError {
                                 error: StreamError::new(
                                     DefinedCondition::UndefinedCondition,
@@ -241,14 +238,12 @@ impl NegotiationState {
                                 .with_application_specific(vec![super::error::ParseError.into()]),
                             }))
                         }
-                        st => {
-                            log::warn!("Received unexpected stanza before response to bind request: {st:?}. Dropping.");
+                        _ => {
                             Poll::Ready(Continue(None))
                         }
                     },
 
                     Ok(XmppStreamElement::StreamError(error)) => {
-                        log::debug!("Received stream:error, failing stream and discarding any stream management state.");
                         let error = io::Error::other(error);
                         transmit_queue.fail(&(&error).into());
                         Poll::Ready(Break(NegotiationResult::Disconnect {
@@ -258,7 +253,6 @@ impl NegotiationState {
                     }
 
                     Ok(other) => {
-                        log::warn!("Received unsupported stream element during bind: {other:?}. Emitting stream error.");
                         Poll::Ready(Break(NegotiationResult::StreamError {
                             error: StreamError::new(
                                 DefinedCondition::UnsupportedStanzaType,
@@ -400,13 +394,6 @@ impl NegotiationState {
                     Ok(XmppStreamElement::Stanza(data)) => Poll::Ready(Continue(Some(data))),
 
                     Ok(XmppStreamElement::SM(sm::Nonza::Enabled(enabled))) => {
-                        if sm_state.is_some() {
-                            // Okay, the peer violated the stream management
-                            // protocol here (or we have a bug).
-                            log::warn!(
-                                "Received <enabled/>, but we also have previous SM state. One of us has a bug here (us or the peer) and I'm not sure which it is. If you can reproduce this, please re-run with trace loglevel and provide the logs. Attempting to proceed with a fresh session.",
-                            );
-                        }
                         // We must emit Reset here because this is a
                         // fresh stream and we did not resume.
                         Poll::Ready(Break(NegotiationResult::StreamReset {
@@ -423,7 +410,6 @@ impl NegotiationState {
                                 Ok(to_retransmit) => transmit_queue.requeue_all(to_retransmit),
                                 Err(e) => {
                                     // We kill the stream with an error
-                                    log::error!("Resumption failed: {e}");
                                     return Poll::Ready(Break(NegotiationResult::StreamError {
                                         error: e.into(),
                                     }));
@@ -453,7 +439,6 @@ impl NegotiationState {
 
                     Ok(XmppStreamElement::SM(sm::Nonza::Failed(failed))) => match sm_state {
                         Some(sm_state) => {
-                            log::debug!("Received <sm:failed/> in response to resumption request. Discarding SM data and attempting to renegotiate.");
                             if let Some(h) = failed.h {
                                 // This is only an optimization anyway, so
                                 // we can also just ignore this.
@@ -463,7 +448,7 @@ impl NegotiationState {
                             Poll::Ready(Continue(None))
                         }
                         None => {
-                            log::warn!("Received <sm:failed/> in response to enable request. Proceeding without stream management.");
+                            // Proceeding without stream management.
 
                             // We must emit Reset here because this is a
                             // fresh stream and we did not resume.
@@ -475,7 +460,6 @@ impl NegotiationState {
                     },
 
                     Ok(XmppStreamElement::StreamError(error)) => {
-                        log::debug!("Received stream error, failing stream and discarding any stream management state.");
                         let error = io::Error::other(error);
                         transmit_queue.fail(&(&error).into());
                         Poll::Ready(Break(NegotiationResult::Disconnect {
@@ -485,7 +469,6 @@ impl NegotiationState {
                     }
 
                     Ok(other) => {
-                        log::warn!("Received unsupported stream element during negotiation: {other:?}. Emitting stream error.");
                         Poll::Ready(Break(NegotiationResult::StreamError {
                             error: StreamError::new(
                                 DefinedCondition::UnsupportedStanzaType,

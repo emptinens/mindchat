@@ -54,7 +54,6 @@ fn pump_until_terminal(
 #[test]
 fn live_ffi_connect_reaches_terminal_state_not_stuck_connecting() {
     if !live_enabled() {
-        eprintln!("skipped: set MINDCHAT_LIVE_TESTS=1");
         return;
     }
     let server = live_server();
@@ -73,11 +72,6 @@ fn live_ffi_connect_reaches_terminal_state_not_stuck_connecting() {
     let started = Instant::now();
     let (state, error) =
         pump_until_terminal(&handle, account_id, started + Duration::from_secs(35));
-    eprintln!(
-        "terminal state after {:?}: {state:?} error={:?}",
-        started.elapsed(),
-        error.as_deref().unwrap_or("<none>")
-    );
     // Bogus credentials on a reachable server must end in a terminal Failed
     // state with a UI-safe detail, not Connecting.
     assert_eq!(state, FfiConnectionState::Failed, "bogus credentials must fail authentication");
@@ -92,20 +86,13 @@ fn live_ffi_connect_reaches_terminal_state_not_stuck_connecting() {
         .connect_account(account_id, "still-wrong-password".to_owned())
         .expect("retry connect must start a fresh worker");
     let started = Instant::now();
-    let (state, error) =
-        pump_until_terminal(&handle, account_id, started + Duration::from_secs(35));
-    eprintln!(
-        "retry terminal state after {:?}: {state:?} error={:?}",
-        started.elapsed(),
-        error.as_deref().unwrap_or("<none>")
-    );
+    let (state, _) = pump_until_terminal(&handle, account_id, started + Duration::from_secs(35));
     assert_eq!(state, FfiConnectionState::Failed, "retry must fail identically");
 }
 
 #[test]
 fn live_ffi_disconnect_cancels_an_in_flight_connect() {
     if !live_enabled() {
-        eprintln!("skipped: set MINDCHAT_LIVE_TESTS=1");
         return;
     }
     let handle = MindChatCoreHandle::new();
@@ -130,7 +117,6 @@ fn live_ffi_disconnect_cancels_an_in_flight_connect() {
     let started = Instant::now();
     handle.disconnect_account(account_id).expect("disconnect during Connecting must succeed");
     let elapsed = started.elapsed();
-    eprintln!("disconnect during Connecting completed in {elapsed:?}");
     assert!(
         elapsed <= Duration::from_secs(5),
         "cancel during Connecting took {elapsed:?}, exceeding the 5 s bound"

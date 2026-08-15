@@ -88,9 +88,6 @@ pub(super) enum WorkerEvent {
     Disconnected {
         /// Slot for a new connection.
         slot: oneshot::Sender<Result<Connection, crate::Error>>,
-
-        /// Set to None if the stream was cleanly closed by the remote side.
-        error: Option<io::Error>,
     },
 
     /// The connector reported a fatal error (e.g. authentication was
@@ -111,10 +108,7 @@ enum WorkerStream {
     /// Pending connection.
     Connecting {
         /// Optional contents of an [`WorkerEvent::Disconnect`] to emit.
-        notify: Option<(
-            oneshot::Sender<Result<Connection, crate::Error>>,
-            Option<io::Error>,
-        )>,
+        notify: Option<oneshot::Sender<Result<Connection, crate::Error>>>,
 
         /// Receiver slot for the next connection.
         slot: oneshot::Receiver<Result<Connection, crate::Error>>,
@@ -136,14 +130,14 @@ enum WorkerStream {
 }
 
 impl WorkerStream {
-    fn disconnect(&mut self, sm_state: Option<SmState>, error: Option<io::Error>) -> WorkerEvent {
+    fn disconnect(&mut self, sm_state: Option<SmState>, _error: Option<io::Error>) -> WorkerEvent {
         let (tx, rx) = oneshot::channel();
         *self = Self::Connecting {
             notify: None,
             slot: rx,
             sm_state,
         };
-        WorkerEvent::Disconnected { slot: tx, error }
+        WorkerEvent::Disconnected { slot: tx }
     }
 
     fn poll_duplex(
@@ -165,8 +159,8 @@ impl WorkerStream {
                     slot,
                     sm_state,
                 } => {
-                    if let Some((slot, error)) = notify.take() {
-                        return Poll::Ready(Some(WorkerEvent::Disconnected { slot, error }));
+                    if let Some(slot) = notify.take() {
+                        return Poll::Ready(Some(WorkerEvent::Disconnected { slot }));
                     }
 
                     match ready!(Pin::new(slot).poll(cx)) {
@@ -236,10 +230,6 @@ impl WorkerStream {
                         }
 
                         Some(ConnectedEvent::RemoteShutdown { sm_state }) => {
-                            let error = io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "peer closed the XML stream",
-                            );
                             let (tx, rx) = oneshot::channel();
                             let mut new_state = Self::Connecting {
                                 notify: None,
@@ -259,7 +249,6 @@ impl WorkerStream {
 
                             return Poll::Ready(Some(WorkerEvent::Disconnected {
                                 slot: tx,
-                                error: Some(error),
                             }));
                         }
 
@@ -441,10 +430,8 @@ pub(super) struct StanzaStreamWorker {
 macro_rules! send_or_break {
     ($value:expr => $permit:ident in $ch:expr, $txq:expr => $stream:expr$(,)?) => {
         if let Some(permit) = $permit.take() {
-            log::trace!("stanza received, passing to frontend via permit");
             permit.send($value);
         } else {
-            log::trace!("no permit for received stanza available, blocking on channel send while handling writes");
             tokio::select! {
                 // drive_writes never completes: I/O errors are reported on
                 // the next call to drive_duplex(), which makes it ideal for
@@ -528,18 +515,12 @@ impl StanzaStreamWorker {
                             Event::Stream(StreamEvent::Reset { bound_jid, features }) => permit in self.frontend_tx,
                             self.transmit_queue => self.stream,
                         ),
-                        WorkerEvent::Disconnected { slot, error } => {
+                        WorkerEvent::Disconnected { slot, .. } => {
                             send_or_break!(
                                 Event::Stream(StreamEvent::Suspended) => permit in self.frontend_tx,
                                 self.transmit_queue => self.stream,
                             );
-                            if let Some(error) = error {
-                                log::debug!("Backend stream got disconnected because of an I/O error: {error}. Attempting reconnect.");
-                            } else {
-                                log::debug!("Backend stream got disconnected for an unknown reason. Attempting reconnect.");
-                            }
                             if self.frontend_tx.is_closed() || self.transmit_queue.is_closed() {
-                                log::debug!("Immediately aborting reconnect because the frontend is gone.");
                                 break;
                             }
                             (self.reconnector)(None, slot);
@@ -553,16 +534,12 @@ impl StanzaStreamWorker {
                             self.transmit_queue => self.stream,
                         ),
                         WorkerEvent::ParseError(e) => {
-                            log::error!("Parse error on stream: {e}");
                             self.stream.start_send_stream_error(parse_error_to_stream_error(e));
                             // We are not break-ing here, because drive_duplex
                             // is sending the error.
                         }
                         WorkerEvent::SoftTimeout => {
-                            if self.stream.queue_sm_request() {
-                                log::debug!("SoftTimeout tripped: enqueued <sm:r/>");
-                            } else {
-                                log::debug!("SoftTimeout tripped. Stream Management is not enabled, enqueueing ping IQ");
+                            if !self.stream.queue_sm_request() {
                                 ping_probe_ctr = ping_probe_ctr.wrapping_add(1);
                                 // We can leave to/from blank because those
                                 // are not needed to send a ping to the peer.
@@ -576,10 +553,6 @@ impl StanzaStreamWorker {
                             }
                         }
                         WorkerEvent::Fatal { error } => {
-                            log::error!(
-                                "Stream failed terminally: {}. No reconnect will be attempted.",
-                                error
-                            );
                             send_or_break!(
                                 Event::Stream(StreamEvent::Fatal(error)) => permit in self.frontend_tx,
                                 self.transmit_queue => self.stream,
@@ -594,8 +567,8 @@ impl StanzaStreamWorker {
             }
         }
         match self.stream.close().await {
-            Ok(()) => log::debug!("Stream closed successfully"),
-            Err(e) => log::debug!("Stream closure failed: {e}"),
+            Ok(()) => (),
+            Err(_) => (),
         }
     }
 }
@@ -612,7 +585,6 @@ async fn shutdown_stream_by_remote_choice(mut stream: XmppStream, timeout: Durat
         Ok(_) => (),
         // .. but if we run in a timeout, we exit here right away.
         Err(_) => {
-            log::debug!("Giving up on clean stream shutdown after timeout elapsed.");
             return;
         }
     }
@@ -621,17 +593,14 @@ async fn shutdown_stream_by_remote_choice(mut stream: XmppStream, timeout: Durat
     loop {
         tokio::select! {
             _ = &mut timeout => {
-                log::debug!("Giving up on clean stream shutdown after timeout elapsed.");
                 break;
             }
             ev = stream.next() => match ev {
                 None => break,
-                Some(Ok(data)) => {
-                    log::debug!("Ignoring data on stream during shutdown: {data:?}");
+                Some(Ok(_)) => {
                     break;
                 }
-                Some(Err(ReadError::HardError(e))) => {
-                    log::debug!("Ignoring stream I/O error during shutdown: {e}");
+                Some(Err(ReadError::HardError(_))) => {
                     break;
                 }
                 Some(Err(ReadError::SoftTimeout)) => (),

@@ -103,10 +103,83 @@ scripts/generate-uniffi-kotlin.sh
    `eprintln`, `android.util.Log`, `Timber`, `env_logger`, `tracing`, log
    files, or diagnostics zips) anywhere in the tracked tree. Debugging
    happens through typed errors, unit tests, and the gated live suite.
-   A CI grep gate (`scripts/check-zero-log.sh`, planned for 0.1.8) enforces
-   this mechanically; today it is a review requirement.
+   Enforced mechanically by `scripts/check-zero-log.sh` in CI (see the
+   "Zero-log gate" section below) and by the compile-time kill switch
+   (`max_level_off`/`release_max_level_off` on the direct `log` and
+   `tracing` deps of `mindchat-core`).
 6. Docs: user-visible behavior changes are reflected in `CHANGELOG.md`
    (Unreleased section), and `ROADMAP.md` when the roadmap moves.
+
+## Zero-log gate
+
+The product contract (ROADMAP 3.4) forbids every logging emission point.
+`scripts/check-zero-log.sh` enforces it mechanically:
+
+- **Source scan.** `git ls-files` over tracked Rust/Kotlin/Gradle/shell
+  sources, rejecting `log::`, `tracing::`, `println!`, `eprintln!`, `dbg!`,
+  `android.util.Log`, `Timber`, `System.out`/`System.err`, and the
+  vestigial `mindchat-diagnostics` name. Failures print `file:line`.
+  Documentation prose that quotes these strings is exempt (only source
+  extensions are scanned).
+- **`.so` strings pass.** Every `libmindchat_core.so` under
+  `app/src/main/jniLibs`, `app/build`, or an explicit `--so-dir` must not
+  contain the purged vendor format strings (`RECV`, `SEND `,
+  `Attempting connection`). A host without an NDK prints
+  `SKIPPED: no .so found` and exits 0; `--strict-so` turns that into a
+  failure (CI always has the libraries).
+- **Kill-switch confirmation** (optional `--cargo-tree`): verifies
+  `cargo tree -p mindchat-core --offline` shows `max_level_off` and
+  `release_max_level_off` unified into the `log` and `tracing` crates.
+
+```sh
+bash scripts/check-zero-log.sh                        # local (grep + .so if present)
+bash scripts/check-zero-log.sh --strict-so            # CI-style: missing .so fails
+bash scripts/check-zero-log.sh --strict-so --so-dir jniLibs --cargo-tree
+```
+
+In CI (`verify.yml`) the `zero-log` job depends on the `android` job, which
+uploads the freshly built `app/build/generated/jniLibs`; the job downloads
+it and runs with `--strict-so` plus `--cargo-tree`. Debugging happens
+through typed errors, unit tests, and the gated live suite, never through
+runtime logging.
+
+## Vendored tokio-xmpp patch
+
+`vendor/tokio-xmpp/` is a deliberate, patched vendored copy of tokio-xmpp
+6.0.0, selected via `[patch.crates-io]` in the root `Cargo.toml`. Beyond the
+transport fixes noted in the root manifest comment, the tree carries the
+**0.1.8 zero-log purge** (ROADMAP 6.1). Every diff from upstream is marked
+`// MindChat patch:` where it touches control flow; deletions below are
+unmarked because upstream simply does not contain them:
+
+- **Deleted the raw-stanza capture path**
+  (`src/xmlstream/capture.rs`, its call sites in
+  `src/xmlstream/common.rs`, and the `LogXsoBuf`/syntect syntax-highlighting
+  machinery in `src/xmlstream/mod.rs`). This was the only code able to
+  serialize message bodies (the `RECV`/`SEND` trace path). It is deleted,
+  not gated: no env var can resurrect it.
+- **Removed all `log::*` call sites** in `src/stanzastream/*`,
+  `src/connect/*`, `src/client/iq.rs`, and the XML-stream layer (~75
+  sites; control flow that only fed a log arm was simplified, e.g. the
+  unused `error` field on `WorkerEvent::Disconnected`).
+- **Deleted `examples/`** (six demo binaries that printed JIDs and
+  passwords) and the `[[example]]` sections from both `Cargo.toml` and
+  `Cargo.toml.orig`.
+- **Manifest pruning** in `Cargo.toml`/`Cargo.toml.orig`: dropped
+  `tokio-rustls` feature `logging`, `xmpp-parsers` feature `log`,
+  `[dependencies.log]`, `[dev-dependencies.env_logger]`, the optional
+  `syntect` dep (`syntax-highlighting` feature), and the unused `signal`
+  dev-feature.
+- **Live tests** in `crates/mindchat-core/tests/` no longer init
+  `env_logger` and replaced every `eprintln!` with a silent skip; failures
+  speak through assert messages.
+
+The compile-time kill switch lives in `crates/mindchat-core/Cargo.toml`:
+`log` and `tracing` are direct dependencies with `max_level_off` and
+`release_max_level_off`, so feature unification compiles every transitive
+`log::*`/`tracing::*` call site (rustls, hickory, vendor) to nothing in
+debug and release builds. Keep it: never remove those two deps, and never
+re-introduce a `log`/`tracing` emission point in the vendored tree.
 
 ## Security invariants
 

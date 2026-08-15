@@ -31,8 +31,6 @@ use xso::{
 
 use crate::connect::AsyncReadAndWrite;
 
-use super::capture::{log_enabled, log_recv, log_send, CaptureBufRead};
-
 use xmpp_parsers::ns::STREAM as XML_STREAM_NS;
 
 /// Configuration for timeouts on an XML stream.
@@ -165,7 +163,7 @@ pin_project_lite::pin_project! {
     pub(super) struct RawXmlStream<Io> {
         // The parser used for deserialising data.
         #[pin]
-        parser: rxml::AsyncReader<CaptureBufRead<Io>>,
+        parser: rxml::AsyncReader<Io>,
 
         // Tracker for `xml:lang` data.
         lang_stack: XmlLangStack,
@@ -183,10 +181,6 @@ pin_project_lite::pin_project! {
         // `poll_ready` and `poll_flush`, while appending serialised data
         // happens in `start_send`.
         tx_buffer: BytesMut,
-
-        // Position inside tx_buffer up to which to-be-sent data has already
-        // been logged.
-        tx_buffer_logged: usize,
 
         // This signifies the limit at the point of which the Sink will
         // refuse to accept more data: if the `tx_buffer`'s size grows beyond
@@ -252,16 +246,11 @@ impl<Io: AsyncBufRead + AsyncWrite> RawXmlStream<Io> {
 
     pub(super) fn new(io: Io, stream_ns: &'static str, timeouts: Timeouts) -> Self {
         let parser = rxml::Parser::default();
-        let mut io = CaptureBufRead::wrap(io);
-        if log_enabled() {
-            io.enable_capture();
-        }
         Self {
             parser: rxml::AsyncReader::wrap(io, parser),
             writer: Self::new_writer(stream_ns),
             lang_stack: XmlLangStack::new(),
             timeouts: TimeoutState::new(timeouts),
-            tx_buffer_logged: 0,
             stream_ns,
             tx_buffer: BytesMut::new(),
 
@@ -281,7 +270,7 @@ impl<Io: AsyncBufRead + AsyncWrite> RawXmlStream<Io> {
     }
 
     pub(super) fn into_inner(self) -> Io {
-        self.parser.into_inner().0.into_inner()
+        self.parser.into_inner().0
     }
 
     /// Box the underlying transport stream.
@@ -293,18 +282,13 @@ impl<Io: AsyncBufRead + AsyncWrite> RawXmlStream<Io> {
         Io: AsyncReadAndWrite + Send + 'static,
     {
         let (io, p) = self.parser.into_inner();
-        let mut io = CaptureBufRead::wrap(Box::new(io) as Box<_>);
-        if log_enabled() {
-            io.enable_capture();
-        }
-        let parser = rxml::AsyncReader::wrap(io, p);
+        let parser = rxml::AsyncReader::wrap(Box::new(io) as Box<_>, p);
         RawXmlStream {
             parser,
             lang_stack: self.lang_stack,
             timeouts: self.timeouts,
             writer: self.writer,
             tx_buffer: self.tx_buffer,
-            tx_buffer_logged: self.tx_buffer_logged,
             tx_buffer_high_water_mark: self.tx_buffer_high_water_mark,
             stream_ns: self.stream_ns,
         }
@@ -328,13 +312,7 @@ impl<Io: AsyncWrite> RawXmlStream<Io> {
         match this.try_send_xso(xso) {
             Ok(()) => Ok(()),
             Err(e) => {
-                let curr_len = this.tx_buffer.len();
                 this.tx_buffer.truncate(prev_len);
-                log::trace!(
-                    "SEND failed: {}. Rewinding buffer by {} bytes.",
-                    e,
-                    curr_len - prev_len
-                );
                 Err(e)
             }
         }
@@ -346,12 +324,8 @@ impl<Io> RawXmlStream<Io> {
         self.project().parser.parser_pinned()
     }
 
-    fn stream_pinned(self: Pin<&mut Self>) -> Pin<&mut CaptureBufRead<Io>> {
-        self.project().parser.inner_pinned()
-    }
-
     pub(super) fn get_stream(&self) -> &Io {
-        self.parser.inner().inner()
+        self.parser.inner()
     }
 }
 
@@ -393,15 +367,6 @@ impl<Io: AsyncBufRead> Stream for RawXmlStream<Io> {
 }
 
 impl<Io: AsyncWrite> RawXmlStreamProj<'_, Io> {
-    fn flush_tx_log(&mut self) {
-        let range = &self.tx_buffer[*self.tx_buffer_logged..];
-        if range.is_empty() {
-            return;
-        }
-        log_send(range);
-        *self.tx_buffer_logged = self.tx_buffer.len();
-    }
-
     fn start_send(&mut self, item: &xso::Item<'_>) -> io::Result<()> {
         self.writer
             .encode_into_bytes(item.as_rxml_item(), self.tx_buffer)
@@ -424,7 +389,6 @@ impl<Io: AsyncWrite> RawXmlStreamProj<'_, Io> {
     }
 
     fn progress_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.flush_tx_log();
         while !self.tx_buffer.is_empty() {
             let written = match ready!(self
                 .parser
@@ -436,10 +400,6 @@ impl<Io: AsyncWrite> RawXmlStreamProj<'_, Io> {
                 Err(e) => return Poll::Ready(Err(e)),
             };
             self.tx_buffer.advance(written);
-            *self.tx_buffer_logged = self
-                .tx_buffer_logged
-                .checked_sub(written)
-                .expect("Buffer arithmetic error");
         }
         Poll::Ready(Ok(()))
     }
@@ -629,13 +589,10 @@ impl<T: FromXml> ReadXsoState<T> {
             let ev = ready!(source.as_mut().poll_next(cx)).transpose();
             match self {
                 ReadXsoState::PreData => {
-                    log::trace!("ReadXsoState::PreData ev = {:?}", ev);
                     match ev {
                         Ok(Some(rxml::Event::XmlDeclaration(_, _))) => (),
                         Ok(Some(rxml::Event::Text(_, data))) => {
                             if xso::is_xml_whitespace(data.as_bytes()) {
-                                log::trace!("Received {} bytes of whitespace", data.len());
-                                source.as_mut().stream_pinned().discard_capture();
                                 continue;
                             } else {
                                 *self = ReadXsoState::Done;
@@ -681,7 +638,6 @@ impl<T: FromXml> ReadXsoState<T> {
                     }
                 }
                 ReadXsoState::Parsing(builder) => {
-                    log::trace!("ReadXsoState::Parsing ev = {:?}", ev);
                     let ev = match ev {
                         Ok(Some(ev)) => ev,
                         Ok(None) => {
@@ -713,7 +669,6 @@ impl<T: FromXml> ReadXsoState<T> {
                     match builder.feed(ev, &ctx) {
                         Err(err) => {
                             *self = ReadXsoState::Done;
-                            source.as_mut().stream_pinned().discard_capture();
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 err,
@@ -722,12 +677,10 @@ impl<T: FromXml> ReadXsoState<T> {
                         }
                         Ok(Some(Err(err))) => {
                             *self = ReadXsoState::Done;
-                            log_recv(Some(&err), source.as_mut().stream_pinned().take_capture());
                             return Poll::Ready(Err(ReadXsoError::Parse(err)));
                         }
                         Ok(Some(Ok(value))) => {
                             *self = ReadXsoState::Done;
-                            log_recv(None, source.as_mut().stream_pinned().take_capture());
                             return Poll::Ready(Ok(value));
                         }
                         Ok(None) => (),

@@ -5,8 +5,6 @@ use futures::{future::select_ok, FutureExt};
 use hickory_resolver::{
     config::LookupIpStrategy, proto::rr::IntoName, proto::rr::RData, TokioResolver,
 };
-#[cfg(feature = "dns")]
-use log::debug;
 use tokio::net::TcpStream;
 
 use crate::Error;
@@ -158,7 +156,6 @@ impl DnsConfig {
         let ascii_domain = idna::domain_to_ascii(host)?;
 
         if let Ok(ip) = ascii_domain.parse() {
-            debug!("Attempting connection to {ip}:{fallback_port}");
             return Ok(TcpStream::connect(&SocketAddr::new(ip, fallback_port)).await?);
         }
 
@@ -175,7 +172,6 @@ impl DnsConfig {
                         continue;
                     };
 
-                    debug!("Attempting connection to {srv_domain} {srv}");
                     if let Ok(stream) =
                         Self::resolve_no_srv(&srv.target.to_ascii(), srv.port, &resolver_ref).await
                     {
@@ -186,7 +182,6 @@ impl DnsConfig {
             }
             None => {
                 // SRV lookup error, retry with hostname
-                debug!("Attempting connection to {host}:{fallback_port}");
                 Self::resolve_no_srv(host, fallback_port, &resolver_ref).await
             }
         }

@@ -114,9 +114,6 @@ pub async fn establish_tls_connection<S: TlsAsyncStream>(
         .connect(&domain, stream)
         .await
         .map_err(|e| TlsConnectorError::Tls(e))?;
-    log::warn!(
-        "tls-native doesn't support channel binding, please use tls-rust if you want this feature!"
-    );
     Ok((tls_stream, ChannelBinding::None))
 }
 

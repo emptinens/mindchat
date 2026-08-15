@@ -150,10 +150,6 @@ impl SmState {
         }
 
         self.unacked_stanzas.push_back(entry);
-        log::trace!(
-            "Stored stanza in SmState. We are now at {} unacked stanzas.",
-            self.unacked_stanzas.len()
-        );
     }
 
     /// Process resumption.
@@ -171,12 +167,10 @@ impl SmState {
 
     /// Process remote `<a/>`
     pub fn remote_acked(&mut self, h: u32) -> Result<(), SmError> {
-        log::debug!("remote_acked: {self:?}::remote_acked({h})");
         // XEP-0198 specifies that counters are mod 2^32, which is handy when
         // you use u32 data types :-).
         let to_drop = h.wrapping_sub(self.outbound_base) as usize;
         if to_drop > 0 {
-            log::trace!("remote_acked: need to drop {to_drop} stanzas");
             if to_drop > self.unacked_stanzas.len() {
                 if to_drop as u32 > u32::MAX / 2 {
                     // If we look at the stanza counter values as RFC 1982
@@ -200,10 +194,8 @@ impl SmState {
                 entry.token.send_replace(StanzaState::Acked {});
             }
             self.outbound_base = h;
-            log::debug!("remote_acked: remote acked {to_drop} stanzas");
             Ok(())
         } else {
-            log::trace!("remote_acked: no stanzas to drop");
             Ok(())
         }
     }
@@ -241,7 +233,6 @@ impl From<sm::Enabled> for SmState {
                     id: id.0,
                 },
                 None => {
-                    log::warn!("peer replied with <enable resume='true'/>, but without an ID! cannot make this stream resumable.");
                     SmResumeInfo::NotResumable
                 }
             }

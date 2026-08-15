@@ -24,6 +24,12 @@ xmpp-transport = ["dep:futures", "dep:hickory-resolver", "dep:tokio", "dep:tokio
 live-login-tests = ["xmpp-transport"]
 
 [dependencies]
+# Compile-time zero-log kill switch: these features make every `log::*`/
+# `tracing::*` call site in the transitive tree (rustls, hickory, vendor)
+# compile to nothing in both debug and release builds. They are direct deps
+# so feature unification is guaranteed.
+log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
+tracing = { version = "0.1", default-features = false, features = ["max_level_off", "release_max_level_off"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = { version = "0.3.31", optional = true }
@@ -34,7 +40,6 @@ uniffi = { version = "0.32.0", default-features = false, optional = true }
 xmpp-parsers = { version = "0.23.0", optional = true }
 
 [dev-dependencies]
-env_logger = "0.11"
 
 [[test]]
 name = "live_login"

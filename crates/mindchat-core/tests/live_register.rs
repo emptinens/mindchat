@@ -23,7 +23,6 @@ fn live_server() -> String {
 #[test]
 fn live_register_flow_reaches_a_terminal_result() {
     if !live_enabled() {
-        eprintln!("skipped: set MINDCHAT_LIVE_REGISTER=1");
         return;
     }
     let server = live_server();
@@ -38,7 +37,6 @@ fn live_register_flow_reaches_a_terminal_result() {
         "live register".to_owned(),
         password,
     );
-    eprintln!("register_account returned after {:?}", started.elapsed());
 
     match result {
         Ok(account_id) => {
@@ -56,10 +54,6 @@ fn live_register_flow_reaches_a_terminal_result() {
                     panic!("registered account {account_id} disappeared from the snapshot");
                 };
                 if account.connection_state != FfiConnectionState::Connecting {
-                    eprintln!(
-                        "registered account reached terminal state {:?} error={:?}",
-                        account.connection_state, account.connection_error
-                    );
                     assert!(
                         matches!(
                             account.connection_state,
@@ -77,7 +71,6 @@ fn live_register_flow_reaches_a_terminal_result() {
         Err(error) => {
             // A refusal must be a UI-safe, non-empty detail. The variants that
             // carry a `detail` string are exactly the ones Kotlin can render.
-            eprintln!("registration refused after {:?}: {error}", started.elapsed());
             match &error {
                 MindChatBindingError::ConnectionFailed { detail }
                 | MindChatBindingError::InvalidInput { detail }

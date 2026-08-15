@@ -40,6 +40,34 @@ jobs:
       - run: cargo install cargo-ndk --version 4.1.2 --locked && cargo install uniffi --version 0.32.0 --features cli --locked
       - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh
       - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug --no-daemon --max-workers=2
+      # Ship the freshly built native libraries to the zero-log job, which
+      # runs `strings` over them. The authoritative .so is built here (the
+      # host has the NDK; local hosts without one skip native assembly).
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jniLibs
+          path: app/build/generated/jniLibs
+          if-no-files-found: error
+
+  zero-log:
+    # The .so strings pass is only meaningful against the libraries the
+    # android job just built, so this job consumes its jniLibs artifact
+    # (--strict-so is therefore safe: a missing artifact is a hard failure).
+    needs: android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      # Warm the cargo registry from Cargo.lock so the --cargo-tree check
+      # below can run offline on a fresh runner.
+      - run: cargo fetch --locked
+      - uses: actions/download-artifact@v4
+        with:
+          name: jniLibs
+          path: jniLibs
+      - run: bash scripts/check-zero-log.sh --strict-so --so-dir jniLibs --cargo-tree
 
   ffi-stability:
     runs-on: ubuntu-latest

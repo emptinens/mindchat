@@ -433,21 +433,14 @@ impl ConnectedState {
                     | Poll::Ready(None)
                     | Poll::Ready(Some(Err(ReadError::StreamFooterReceived)))
                     | Poll::Ready(Some(Err(ReadError::SoftTimeout))) => (),
-                    Poll::Ready(Some(Ok(ev))) => {
-                        log::trace!("Discarding incoming data while sending stream error: {ev:?}")
-                    }
-                    Poll::Ready(Some(Err(ReadError::ParseError(e)))) => {
-                        log::trace!("Ignoring parse error while sending stream error: {e}")
-                    }
-                    Poll::Ready(Some(Err(ReadError::HardError(e)))) => {
-                        log::warn!("I/O error while sending stream error: {e}")
-                    }
+                    Poll::Ready(Some(Ok(_))) => (),
+                    Poll::Ready(Some(Err(ReadError::ParseError(_)))) => (),
+                    Poll::Ready(Some(Err(ReadError::HardError(_)))) => (),
                 }
 
                 match deadline.as_mut().poll(cx) {
                     Poll::Pending => (),
                     Poll::Ready(()) => {
-                        log::debug!("Timeout while sending stream error. Discarding state.");
                         let error = local_error_for_stream_error(io_error, stream_error);
                         self.to_failed_state(error, None);
                         return Poll::Ready(None);
@@ -473,8 +466,7 @@ impl ConnectedState {
                         result
                     }) {
                         Ok(()) => (),
-                        Err(e) => {
-                            log::debug!("Got I/O error while sending stream error: {e}. Skipping error transmission.");
+                        Err(_) => {
                             let error = local_error_for_stream_error(io_error, stream_error);
                             self.to_failed_state(error, None);
                             return Poll::Ready(None);
@@ -487,13 +479,8 @@ impl ConnectedState {
                     cx
                 )) {
                     Ok(()) => (),
-                    Err(e) => {
-                        log::debug!(
-                            "Got I/O error while flushing stream error: {e}. Skipping flush.",
-                        );
-                    }
+                    Err(_) => {}
                 }
-                log::trace!("Stream error send complete, transitioning to Failed state");
                 *self = Self::Failed {
                     error: Some(local_error_for_stream_error(io_error, stream_error)),
                     // Do *not* resume after we caused a stream error.
@@ -554,15 +541,11 @@ impl ConnectedState {
                             match sm_state.remote_acked(ack.h) {
                                 Ok(()) => Poll::Ready(None),
                                 Err(e) => {
-                                    log::error!(
-                                        "Failed to process <sm:a/> sent by the server: {e}",
-                                    );
                                     self.to_stream_error_state(e.into());
                                     Poll::Ready(None)
                                 }
                             }
                         } else {
-                            log::debug!("Hmm... I got an <sm:a/> from the peer, but I don't have a stream management state. I'm gonna ignore that...");
                             Poll::Ready(None)
                         }
                     }
@@ -574,7 +557,6 @@ impl ConnectedState {
                                 Some(v) => sm_state.pending_acks = v,
                             }
                         } else {
-                            log::warn!("Got an <sm:r/> from the peer, but we don't have any stream management state. Terminating stream with an error.");
                             self.to_stream_error_state(StreamError::new(
                                 DefinedCondition::UnsupportedStanzaType,
                                 "en",
@@ -589,9 +571,6 @@ impl ConnectedState {
                     }
 
                     Ok(FallibleStreamElement::Ok(other)) => {
-                        log::warn!(
-                            "Received unsupported stream element: {other:?}. Emitting stream error.",
-                        );
                         // TODO: figure out a good way to provide the sender
                         // with more information.
                         self.to_stream_error_state(StreamError::new(
@@ -603,9 +582,8 @@ impl ConnectedState {
                     }
 
                     Ok(FallibleStreamElement::Err(
-                        e @ StreamElementError::InvalidStanza { .. },
+                        StreamElementError::InvalidStanza { .. },
                     )) => {
-                        log::warn!("Received invalid stanza: {e}; discarding silently.");
                         if let Some(sm_state) = sm_state.as_mut() {
                             sm_state.received();
                         }
@@ -696,7 +674,6 @@ impl ConnectedState {
                 // If close is called while an attempt is made to send the
                 // stream error, we abort transmission.
                 Self::SendStreamError { .. } => {
-                    log::debug!("close() called while stream error was being sent. Aborting transmission of stream error.");
                     *self = Self::LocalShutdown {
                         rx_state: RxShutdownState::AwaitingFooter,
                         tx_closed: false,
@@ -712,7 +689,6 @@ impl ConnectedState {
                 } => {
                     match deadline.as_mut().poll(cx) {
                         Poll::Ready(()) => {
-                            log::debug!("Dropping stream after shutdown timeout was exceeded.");
                             *self = Self::LocalShutdownComplete;
                             return Poll::Ready(Ok(()));
                         }
@@ -727,10 +703,7 @@ impl ConnectedState {
                             Poll::Ready(Ok(())) => {
                                 *tx_closed = true;
                             }
-                            Poll::Ready(Err(e)) => {
-                                log::debug!(
-                                    "Ignoring write error during local stream shutdown: {e}"
-                                );
+                            Poll::Ready(Err(_)) => {
                                 *tx_closed = true;
                             }
                         }
@@ -750,27 +723,16 @@ impl ConnectedState {
                         _ => loop {
                             match ready!(stream.as_mut().poll_next(cx)) {
                                 None => {
-                                    if *rx_state != RxShutdownState::AwaitingEof {
-                                        log::debug!("Ignoring early EOF during stream shutdown.");
-                                    }
                                     *rx_state = RxShutdownState::Done;
                                     break;
                                 }
-                                Some(Ok(data)) => {
-                                    log::debug!("Ignoring data received on stream during local shutdown: {data:?}");
-                                }
+                                Some(Ok(_)) => (),
                                 Some(Err(ReadError::SoftTimeout)) => (),
-                                Some(Err(ReadError::HardError(e))) => {
+                                Some(Err(ReadError::HardError(_))) => {
                                     *rx_state = RxShutdownState::Done;
-                                    log::debug!("Ignoring read error during local shutdown: {e}");
                                     break;
                                 }
-                                Some(Err(ReadError::ParseError(e))) => {
-                                    log::debug!(
-                                        "Ignoring parse error during local shutdown: {}",
-                                        e
-                                    );
-                                }
+                                Some(Err(ReadError::ParseError(_))) => {}
                                 Some(Err(ReadError::StreamFooterReceived)) => match rx_state {
                                     RxShutdownState::AwaitingFooter => {
                                         *rx_state = RxShutdownState::AwaitingEof;
@@ -810,14 +772,12 @@ impl ConnectedState {
             | Self::LocalShutdown { .. }
             | Self::RemoteShutdown { .. }
             | Self::Failed { .. } => {
-                log::debug!("Request to send stream error ({error}), but we are already shutting down or have already failed. Discarding.");
                 return;
             }
 
             Self::Ready { .. } | Self::Negotiating { .. } => {}
 
             Self::SendStreamError { .. } => {
-                log::debug!("Request to send stream error ({error}) while transmission of another stream error is already in progress. Discarding the new one.");
                 return;
             }
         }

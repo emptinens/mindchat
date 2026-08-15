@@ -147,7 +147,6 @@ impl StanzaStream {
                         if slot.is_closed() {
                             return;
                         }
-                        log::debug!("Starting new connection as {}", jid);
                         match crate::client::login::client_auth(
                             server.clone(),
                             jid.clone(),
@@ -157,7 +156,6 @@ impl StanzaStream {
                         .await
                         {
                             Ok((features, stream)) => {
-                                log::debug!("Connection as {} established", jid);
                                 let stream = stream.box_stream();
                                 let Err(Ok(mut conn)) = slot.send(Ok(Connection {
                                     stream,
@@ -170,7 +168,6 @@ impl StanzaStream {
                                     return;
                                 };
 
-                                log::debug!("StanzaStream dropped, attempting graceful termination of fresh stream.");
                                 // Send failed, i.e. the stanzastream is dead. Let's
                                 // be polite and close this stream cleanly.
                                 // We don't care whether that works, though, we
@@ -188,10 +185,6 @@ impl StanzaStream {
                                 // terminal. Retrying them forever hides a wrong
                                 // password behind an endless "connecting" state.
                                 if matches!(e, crate::Error::Auth(_)) {
-                                    log::error!(
-                                        "Failed to connect: {}. Authentication errors are fatal; giving up.",
-                                        e
-                                    );
                                     // MindChat patch: surface the fatal connector
                                     // error through the slot so the stream worker
                                     // can emit it as a terminal event instead of
@@ -199,7 +192,6 @@ impl StanzaStream {
                                     let _ = slot.send(Err(e));
                                     return;
                                 }
-                                log::error!("Failed to connect: {}. Retrying in {:?}.", e, delay);
                                 tokio::time::sleep(delay).await;
                                 delay *= 2;
                                 if delay > MAX_DELAY {
@@ -274,9 +266,7 @@ impl StanzaStream {
     /// cancel any more reconnection attempts.
     pub async fn close(mut self) {
         drop(self.tx); // closes stream.
-        while let Some(ev) = self.rx.recv().await {
-            log::trace!("discarding event {:?} after stream closure", ev);
-        }
+        while self.rx.recv().await.is_some() {}
     }
 
     /// Send a stanza via the stream.

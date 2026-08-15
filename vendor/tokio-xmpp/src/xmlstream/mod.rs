@@ -62,8 +62,6 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::io;
-#[cfg(feature = "syntax-highlighting")]
-use std::sync::LazyLock;
 
 use futures::{ready, Sink, SinkExt, Stream};
 
@@ -73,7 +71,6 @@ use xso::{AsXml, FromXml, Item};
 
 use crate::connect::AsyncReadAndWrite;
 
-mod capture;
 mod common;
 mod initiator;
 mod responder;
@@ -88,40 +85,6 @@ pub use self::responder::{AcceptedStream, PendingFeaturesSend};
 pub use self::xmpp::{
     FallibleStreamElement, RawStanzaHeader, StreamElementError, XmppStreamElement,
 };
-
-#[cfg(feature = "syntax-highlighting")]
-static PS: LazyLock<syntect::parsing::SyntaxSet> =
-    LazyLock::new(syntect::parsing::SyntaxSet::load_defaults_newlines);
-
-#[cfg(feature = "syntax-highlighting")]
-static SYNTAX: LazyLock<&syntect::parsing::SyntaxReference> =
-    LazyLock::new(|| PS.find_syntax_by_extension("xml").unwrap());
-
-#[cfg(feature = "syntax-highlighting")]
-static THEME: LazyLock<syntect::highlighting::Theme> = LazyLock::new(|| {
-    syntect::highlighting::ThemeSet::load_defaults().themes["Solarized (dark)"].clone()
-});
-
-#[cfg(feature = "syntax-highlighting")]
-fn highlight_xml(xml: &str) -> String {
-    let mut h = syntect::easy::HighlightLines::new(&SYNTAX, &THEME);
-    let ranges: Vec<_> = h.highlight_line(&xml, &PS).unwrap();
-    let mut escaped = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
-    escaped += "\x1b[0m";
-    escaped
-}
-
-struct LogXsoBuf<'x>(&'x [u8]);
-
-impl fmt::Display for LogXsoBuf<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // We always generate UTF-8, so this should be good... I think.
-        let text = core::str::from_utf8(self.0).unwrap();
-        #[cfg(feature = "syntax-highlighting")]
-        let text = highlight_xml(text);
-        f.write_str(&text)
-    }
-}
 
 /// Initiate a new stream
 ///
@@ -421,15 +384,9 @@ impl<Io: AsyncWrite, T: FromXml> XmlStream<Io, T> {
                     match ready!(this.inner.as_mut().poll_ready(cx))
                         .and_then(|_| this.inner.as_mut().start_send(Item::ElementFoot))
                     {
-                        Ok(()) => {
-                            log::trace!("stream footer sent successfully");
-                        }
+                        Ok(()) => (),
                         // If it fails, we fail the sink immediately.
                         Err(e) => {
-                            log::debug!(
-                                "omitting stream footer: failed to make stream ready: {}",
-                                e
-                            );
                             *this.write_state = WriteState::Failed;
                             return Poll::Ready(Err(e));
                         }

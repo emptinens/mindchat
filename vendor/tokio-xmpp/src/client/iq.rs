@@ -192,7 +192,6 @@ impl Future for IqResponseToken {
                 return Poll::Ready(v);
             }
             Poll::Ready(Err(_)) => {
-                log::warn!("IqResponseToken oneshot::Receiver returned receive error!");
                 // Drop the map entry handle to release some memory.
                 this.entry.take();
                 return Poll::Ready(Err(IqFailure::LostWorker));
@@ -208,7 +207,6 @@ impl Future for IqResponseToken {
                     Some(StanzaState::Queued) => (),
 
                     Some(StanzaState::Dropped) | None => {
-                        log::warn!("StanzaToken associated with IqResponseToken signalled that the Stanza was dropped before transmission.");
                         // Drop the map entry handle to release some memory.
                         this.entry.take();
                         // Lost stanza stream: cannot ever get a reply.
@@ -306,12 +304,9 @@ impl IqResponseTracker {
         let mut map = self.map.lock().unwrap();
         match map.remove(&key) {
             None => {
-                log::debug!("not handling IQ response from {:?} with id {:?}: no active tracker for this tuple", key.0, key.1);
-                log::trace!("active trackers: {map:?}");
                 ControlFlow::Continue(payload.into_iq(key.0, to, key.1))
             }
             Some(sink) => {
-                log::trace!("completing IQ {:?}", key.0);
                 sink.complete(payload);
                 ControlFlow::Break(())
             }
