@@ -17,6 +17,11 @@ pub mod direct_tls;
 #[cfg(feature = "direct-tls")]
 pub use direct_tls::DirectTlsServerConnector;
 
+#[cfg(feature = "preconnected")]
+pub mod preconnected;
+#[cfg(feature = "preconnected")]
+pub use preconnected::PreconnectedServerConnector;
+
 #[cfg(feature = "insecure-tcp")]
 pub mod tcp;
 #[cfg(feature = "insecure-tcp")]

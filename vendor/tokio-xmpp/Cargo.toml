@@ -72,6 +72,10 @@ native-tls = [
     "dep:native-tls",
 ]
 pedantic = ["xmpp-parsers/pedantic"]
+# MindChat patch (0.1.8, ROADMAP 6.2 P2-2): connector over an
+# already-established TCP stream (proxy seam); TLS runs against the real
+# hostname. Built on the direct-tls TLS plumbing.
+preconnected = ["direct-tls"]
 ring = [
     "rustls-any-backend",
     "tokio-rustls/ring",

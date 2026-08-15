@@ -439,7 +439,7 @@ class NativeMindChatGateway(
                 .toSet()
             val result = withContext(Dispatchers.IO) {
                 try {
-                    val processedEvents = core.pollTransportEvents(32U)
+                    val processedEvents = drainTransportEvents()
                     val pendingWork = pendingAccounts.any { it in onlineBefore }
                     if (processedEvents == 0U && !pendingWork) {
                         // Unchanged poll: nothing to apply and nothing queued.
@@ -510,6 +510,31 @@ class NativeMindChatGateway(
             if (throwable is CancellationException) throw throwable
             runCatching { refresh() }
         }
+    }
+
+    /**
+     * P1-1: adaptively drains the core transport queue in bounded batches.
+     *
+     * The planner in [GatewayPoll] decides each batch size and when to stop:
+     * up to [MAX_DRAIN_BATCHES_PER_CYCLE] polls of [MAX_EVENTS_PER_DRAIN_BATCH]
+     * each, capped at [MAX_EVENTS_PER_DRAIN_CYCLE] per cycle, stopping early
+     * on a partial batch (the core queue is empty). A busy server therefore
+     * yields at most 512 applied events per poll cycle instead of one
+     * unbounded call, while a quiet one costs exactly one poll call.
+     */
+    private fun drainTransportEvents(): UInt {
+        var eventsProcessed = 0U
+        var batchesUsed = 0
+        var previousBatchSize = MAX_EVENTS_PER_DRAIN_BATCH
+        while (true) {
+            val step = nextDrainStep(previousBatchSize, batchesUsed, eventsProcessed)
+            if (!step.continueDraining) break
+            val batch = core.pollTransportEvents(step.batchSize)
+            eventsProcessed += batch
+            batchesUsed += 1
+            previousBatchSize = batch
+        }
+        return eventsProcessed
     }
 
     override suspend fun persistNow() {

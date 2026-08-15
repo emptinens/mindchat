@@ -755,8 +755,9 @@ impl MindChatCoreHandle {
     ///
     /// Offline and connecting accounts keep their queue untouched and return
     /// zero, so Android can safely invoke this after each polling pass. The
-    /// send batch is bounded in the coordinator (32 messages, ~10 s budget),
-    /// so a stalled server cannot freeze the session lock for the whole queue.
+    /// send batch is bounded in the coordinator (16 messages, ~4 s budget,
+    /// 0.1.8 P1-1), so a stalled server cannot freeze the session lock for
+    /// the whole queue.
     pub fn flush_outbox(&self, account_id: u64) -> Result<u32, MindChatBindingError> {
         let mut session = self.lock()?;
         let connection_state = session

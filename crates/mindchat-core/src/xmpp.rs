@@ -7,7 +7,7 @@
 use crate::{
     AccountId, ConnectionRequest, ContactPresence, ConversationKind, OutgoingMessage,
     ProtocolCapability, RosterSubscription, SecretString, TransportError, TransportEvent,
-    XmppTransport,
+    XmppTransport, proxy::ConnectStrategy,
 };
 use futures::{SinkExt, StreamExt};
 use hickory_resolver::{TokioResolver, config::LookupIpStrategy, proto::rr::RData};
@@ -379,6 +379,10 @@ struct WorkerConnection {
     password: String,
     server: String,
     auto_reconnect: bool,
+    /// Connect strategy for this session (ROADMAP 6.2 P2-2). Only
+    /// [`ConnectStrategy::Direct`] is reachable in 0.1.8; the proxy variants
+    /// are reserved and rejected recoverably by [`strategy_connect_failure`].
+    connect_strategy: ConnectStrategy,
 }
 
 impl WorkerConnection {
@@ -399,6 +403,9 @@ impl WorkerConnection {
             password: request.password.into_inner(),
             server,
             auto_reconnect: request.auto_reconnect,
+            // The FFI cannot select a strategy in 0.1.8, so every session
+            // starts direct; 6.3 plumbs the persisted setting here.
+            connect_strategy: ConnectStrategy::Direct,
         })
     }
 }
@@ -603,7 +610,7 @@ struct ReadyClient {
 }
 
 /// A terminal connect failure with a UI-safe reason.
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ConnectFailure {
     detail: String,
     /// False when the server rejected the credentials, so the account is
@@ -658,6 +665,13 @@ async fn connect_attempt(
     connection: &WorkerConnection,
     attempts: Vec<(SocketAddr, bool)>,
 ) -> Result<ReadyClient, ConnectFailure> {
+    // ROADMAP 6.2 P2-2: a reserved proxy strategy fails recoverably before
+    // any candidate handshake instead of silently connecting directly. The
+    // failure runs under the same connect budget as every other candidate
+    // failure; 6.3 replaces it with the real handshake.
+    if let Some(failure) = strategy_connect_failure(connection.connect_strategy) {
+        return Err(failure);
+    }
     let mut last_failure =
         ConnectFailure { detail: String::from("no connection candidates"), recoverable: true };
     for group in group_attempts(attempts) {
@@ -684,6 +698,24 @@ async fn connect_attempt(
 #[must_use]
 fn terminal_if_auth(failure: ConnectFailure) -> Option<ConnectFailure> {
     (!failure.recoverable).then_some(failure)
+}
+
+/// Maps a connect strategy to the failure it produces in this release.
+///
+/// [`ConnectStrategy::Direct`] connects normally. The reserved proxy
+/// strategies (ROADMAP 6.2 P2-2, handshakes land in 6.3) produce a
+/// recoverable connection failure so a strategy selected by a future FFI can
+/// never silently fall back to a direct connection; the failure is billed to
+/// the same connect budget as any other candidate failure.
+#[must_use]
+fn strategy_connect_failure(strategy: ConnectStrategy) -> Option<ConnectFailure> {
+    match strategy {
+        ConnectStrategy::Direct => None,
+        ConnectStrategy::HttpConnect | ConnectStrategy::Socks5 => Some(ConnectFailure {
+            detail: format!("{strategy} connect strategy is not implemented yet"),
+            recoverable: true,
+        }),
+    }
 }
 
 /// Races every address of one `(port, TLS mode)` group with a Happy
@@ -1728,6 +1760,31 @@ mod tests {
                 ProtocolCapability::Omemo,
             ])
         );
+    }
+
+    #[test]
+    fn direct_strategy_has_no_connect_failure() {
+        // ROADMAP 6.2 P2-2: Direct is the shipped behavior and must not be
+        // rejected anywhere in the connect path.
+        assert_eq!(strategy_connect_failure(ConnectStrategy::Direct), None);
+    }
+
+    #[test]
+    fn reserved_proxy_strategies_fail_recoverably() {
+        // A reserved strategy must fail recoverably (never silently connect
+        // directly, never surface as a credential failure), with a UI-safe
+        // detail naming the strategy, until 6.3 implements the handshake.
+        for strategy in [ConnectStrategy::HttpConnect, ConnectStrategy::Socks5] {
+            let failure = strategy_connect_failure(strategy)
+                .expect("reserved proxy strategy fails in the connect path");
+            assert!(failure.recoverable, "{strategy:?} must be recoverable");
+            assert!(
+                failure.detail.contains("not implemented yet"),
+                "detail should name the unimplemented strategy: {}",
+                failure.detail
+            );
+            assert!(failure.detail.contains(strategy.as_str()));
+        }
     }
 
     #[test]

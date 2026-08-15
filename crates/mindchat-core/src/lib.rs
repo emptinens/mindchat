@@ -18,6 +18,8 @@ pub mod persistence;
 pub mod transport;
 
 #[cfg(feature = "xmpp-transport")]
+pub mod proxy;
+#[cfg(feature = "xmpp-transport")]
 pub mod xmpp;
 
 #[cfg(feature = "uniffi")]
@@ -51,20 +53,25 @@ const MAX_MESSAGE_CHARS: usize = 16_384;
 
 /// Per-flush-call send budget for [`TransportCoordinator::flush_outbox`].
 ///
-/// The transport worker owns its own per-send timeout (currently 15 s in
-/// `xmpp.rs`), so a single blocking `send` can still take that long. This
-/// constant is the flush-level budget checked between sends: once it has
-/// elapsed, the flush stops and remaining messages stay pending for the next
-/// call. It deliberately undercuts the transport's 15 s per-send timeout so
-/// the session lock is never held for a whole multi-message queue.
-const FLUSH_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// The transport worker owns its own per-send timeout (10 s in `xmpp.rs`),
+/// so a single blocking `send` can still take that long. This constant is the
+/// flush-level budget checked between sends: once it has elapsed, the flush
+/// stops and remaining messages stay pending for the next call. It
+/// deliberately undercuts the transport's 10 s per-send timeout so the
+/// session lock is never held for a whole multi-message queue.
+///
+/// 0.1.8 P1-1 tuning: 10 s to 4 s, so a stalled peer pins the session lock
+/// for at most one in-flight send plus the flush budget (see
+/// [`FLUSH_OUTBOX_MAX_BATCH`]) instead of roughly half a multi-message queue.
+const FLUSH_SEND_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Maximum queued messages sent per [`TransportCoordinator::flush_outbox`] call.
 ///
 /// Together with [`FLUSH_SEND_TIMEOUT`] this bounds the session lock hold of
 /// one flush. Worst case is `FLUSH_SEND_TIMEOUT` plus one transport per-send
-/// timeout (15 s), because a send already in flight cannot be interrupted.
-const FLUSH_OUTBOX_MAX_BATCH: usize = 32;
+/// timeout (10 s), because a send already in flight cannot be interrupted:
+/// roughly 14 s in 0.1.8 (was ~25 s with the 10 s/32-message pairing).
+const FLUSH_OUTBOX_MAX_BATCH: usize = 16;
 
 /// Connection status projected to the UI.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1388,11 +1395,12 @@ impl<T: XmppTransport> TransportCoordinator<T> {
     /// at most [`FLUSH_OUTBOX_MAX_BATCH`] messages are sent per call and the
     /// call stops once [`FLUSH_SEND_TIMEOUT`] has elapsed between sends. Each
     /// `send` can itself block up to the transport's own per-send timeout
-    /// (currently 15 s inside the XMPP worker), so the worst-case session lock
-    /// hold is `FLUSH_SEND_TIMEOUT` plus one per-send timeout, roughly 25 s.
-    /// Messages left behind stay pending and are retried by the next flush
-    /// call. A send failure still aborts the batch immediately and marks the
-    /// failing message `Failed`, preserving the abort-on-first-error contract.
+    /// (currently 10 s inside the XMPP worker), so the worst-case session lock
+    /// hold is `FLUSH_SEND_TIMEOUT` plus one per-send timeout, roughly 14 s
+    /// (0.1.8 P1-1; was ~25 s). Messages left behind stay pending and are
+    /// retried by the next flush call. A send failure still aborts the batch
+    /// immediately and marks the failing message `Failed`, preserving the
+    /// abort-on-first-error contract.
     pub fn flush_outbox(
         &mut self,
         account_id: AccountId,
@@ -1528,6 +1536,8 @@ mod tests {
         sent_messages: Vec<OutgoingMessage>,
         events: VecDeque<TransportEvent>,
         fail_next_send: bool,
+        /// Simulates a stalled peer: every `send` blocks for this long.
+        send_delay: Option<Duration>,
     }
 
     impl XmppTransport for FakeTransport {
@@ -1542,6 +1552,9 @@ mod tests {
         }
 
         fn send(&mut self, message: OutgoingMessage) -> Result<(), TransportError> {
+            if let Some(delay) = self.send_delay {
+                std::thread::sleep(delay);
+            }
             if self.fail_next_send {
                 self.fail_next_send = false;
                 return Err(TransportError::ConnectionFailed("temporary failure".to_owned()));
@@ -2371,6 +2384,57 @@ mod tests {
                 .pending_outgoing_messages(account_id)
                 .expect("empty outbox")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn flush_outbox_stops_once_the_send_budget_elapses() {
+        // 0.1.8 P1-1: the flush must stop on the 4 s budget even when the
+        // 16-message batch cap has not been reached. Each send blocks 1.5 s,
+        // so under nominal timing three sends fit inside the budget (checks
+        // at 0 s, 1.5 s and 3.0 s; the fourth check at 4.5 s stops the
+        // flush). The exact count is timing-dependent under load, so the
+        // assertions only require that the budget, not the batch cap, ended
+        // the flush: fewer than the 16-message cap were sent and the rest of
+        // the queue stayed pending for a later flush.
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        let conversation_id = core
+            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
+            .expect("conversation");
+        let total = FLUSH_OUTBOX_MAX_BATCH + 10;
+        for index in 0..total {
+            core.send_text(
+                conversation_id,
+                "alice@example.org",
+                format!("message {index}"),
+                None,
+                index as u64 + 2,
+            )
+            .expect("queued message");
+        }
+
+        let mut coordinator = TransportCoordinator::new(
+            core,
+            FakeTransport {
+                send_delay: Some(Duration::from_millis(1500)),
+                ..FakeTransport::default()
+            },
+        );
+        let sent = coordinator.flush_outbox(account_id).expect("bounded flush");
+        assert!(
+            (1..FLUSH_OUTBOX_MAX_BATCH).contains(&sent),
+            "the 4 s budget must stop the flush below the batch cap, sent {sent}"
+        );
+        assert_eq!(coordinator.transport().sent_messages.len(), sent);
+        // The remaining queue is untouched and retried by a later flush.
+        assert_eq!(
+            coordinator
+                .core()
+                .pending_outgoing_messages(account_id)
+                .expect("remaining outbox")
+                .len(),
+            total - sent
         );
     }
 
