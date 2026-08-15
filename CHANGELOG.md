@@ -25,6 +25,51 @@ the roadmap cleanup commit; their content lives in git history.
   removed; README rewritten; CONTRIBUTING extended with security invariants
   and the native build; vendor patch rationale added to `Cargo.toml`.
 
+## [0.1.7] - 2026-08-15
+
+### Added
+
+- Appearance engine: `AppearanceProfile` with shape scale (Compact /
+  Standard), density (relaxed / comfortable / compact), text scale,
+  animation speed, bubble style (rounded / speech-tail / outlined) and chat
+  background, plus per-account bubble/background overrides in the profile
+  sheet. Live-preview Appearance screen with immediate-apply controls and
+  reset; defaults reproduce 0.1.6 byte-for-byte; legacy
+  `comfortable_layout` preference migrated transparently.
+- Typed settings platform: `SettingsSchema.kt` (`SettingKey<T>`,
+  `SettingsSnapshot`), `SettingsNavigation.kt`, catalog-driven settings
+  screen with search; storage keys byte-identical to legacy
+  SharedPreferences (zero migration), gateway pinned via
+  `setSetting`/`setAccountSetting`.
+- Material 3 Expressive polish (P0 + P1): app-local motion tokens
+  (`theme/Motion.kt`; material3 1.4.0 keeps its expressive motion API
+  internal), WCAG-AA semantic status colors, lock/send icons, extraLarge
+  dialog shapes, extended FAB, shape/type tokens, empty-state medallions,
+  snackbar hosts with transient results, hoisted motion speed.
+- Micro-animations (T1-T9): message entrance (fade+slide+scale) and
+  delivery crossfade, unread-badge pop, reaction pop-in/out, dock selection
+  animation, destination switch transition, haptics on send/dock/account
+  switch, delivery-failed snackbar, animated presence/connection dots.
+  Reduce-motion honored via system animation scales; instant at scale 0.
+- Perf P0: poll loop gated by `ON_START` lifecycle (no FFI while stopped,
+  immediate catch-up poll on resume); single `core.snapshot()` on the
+  changed-poll path (was 2); per-locale `DateTimeFormatter` cache with
+  byte-identical output; `SnapshotMappingBenchmarkTest` tripwires (diff
+  < 2 ms, mapping < 50 ms at 10k) with p50s recorded.
+- FFI stability CI job (`scripts/check-ffi-stability.sh` + golden binding
+  API snapshot, 143 signatures); FFI surface frozen in 0.1.7.
+
+### Changed
+
+- Gateway split into shared pure layers: `GatewayMapping.kt`
+  (snapshot-to-UI mapping, skip-rebuild diffing, timestamp formatting) and
+  `GatewayPolicy.kt` (stall threshold, active-account fallback), unit-tested
+  directly; `toggleComfortableLayout` replaced by `setAppearance`.
+
+### Fixed
+
+- Version bumped to 7 / 0.1.7.
+
 ## [0.1.6] - 2026-08-14
 
 ### Added
@@ -124,7 +169,8 @@ the roadmap cleanup commit; their content lives in git history.
 Foundational commits (Android app shell, Rust core, UniFFI boundary,
 extension policy, roster projections). No tagged releases.
 
-[Unreleased]: https://github.com/emptinens/mindchat/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/emptinens/mindchat/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/emptinens/mindchat/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/emptinens/mindchat/compare/v0.1.4...v0.1.6
 [0.1.4]: https://github.com/emptinens/mindchat/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/emptinens/mindchat/compare/v0.1.2...v0.1.3

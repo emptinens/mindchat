@@ -170,6 +170,12 @@ Hard sequencing rules:
 
 ## 5. Release 0.1.7: Polish and customization foundation
 
+> **Status: SHIPPED in `v0.1.7` (2026-08-15).** Implementation notes below
+> stay as the historical plan; deltas are recorded in `CHANGELOG.md`. Known
+> deferrals carried to later releases: B11 pull-to-refresh and B12
+> swipe-to-dismiss (contract additions + gesture QA, queued for a device
+> pass); `PollLifecycleGatingTest` is compiled but needs an emulator run.
+
 Character: Android-local polish, settings architecture, appearance engine.
 **FFI frozen.** No new dependencies.
 
