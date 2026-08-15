@@ -5,7 +5,21 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.annotation.StringRes
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExperimentalAnimationApi
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateValueAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.togetherWith
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -78,9 +92,11 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -93,9 +109,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -111,16 +131,22 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.mindchat.app.theme.ACCENT_DEFAULT_KEY
 import com.mindchat.app.theme.AccentOptions
-import com.mindchat.app.theme.LocalMindChatMotionSpeed
+import com.mindchat.app.theme.EmphasizedDecelerate
+import com.mindchat.app.theme.FontWeightConverter
 import com.mindchat.app.theme.LocalMindChatStatusColors
+import com.mindchat.app.theme.LocalMotion
 import com.mindchat.app.theme.MindChatDockItemShape
 import com.mindchat.app.theme.MindChatDockShape
-import com.mindchat.app.theme.MindChatMotionScheme
 import com.mindchat.app.theme.MindChatTheme
+import com.mindchat.app.theme.MotionDurations
+import com.mindchat.app.theme.StandardEasing
 import com.mindchat.app.theme.bubbleContainerColor
 import com.mindchat.app.theme.bubbleOutlineColor
 import com.mindchat.app.theme.bubbleShape
 import com.mindchat.app.theme.chatListBackground
+import com.mindchat.app.theme.rememberEffectsSpec
+import com.mindchat.app.theme.rememberMotion
+import com.mindchat.app.theme.rememberMotionScale
 import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.Dispatchers
@@ -143,6 +169,18 @@ fun MindChatApp(appLockHost: AppLockHost? = null) {
 
 @Composable
 private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
+    // T1: the system reduce-motion contract (Settings.Global animator +
+    // transition scales, live via ContentObserver) feeds every micro-animation
+    // through LocalMotion. Tests override LocalMotion directly.
+    val context = LocalContext.current
+    val motionScale = rememberMotionScale(context)
+    CompositionLocalProvider(LocalMotion provides motionScale) {
+        MindChatAppThemed(gateway, appLockHost)
+    }
+}
+
+@Composable
+private fun MindChatAppThemed(gateway: MindChatGateway, appLockHost: AppLockHost?) {
     val state = gateway.state
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, gateway) {
@@ -241,12 +279,15 @@ private fun AppLockedScreen(state: AppLockUiState, onUnlock: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalAnimationApi::class)
 @Composable
 private fun MindChatShell(
     gateway: MindChatGateway,
     state: MindChatUiState,
     appLockHost: AppLockHost?,
 ) {
+    val motion = rememberMotion()
+    val density = LocalDensity.current
     var destination by rememberSaveable { mutableStateOf(Destination.Chats) }
     var selectedConversationId by rememberSaveable { mutableStateOf<Long?>(null) }
     var showAddAccount by rememberSaveable { mutableStateOf(false) }
@@ -492,82 +533,106 @@ private fun MindChatShell(
             },
             floatingActionButton = {
                 if (state.activeAccountId != 0L) {
-                    when (destination) {
-                        Destination.Chats -> {
-                            ExtendedFloatingActionButton(
-                                onClick = { showNewConversation = true },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Filled.Add,
-                                        contentDescription = null,
-                                    )
-                                },
-                                text = { Text(stringResource(R.string.new_chat)) },
-                            )
-                        }
-
-                        Destination.Contacts -> {
-                            FloatingActionButton(onClick = { showAddContact = true }) {
-                                Icon(
-                                    imageVector = Icons.Filled.Add,
-                                    contentDescription = stringResource(R.string.add_contact),
+                    // T6: the FAB icon crossfades when the destination changes;
+                    // the extended/circular shapes differ per destination.
+                    Crossfade(
+                        targetState = destination,
+                        animationSpec = motion.tween(180),
+                        label = "fabIcon",
+                    ) { target ->
+                        when (target) {
+                            Destination.Chats -> {
+                                ExtendedFloatingActionButton(
+                                    onClick = { showNewConversation = true },
+                                    icon = {
+                                        Icon(
+                                            imageVector = Icons.Filled.Add,
+                                            contentDescription = null,
+                                        )
+                                    },
+                                    text = { Text(stringResource(R.string.new_chat)) },
                                 )
                             }
-                        }
 
-                        Destination.Settings -> Unit
+                            Destination.Contacts -> {
+                                FloatingActionButton(onClick = { showAddContact = true }) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Add,
+                                        contentDescription = stringResource(R.string.add_contact),
+                                    )
+                                }
+                            }
+
+                            Destination.Settings -> Unit
+                        }
                     }
                 }
             },
         ) { padding ->
-            when (destination) {
-                Destination.Chats -> ConversationsScreen(
-                    state = state,
-                    density = resolved.density,
-                    contentPadding = padding,
-                    onConversationClick = { selectedConversationId = it.id },
-                    onMarkRead = { gateway.markConversationRead(it.id) },
-                    onOpenAsGroup = { conversation ->
-                        gateway.openConversation(conversation.address, conversation.title, group = true)
-                            ?.let { selectedConversationId = it }
-                    },
-                    onDeleteConversation = { deleteConversationId = it.id },
-                )
-
-                Destination.Contacts -> ContactsScreen(
-                    state = state,
-                    contentPadding = padding,
-                    onContactClick = { contact ->
-                        gateway.openConversation(contact.jid, contact.displayName, group = false)?.let {
-                            selectedConversationId = it
-                            destination = Destination.Chats
-                        }
-                    },
-                )
-                Destination.Settings -> {
-                    // System back walks the settings back stack first; at the
-                    // root the shell's default (or drawer) handling applies.
-                    BackHandler(enabled = settingsNavState.backStack.size > 1) {
-                        settingsNavState.back()
+            // T6: destination switches crossfade (fade+slide when the system
+            // permits excessive motion; fade-only under reduce-motion).
+            AnimatedContent(
+                targetState = destination,
+                transitionSpec = {
+                    if (motion.excessiveMotionAllowed) {
+                        fadeIn(motion.tween(220)) +
+                            slideInHorizontally(motion.tween(220, EmphasizedDecelerate)) { with(density) { 8.dp.roundToPx() } } togetherWith
+                            fadeOut(motion.tween(160))
+                    } else {
+                        fadeIn(motion.tween(220)) togetherWith fadeOut(motion.tween(160))
                     }
-                    SettingsScreen(
-                        gateway = gateway,
+                },
+                label = "destinationContent",
+            ) { target ->
+                when (target) {
+                    Destination.Chats -> ConversationsScreen(
                         state = state,
-                        navState = settingsNavState,
+                        density = resolved.density,
                         contentPadding = padding,
-                        onOpenAccountDrawer = {
-                            scope.launch { drawerState.open() }
+                        onConversationClick = { selectedConversationId = it.id },
+                        onMarkRead = { gateway.markConversationRead(it.id) },
+                        onOpenAsGroup = { conversation ->
+                            gateway.openConversation(conversation.address, conversation.title, group = true)
+                                ?.let { selectedConversationId = it }
                         },
-                        onAddAccount = { showAddAccount = true },
-                        onOpenAppearance = { showAppearance = true },
-                        appLockHostAvailable = appLockHost?.isAuthenticationAvailable ?: true,
-                        onAppLockToggle = { enabled ->
-                            if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
-                                appLockHost?.setAppLockEnabled(enabled)
-                                gateway.toggleAppLock()
+                        onDeleteConversation = { deleteConversationId = it.id },
+                    )
+
+                    Destination.Contacts -> ContactsScreen(
+                        state = state,
+                        contentPadding = padding,
+                        onContactClick = { contact ->
+                            gateway.openConversation(contact.jid, contact.displayName, group = false)?.let {
+                                selectedConversationId = it
+                                destination = Destination.Chats
                             }
                         },
                     )
+                    Destination.Settings -> {
+                        // System back walks the settings back stack first; at the
+                        // root the shell's default (or drawer) handling applies.
+                        BackHandler(enabled = settingsNavState.backStack.size > 1) {
+                            settingsNavState.back()
+                        }
+                        SettingsScreen(
+                            gateway = gateway,
+                            state = state,
+                            navState = settingsNavState,
+                            contentPadding = padding,
+                            onOpenAccountDrawer = {
+                                scope.launch { drawerState.open() }
+                            },
+                            onAddAccount = { showAddAccount = true },
+                            onOpenAppearance = { showAppearance = true },
+                            appLockHostAvailable = appLockHost?.isAuthenticationAvailable ?: true,
+                            onAppLockToggle = { enabled ->
+                                if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
+                                    appLockHost?.setAppLockEnabled(enabled)
+                                    gateway.toggleAppLock()
+                                }
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -616,7 +681,7 @@ private fun MindChatTopBar(
                                 .size(12.dp)
                                 .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape)
                                 .clip(CircleShape)
-                                .background(connectionDotColor(active.connectionState)),
+                                .background(animatedDotColor(connectionDotColor(active.connectionState), "topBarConnectionDot")),
                         )
                     }
                 } else {
@@ -708,6 +773,21 @@ private fun connectionDotColor(state: AccountConnectionState): Color {
     }
 }
 
+/**
+ * T9: connection/presence dots crossfade between status colors through the
+ * motion tokens instead of snapping. Reduce-motion scales (or instants) the
+ * tween through [Motion.tween].
+ */
+@Composable
+private fun animatedDotColor(target: Color, label: String): Color {
+    val motion = rememberMotion()
+    return animateColorAsState(
+        targetValue = target,
+        animationSpec = motion.tween(MotionDurations.StandardMs, StandardEasing),
+        label = label,
+    ).value
+}
+
 private fun accountConnectionLabel(connectionState: AccountConnectionState): Int = when (connectionState) {
     AccountConnectionState.OFFLINE -> R.string.connection_offline
     AccountConnectionState.CONNECTING -> R.string.connection_connecting
@@ -728,6 +808,7 @@ private fun ConversationsScreen(
     val conversations = state.conversations
         .filter { it.accountId == state.activeAccountId }
         .sortedByDescending { it.lastActivityEpochMs }
+    val motion = rememberMotion()
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -749,6 +830,10 @@ private fun ConversationsScreen(
             ConversationRow(
                 conversation = conversation,
                 rowPadding = density.rowPadding,
+                // T3: re-sorting on new activity shifts neighbours smoothly.
+                modifier = Modifier.animateItem(
+                    placementSpec = motion.placementSpring(dampingRatio = 0.9f, stiffness = 350f),
+                ),
                 onClick = { onConversationClick(conversation) },
                 onMarkRead = { onMarkRead(conversation) },
                 onOpenAsGroup = { onOpenAsGroup(conversation) },
@@ -800,6 +885,7 @@ private fun EmptyConversations() {
 private fun ConversationRow(
     conversation: ConversationUi,
     rowPadding: Dp,
+    modifier: Modifier = Modifier,
     onClick: () -> Unit,
     onMarkRead: () -> Unit,
     onOpenAsGroup: () -> Unit,
@@ -807,7 +893,7 @@ private fun ConversationRow(
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     Card(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
         colors = CardDefaults.cardColors(
@@ -931,6 +1017,45 @@ private fun ChatScreen(
 ) {
     var draft by rememberSaveable(conversation.id) { mutableStateOf("") }
     val snackbarHostState = remember { SnackbarHostState() }
+    val motion = rememberMotion()
+
+    // T2: history renders statically; only message ids that appear after the
+    // first composition animate their entrance. seenIds is a render detail,
+    // not persistent state: it resets when the conversation reopens.
+    val seenIds = remember(conversation.id) { mutableStateOf(emptySet<Long>()) }
+    var entranceArmed by remember(conversation.id) { mutableStateOf(false) }
+    LaunchedEffect(conversation.id) {
+        seenIds.value = messages.mapTo(mutableSetOf()) { it.id }
+        entranceArmed = true
+    }
+
+    // T8: a delivery transition TO FAILED surfaces exactly once per message id
+    // through the existing snackbar host (B6). Messages already FAILED on
+    // conversation open are silent; the diff map is seeded on first
+    // composition and rebuilt whenever the list changes.
+    val deliveryFailedMessage = stringResource(R.string.delivery_failed)
+    val previousDelivery = remember(conversation.id) { mutableStateMapOf<Long, MessageDelivery>() }
+    LaunchedEffect(messages) {
+        val newlyFailed = messages
+            .mapNotNull { m -> m.delivery?.let { d -> m.id to d } }
+            .filter { (id, delivery) ->
+                delivery == MessageDelivery.FAILED &&
+                    previousDelivery[id] != null &&
+                    previousDelivery[id] != MessageDelivery.FAILED
+            }
+            .map { it.first }
+        if (newlyFailed.isNotEmpty()) {
+            newlyFailed.forEach {
+                snackbarHostState.showSnackbar(
+                    message = deliveryFailedMessage,
+                    duration = SnackbarDuration.Short,
+                )
+            }
+        }
+        previousDelivery.clear()
+        messages.forEach { m -> m.delivery?.let { previousDelivery[m.id] = it } }
+    }
+
     Scaffold(
         containerColor = chatListBackground(chatBackground, MaterialTheme.colorScheme),
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -1015,7 +1140,24 @@ private fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(messages, key = { it.id }) { message ->
-                MessageBubble(message, bubbleStyle)
+                val isNew = entranceArmed && message.id !in seenIds.value
+                if (isNew) {
+                    // Mark the entrance finished so scrolling the item out and
+                    // back in renders it statically (no replay).
+                    LaunchedEffect(message.id) {
+                        delay(motion.durationMs(220).toLong())
+                        seenIds.value = seenIds.value + message.id
+                    }
+                }
+                MessageBubble(
+                    message = message,
+                    style = bubbleStyle,
+                    animateIn = isNew,
+                    // T2: inserts shift neighbours smoothly.
+                    modifier = Modifier.animateItem(
+                        placementSpec = motion.placementSpring(dampingRatio = 0.85f, stiffness = 400f),
+                    ),
+                )
             }
         }
     }
@@ -1023,6 +1165,7 @@ private fun ChatScreen(
 
 @Composable
 private fun Composer(value: String, onValueChange: (String) -> Unit, onSend: () -> Unit) {
+    val haptics = LocalHapticFeedback.current
     Surface(tonalElevation = 3.dp) {
         Row(
             modifier = Modifier
@@ -1038,7 +1181,15 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, onSend: () 
                 maxLines = 5,
             )
             Spacer(Modifier.width(8.dp))
-            FilledIconButton(onClick = onSend, enabled = value.isNotBlank()) {
+            FilledIconButton(
+                onClick = {
+                    // T7: the send affordance is the commit; confirm-feedback
+                    // fires only when the button is enabled (text non-blank).
+                    haptics.performHapticFeedback(HapticFeedbackType.Confirm)
+                    onSend()
+                },
+                enabled = value.isNotBlank(),
+            ) {
                 Icon(
                     imageVector = Icons.Filled.Send,
                     contentDescription = stringResource(R.string.send),
@@ -1049,57 +1200,165 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, onSend: () 
     }
 }
 
+@OptIn(ExperimentalAnimationApi::class)
 @Composable
-private fun MessageBubble(message: MessageUi, style: BubbleStyle) {
+private fun MessageBubble(
+    message: MessageUi,
+    style: BubbleStyle,
+    animateIn: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val motion = rememberMotion()
+    val density = LocalDensity.current
     val deliveryText = if (message.delivery != null) deliveryLabel(message.delivery) else null
     val scheme = MaterialTheme.colorScheme
     val containerColor = bubbleContainerColor(style, message.mine, scheme)
     val borderColor = bubbleOutlineColor(style, scheme)
+    // T2: own messages read as "placed" (fade + 8.dp slide), incoming as
+    // "arrived" (fade + 6.dp slide + subtle scale). Reduce-motion degrades to
+    // fade-only; animator scale 0 snaps everything via [Motion.tween].
+    val entrance = when {
+        !animateIn -> EnterTransition.None
+        !motion.excessiveMotionAllowed -> fadeIn(motion.tween(220, EmphasizedDecelerate))
+        message.mine -> fadeIn(motion.tween(220, EmphasizedDecelerate)) +
+            slideInVertically(motion.tween(220, EmphasizedDecelerate)) { with(density) { 8.dp.roundToPx() } }
+
+        else -> fadeIn(motion.tween(220, EmphasizedDecelerate)) +
+            slideInVertically(motion.tween(220, EmphasizedDecelerate)) { with(density) { 6.dp.roundToPx() } } +
+            scaleIn(motion.tween(220, EmphasizedDecelerate), initialScale = 0.97f)
+    }
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start,
     ) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth(0.82f)
-                .then(
-                    if (borderColor != Color.Transparent) {
-                        Modifier.border(1.dp, borderColor, bubbleShape(style, message.mine))
-                    } else {
-                        Modifier
-                    },
-                ),
-            shape = bubbleShape(style, message.mine),
-            colors = CardDefaults.cardColors(containerColor = containerColor),
+        AnimatedVisibility(
+            visible = true,
+            enter = entrance,
+            label = "messageEntrance",
         ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                if (!message.mine) {
-                    Text(
-                        text = message.sender,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                    Spacer(Modifier.height(3.dp))
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth(0.82f)
+                    .then(
+                        if (borderColor != Color.Transparent) {
+                            Modifier.border(1.dp, borderColor, bubbleShape(style, message.mine))
+                        } else {
+                            Modifier
+                        },
+                    ),
+                shape = bubbleShape(style, message.mine),
+                colors = CardDefaults.cardColors(containerColor = containerColor),
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    if (!message.mine) {
+                        Text(
+                            text = message.sender,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.height(3.dp))
+                    }
+                    Text(message.body, style = MaterialTheme.typography.bodyLarge)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = message.timestamp,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        if (deliveryText != null) {
+                            Text(
+                                text = " · ",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            // T2: the delivery tick crossfades in place between
+                            // PENDING/SENT/DELIVERED/READ/FAILED; no haptic.
+                            AnimatedContent(
+                                targetState = deliveryText,
+                                transitionSpec = {
+                                    fadeIn(motion.tween(180, StandardEasing)) +
+                                        slideInVertically(motion.tween(180, StandardEasing)) { with(density) { 4.dp.roundToPx() } } togetherWith
+                                        fadeOut(motion.tween(180, StandardEasing))
+                                },
+                                label = "deliveryTick",
+                            ) { label ->
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                    if (message.reactions.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        ReactionChips(reactions = message.reactions, messageId = message.id)
+                    }
                 }
-                Text(message.body, style = MaterialTheme.typography.bodyLarge)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = listOfNotNull(message.timestamp, deliveryText).joinToString(" · "),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+            }
+        }
+    }
+}
+
+/**
+ * T4: each reaction renders as a small chip. Labels present at first render
+ * are static; labels added later pop in once (fade + snappy spring); removed
+ * labels fade+scale out. The per-message seen set is a render detail only.
+ */
+@Composable
+private fun ReactionChips(reactions: List<String>, messageId: Long) {
+    val motion = rememberMotion()
+    var seeded by remember(messageId) { mutableStateOf(false) }
+    val seenLabels = remember(messageId) { mutableStateOf(emptySet<String>()) }
+    LaunchedEffect(messageId) {
+        if (!seeded) {
+            seenLabels.value = reactions.toSet()
+            seeded = true
+        }
+    }
+    val labels = remember(reactions, seenLabels.value) {
+        val union = reactions.toMutableSet()
+        union.addAll(seenLabels.value)
+        union.toList()
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        labels.forEach { label ->
+            val present = label in reactions
+            val isNew = seeded && label !in seenLabels.value
+            if (isNew) {
+                // Once the pop finishes, later recompositions (or scrolling the
+                // chip out and back) render it statically.
+                LaunchedEffect(messageId, label) {
+                    delay(motion.durationMs(140).toLong())
+                    seenLabels.value = seenLabels.value + label
                 }
-                if (message.reactions.isNotEmpty()) {
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = message.reactions.joinToString("  "),
-                        style = MaterialTheme.typography.labelMedium,
-                    )
+            }
+            AnimatedVisibility(
+                visible = present,
+                enter = if (isNew) {
+                    fadeIn(motion.tween(140)) + scaleIn(motion.microSpring(), initialScale = 0.6f)
+                } else {
+                    EnterTransition.None
+                },
+                exit = fadeOut(motion.tween(120)) + scaleOut(motion.tween(120)),
+                label = "reactionChip",
+            ) {
+                if (present) {
+                    Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                    ) {
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelMedium,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
                 }
             }
         }
@@ -1125,6 +1384,7 @@ private fun ContactsScreen(
     val contacts = state.contacts
         .filter { it.accountId == state.activeAccountId }
         .sortedBy { it.displayName.lowercase() }
+    val motion = rememberMotion()
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -1150,24 +1410,31 @@ private fun ContactsScreen(
             }
         }
         items(contacts, key = { it.jid }) { contact ->
-            ListItem(
-                modifier = Modifier.clickable { onContactClick(contact) },
-                headlineContent = { Text(contact.displayName) },
-                supportingContent = {
-                    Column {
-                        Text(contact.jid)
-                        contact.status?.let { status ->
-                            Text(
-                                text = status,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
+            Column(
+                // T3: contact rows shift smoothly on reorder/removal.
+                modifier = Modifier.animateItem(
+                    placementSpec = motion.placementSpring(dampingRatio = 0.9f, stiffness = 350f),
+                ),
+            ) {
+                ListItem(
+                    modifier = Modifier.clickable { onContactClick(contact) },
+                    headlineContent = { Text(contact.displayName) },
+                    supportingContent = {
+                        Column {
+                            Text(contact.jid)
+                            contact.status?.let { status ->
+                                Text(
+                                    text = status,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                         }
-                    }
-                },
-                leadingContent = { Avatar(contact.displayName, contact.jid.contains("conference")) },
-                trailingContent = { PresenceDot(contact.presence) },
-            )
-            HorizontalDivider()
+                    },
+                    leadingContent = { Avatar(contact.displayName, contact.jid.contains("conference")) },
+                    trailingContent = { PresenceDot(contact.presence) },
+                )
+                HorizontalDivider()
+            }
         }
     }
 }
@@ -1258,9 +1525,12 @@ private fun FloatingDockItem(
     selected: Boolean,
     onClick: () -> Unit,
 ) {
+    val motion = rememberMotion()
+    val haptics = LocalHapticFeedback.current
     // The selection pill animates through the app motion scheme, scaled by
-    // the appearance engine's animation speed (B1): no bare tween literals.
-    val effectsSpec = MindChatMotionScheme.effectsSpecFor<Color>(LocalMindChatMotionSpeed.current)
+    // the appearance engine's animation speed (B1) and the system reduce-
+    // motion settings (T1): no bare tween literals.
+    val effectsSpec = rememberEffectsSpec<Color>()
     val containerColor by animateColorAsState(
         targetValue = if (selected) {
             MaterialTheme.colorScheme.secondaryContainer
@@ -1279,12 +1549,33 @@ private fun FloatingDockItem(
         animationSpec = effectsSpec,
         label = "floatingDockContent",
     )
+    // T5 Tier A: the icon pops and the label weight emphasizes on selection.
+    // Equal targets make re-tapping the selected item a no-op (no restart);
+    // the spring degrades to a snap under reduced motion.
+    val iconScale by animateFloatAsState(
+        targetValue = if (selected) 1.08f else 1f,
+        animationSpec = motion.microSpring(dampingRatio = 0.6f, stiffness = 700f),
+        label = "floatingDockIconScale",
+    )
+    val labelWeight by animateValueAsState(
+        targetValue = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+        typeConverter = FontWeightConverter,
+        animationSpec = motion.tween(180),
+        label = "floatingDockLabelWeight",
+    )
     Row(
         modifier = Modifier
             .height(52.dp)
             .clip(MindChatDockItemShape)
             .background(containerColor)
-            .clickable(onClick = onClick)
+            .clickable {
+                // T7: a light tick on destination select; never on re-tap of
+                // the already-selected item, never on destructive actions.
+                if (!selected) {
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                }
+                onClick()
+            }
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1293,11 +1584,17 @@ private fun FloatingDockItem(
             imageVector = destinationIcon(destination),
             contentDescription = null,
             tint = contentColor,
-            modifier = Modifier.size(22.dp),
+            modifier = Modifier
+                .size(22.dp)
+                .graphicsLayer {
+                    scaleX = iconScale
+                    scaleY = iconScale
+                },
         )
         Text(
             text = destinationLabel(destination),
             style = MaterialTheme.typography.labelLarge,
+            fontWeight = labelWeight,
             color = contentColor,
         )
     }
@@ -1343,30 +1640,44 @@ private fun PresenceDot(presence: Presence) {
             .size(8.dp)
             .clip(CircleShape)
             .background(
-                when (presence) {
-                    Presence.ONLINE -> status.online
-                    Presence.AWAY -> status.away
-                    Presence.DO_NOT_DISTURB -> MaterialTheme.colorScheme.error
-                    Presence.OFFLINE -> MaterialTheme.colorScheme.outline
-                },
+                animatedDotColor(
+                    target = when (presence) {
+                        Presence.ONLINE -> status.online
+                        Presence.AWAY -> status.away
+                        Presence.DO_NOT_DISTURB -> MaterialTheme.colorScheme.error
+                        Presence.OFFLINE -> MaterialTheme.colorScheme.outline
+                    },
+                    label = "presenceDot",
+                ),
             ),
     )
 }
 
 @Composable
 private fun UnreadBadge(count: Int) {
-    Box(
-        modifier = Modifier
-            .clip(CircleShape)
-            .background(MaterialTheme.colorScheme.primary)
-            .padding(horizontal = 7.dp, vertical = 3.dp),
-        contentAlignment = Alignment.Center,
+    // T3: the badge pops in with fade + snappy scale spring on composition
+    // entry; the count text itself updates instantly (no digit rolling).
+    val motion = rememberMotion()
+    AnimatedVisibility(
+        visible = count > 0,
+        enter = fadeIn(motion.tween(MotionDurations.FastMs)) +
+            scaleIn(motion.microSpring(), initialScale = 0.6f),
+        exit = fadeOut(motion.tween(120)),
+        label = "unreadBadge",
     ) {
-        Text(
-            text = count.toString(),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onPrimary,
-        )
+        Box(
+            modifier = Modifier
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.primary)
+                .padding(horizontal = 7.dp, vertical = 3.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = count.toString(),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
     }
 }
 
@@ -1749,12 +2060,17 @@ private fun AccountDrawerRow(
     onEditProfile: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val haptics = LocalHapticFeedback.current
     ListItem(
         modifier = Modifier
             .fillMaxWidth()
             .clickable(
                 onClickLabel = stringResource(R.string.switch_to_account, account.displayName),
-                onClick = onClick,
+                onClick = {
+                    // T7: light tick when switching accounts from the drawer.
+                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                    onClick()
+                },
             )
             .background(
                 if (isActive) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent,
@@ -1966,7 +2282,7 @@ internal fun ConnectionStatusIndicator(
                 .size(10.dp)
                 .border(2.dp, MaterialTheme.colorScheme.surface, CircleShape)
                 .clip(CircleShape)
-                .background(connectionDotColor(state)),
+                .background(animatedDotColor(connectionDotColor(state), "connectionStatusDot")),
         )
     }
 }
