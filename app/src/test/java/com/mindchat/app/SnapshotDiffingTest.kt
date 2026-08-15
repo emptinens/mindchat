@@ -104,13 +104,25 @@ class SnapshotDiffingTest {
     }
 
     @Test
-    fun changedCustomizationForcesRebuild() {
+    fun changedSettingsForcesRebuild() {
         assertFalse(
             skipDecision(
                 snapshot(),
                 snapshot(),
-                customization = MindChatCustomization(comfortableLayout = false),
-                lastCustomization = MindChatCustomization(),
+                settings = SettingsSnapshot(mapOf(SettingsSchema.comfortableLayout to false)),
+                lastSettings = SettingsSnapshot(),
+            ),
+        )
+    }
+
+    @Test
+    fun changedAccountSettingsForcesRebuild() {
+        assertFalse(
+            skipDecision(
+                snapshot(),
+                snapshot(),
+                accountSettings = mapOf(1L to SettingsSnapshot(mapOf(SettingsSchema.appLockEnabled to true))),
+                lastAccountSettings = emptyMap(),
             ),
         )
     }
@@ -206,18 +218,22 @@ class SnapshotDiffingTest {
         lastSnapshot: FfiCoreSnapshot? = snapshot,
         publishedActiveAccountId: Long = 1L,
         activeAccountId: Long = 1L,
-        customization: MindChatCustomization = MindChatCustomization(),
-        lastCustomization: MindChatCustomization = MindChatCustomization(),
+        settings: SettingsSnapshot = SettingsSnapshot(),
+        lastSettings: SettingsSnapshot = SettingsSnapshot(),
         profiles: Map<Long, AccountProfile> = emptyMap(),
         lastProfiles: Map<Long, AccountProfile> = emptyMap(),
+        accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+        lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     ): Boolean = shouldSkipUiRebuild(
         snapshot = snapshot,
         lastSnapshot = lastSnapshot,
         publishedActiveAccountId = publishedActiveAccountId,
         activeAccountId = activeAccountId,
-        customization = customization,
-        lastCustomization = lastCustomization,
+        settings = settings,
+        lastSettings = lastSettings,
         profiles = profiles,
         lastProfiles = lastProfiles,
+        accountSettings = accountSettings,
+        lastAccountSettings = lastAccountSettings,
     )
 }

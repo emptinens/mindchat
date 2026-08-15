@@ -234,6 +234,12 @@ private fun MindChatShell(
     var deleteConversationId by rememberSaveable { mutableStateOf<Long?>(null) }
     var profileAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
 
+    // Settings sub-navigation (root -> category -> account settings). The
+    // stack is saver-backed so rotation restores where the user was.
+    var settingsNavState by rememberSaveable(stateSaver = SettingsNavSaver) {
+        mutableStateOf(SettingsNavState())
+    }
+
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
@@ -338,17 +344,9 @@ private fun MindChatShell(
                 profile = state.profiles[id],
                 onDismiss = { profileAccountId = null },
                 onSave = { updatedProfile, newDisplayName ->
-                    val trimmedName = newDisplayName.trim()
-                    val renamed = if (trimmedName.isNotEmpty() && trimmedName != account.displayName) {
-                        runCatching { gateway.renameAccount(account.id, trimmedName) }.isSuccess
-                    } else {
-                        true
-                    }
-                    if (renamed) {
-                        gateway.updateProfile(account.id, updatedProfile)
-                        profileAccountId = null
-                    }
-                    renamed
+                    val saved = saveProfile(gateway, account, updatedProfile, newDisplayName)
+                    if (saved) profileAccountId = null
+                    saved
                 },
             )
         }
@@ -467,32 +465,30 @@ private fun MindChatShell(
                         }
                     },
                 )
-                Destination.Settings -> SettingsScreen(
-                    state = state,
-                    contentPadding = padding,
-                    onDynamicColorChange = gateway::toggleDynamicColor,
-                    onComfortableLayoutChange = gateway::toggleComfortableLayout,
-                    appLockAvailable = appLockHost?.isAuthenticationAvailable ?: true,
-                    onAppLockChange = {
-                        val enabled = !state.appLockEnabled
-                        if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
-                            appLockHost?.setAppLockEnabled(enabled)
-                            gateway.toggleAppLock()
-                        }
-                    },
-                    onOpenAccountDrawer = {
-                        scope.launch { drawerState.open() }
-                    },
-                    onOpenActiveProfile = {
-                        profileAccountId = state.activeAccountId
-                    },
-                    onAddAccount = { showAddAccount = true },
-                    onClearProfileImages = {
-                        state.profiles.forEach { (accountId, profile) ->
-                            gateway.updateProfile(accountId, profile.copy(avatarUri = null))
-                        }
-                    },
-                )
+                Destination.Settings -> {
+                    // System back walks the settings back stack first; at the
+                    // root the shell's default (or drawer) handling applies.
+                    BackHandler(enabled = settingsNavState.backStack.size > 1) {
+                        settingsNavState.back()
+                    }
+                    SettingsScreen(
+                        gateway = gateway,
+                        state = state,
+                        navState = settingsNavState,
+                        contentPadding = padding,
+                        onOpenAccountDrawer = {
+                            scope.launch { drawerState.open() }
+                        },
+                        onAddAccount = { showAddAccount = true },
+                        appLockHostAvailable = appLockHost?.isAuthenticationAvailable ?: true,
+                        onAppLockToggle = { enabled ->
+                            if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
+                                appLockHost?.setAppLockEnabled(enabled)
+                                gateway.toggleAppLock()
+                            }
+                        },
+                    )
+                }
             }
         }
     }
@@ -1360,7 +1356,7 @@ private fun AddAccountDialog(
 }
 
 @Composable
-private fun ReconnectDialog(
+internal fun ReconnectDialog(
     account: AccountUi,
     onDismiss: () -> Unit,
     onReconnect: (password: String) -> Boolean,
@@ -1714,7 +1710,7 @@ private fun AccountDrawerRow(
 
 /** Initials or picked-image avatar for an account, with an accessible label. */
 @Composable
-private fun ProfileAvatar(
+internal fun ProfileAvatar(
     account: AccountUi,
     avatarUri: String?,
     contentDescription: String?,
@@ -1817,7 +1813,7 @@ private fun persistAvatarCopy(context: Context, accountId: Long, uri: String?): 
 
 /** Small dot or spinner that mirrors an account's connection state. */
 @Composable
-private fun ConnectionStatusIndicator(
+internal fun ConnectionStatusIndicator(
     state: AccountConnectionState,
     modifier: Modifier = Modifier,
 ) {
@@ -1845,8 +1841,37 @@ private fun ProfileSheet(
     onDismiss: () -> Unit,
     onSave: (profile: AccountProfile, displayName: String) -> Boolean,
 ) {
-    val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        shape = MaterialTheme.shapes.extraLarge,
+    ) {
+        ProfileEditorContent(
+            account = account,
+            profile = profile,
+            onSave = onSave,
+            onCancel = onDismiss,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 24.dp, end = 24.dp, bottom = 32.dp),
+        )
+    }
+}
+
+/**
+ * Shared profile editor body used by the drawer's [ProfileSheet] and the
+ * settings AccountSettings screen: one editor, no duplication (T10).
+ */
+@Composable
+internal fun ProfileEditorContent(
+    account: AccountUi,
+    profile: AccountProfile?,
+    onSave: (profile: AccountProfile, displayName: String) -> Boolean,
+    modifier: Modifier = Modifier,
+    onCancel: (() -> Unit)? = null,
+) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var displayName by rememberSaveable(account.id) { mutableStateOf(account.displayName) }
     var statusMessage by rememberSaveable(account.id) { mutableStateOf(profile?.statusMessage.orEmpty()) }
@@ -1861,128 +1886,143 @@ private fun ProfileSheet(
         uri?.let { avatarUri = it.toString() }
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-        shape = MaterialTheme.shapes.extraLarge,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 24.dp, end = 24.dp, bottom = 32.dp),
-        ) {
-            Text(
-                text = stringResource(R.string.profile_title),
-                style = MaterialTheme.typography.headlineSmall,
+    Column(modifier = modifier) {
+        Text(
+            text = stringResource(R.string.profile_title),
+            style = MaterialTheme.typography.headlineSmall,
+        )
+        Text(
+            text = account.jid,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(20.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ProfileAvatar(
+                account = account,
+                avatarUri = avatarUri,
+                contentDescription = stringResource(R.string.account_avatar, account.displayName),
+                modifier = Modifier.size(72.dp),
             )
-            Text(
-                text = account.jid,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(20.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                ProfileAvatar(
-                    account = account,
-                    avatarUri = avatarUri,
-                    contentDescription = stringResource(R.string.account_avatar, account.displayName),
-                    modifier = Modifier.size(72.dp),
-                )
-                Spacer(Modifier.width(16.dp))
-                Column {
-                    FilledTonalButton(
-                        onClick = {
-                            avatarPicker.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                            )
-                        },
-                    ) {
-                        Text(stringResource(R.string.change_avatar))
-                    }
-                    if (avatarUri != null) {
-                        TextButton(onClick = { avatarUri = null }) {
-                            Text(stringResource(R.string.remove_avatar))
-                        }
-                    }
-                }
-            }
-            Spacer(Modifier.height(16.dp))
-            OutlinedTextField(
-                value = displayName,
-                onValueChange = {
-                    displayName = it
-                    failed = false
-                },
-                label = { Text(stringResource(R.string.display_name)) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = statusMessage,
-                onValueChange = { statusMessage = it },
-                label = { Text(stringResource(R.string.status_message)) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(20.dp))
-            Text(
-                text = stringResource(R.string.accent_color),
-                style = MaterialTheme.typography.titleSmall,
-            )
-            Spacer(Modifier.height(8.dp))
-            AccentSelector(selectedKey = accentKey, onSelect = { accentKey = it })
-            if (failed) {
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    text = stringResource(R.string.not_available_yet),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-            Spacer(Modifier.height(24.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                TextButton(onClick = onDismiss, enabled = !saving) {
-                    Text(stringResource(R.string.cancel))
-                }
-                Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(16.dp))
+            Column {
                 FilledTonalButton(
                     onClick = {
-                        saving = true
-                        failed = false
-                        scope.launch {
-                            val persistedAvatar = withContext(Dispatchers.IO) {
-                                persistAvatarCopy(context, account.id, avatarUri)
-                            }
-                            val saved = onSave(
-                                AccountProfile(
-                                    avatarUri = persistedAvatar,
-                                    statusMessage = statusMessage.trim().ifBlank { null },
-                                    accentKey = accentKey?.takeIf { it != ACCENT_DEFAULT_KEY },
-                                ),
-                                displayName.trim(),
-                            )
-                            saving = false
-                            if (!saved) failed = true
-                        }
+                        avatarPicker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
                     },
-                    enabled = displayName.isNotBlank() && !saving,
                 ) {
-                    Text(
-                        text = if (saving) {
-                            stringResource(R.string.saving)
-                        } else {
-                            stringResource(R.string.save)
-                        },
-                    )
+                    Text(stringResource(R.string.change_avatar))
+                }
+                if (avatarUri != null) {
+                    TextButton(onClick = { avatarUri = null }) {
+                        Text(stringResource(R.string.remove_avatar))
+                    }
                 }
             }
         }
+        Spacer(Modifier.height(16.dp))
+        OutlinedTextField(
+            value = displayName,
+            onValueChange = {
+                displayName = it
+                failed = false
+            },
+            label = { Text(stringResource(R.string.display_name)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = statusMessage,
+            onValueChange = { statusMessage = it },
+            label = { Text(stringResource(R.string.status_message)) },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Spacer(Modifier.height(20.dp))
+        Text(
+            text = stringResource(R.string.accent_color),
+            style = MaterialTheme.typography.titleSmall,
+        )
+        Spacer(Modifier.height(8.dp))
+        AccentSelector(selectedKey = accentKey, onSelect = { accentKey = it })
+        if (failed) {
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = stringResource(R.string.not_available_yet),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (onCancel != null) {
+                TextButton(onClick = onCancel, enabled = !saving) {
+                    Text(stringResource(R.string.cancel))
+                }
+                Spacer(Modifier.width(8.dp))
+            }
+            FilledTonalButton(
+                onClick = {
+                    saving = true
+                    failed = false
+                    scope.launch {
+                        val persistedAvatar = withContext(Dispatchers.IO) {
+                            persistAvatarCopy(context, account.id, avatarUri)
+                        }
+                        val saved = onSave(
+                            AccountProfile(
+                                avatarUri = persistedAvatar,
+                                statusMessage = statusMessage.trim().ifBlank { null },
+                                accentKey = accentKey?.takeIf { it != ACCENT_DEFAULT_KEY },
+                            ),
+                            displayName.trim(),
+                        )
+                        saving = false
+                        if (!saved) failed = true
+                    }
+                },
+                enabled = displayName.isNotBlank() && !saving,
+            ) {
+                Text(
+                    text = if (saving) {
+                        stringResource(R.string.saving)
+                    } else {
+                        stringResource(R.string.save)
+                    },
+                )
+            }
+        }
     }
+}
+
+/**
+ * Shared profile save flow behind [ProfileEditorContent]: rename the account
+ * first (when the display name changed), then persist the profile. Returns
+ * false when the rename was rejected so the editor can surface the failure.
+ */
+internal fun saveProfile(
+    gateway: MindChatGateway,
+    account: AccountUi,
+    updatedProfile: AccountProfile,
+    newDisplayName: String,
+): Boolean {
+    val trimmedName = newDisplayName.trim()
+    val renamed = if (trimmedName.isNotEmpty() && trimmedName != account.displayName) {
+        runCatching { gateway.renameAccount(account.id, trimmedName) }.isSuccess
+    } else {
+        true
+    }
+    if (renamed) {
+        gateway.updateProfile(account.id, updatedProfile)
+    }
+    return renamed
 }
 
 @Composable
@@ -2079,7 +2119,7 @@ private fun AccentSelector(
 }
 
 @Composable
-private fun RenameAccountDialog(
+internal fun RenameAccountDialog(
     account: AccountUi,
     onDismiss: () -> Unit,
     onRename: (displayName: String) -> Boolean,
@@ -2124,7 +2164,7 @@ private fun RenameAccountDialog(
 }
 
 @Composable
-private fun DeleteAccountDialog(
+internal fun DeleteAccountDialog(
     account: AccountUi,
     onDismiss: () -> Unit,
     onConfirm: () -> Boolean,

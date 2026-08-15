@@ -127,4 +127,12 @@
     <string name="repository">Исходный код</string>
     <string name="repository_summary">github.com/emptinens/mindchat</string>
     <string name="close">Закрыть</string>
+    <string name="settings_search">Поиск по настройкам</string>
+    <string name="settings_category_appearance_summary">Цвета, оформление и акцент</string>
+    <string name="settings_category_privacy_summary">Безопасность и конфиденциальность</string>
+    <string name="settings_category_notifications_summary">Уведомления о сообщениях и групповых чатах</string>
+    <string name="settings_category_storage_summary">Локальные данные и хранилище</string>
+    <string name="settings_category_about_summary">Версия, лицензии и исходный код</string>
+    <string name="back">Назад</string>
+    <string name="accounts_empty">На этом устройстве нет аккаунтов</string>
 </resources>

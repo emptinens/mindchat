@@ -74,10 +74,16 @@ data class MindChatUiState(
     val conversations: List<ConversationUi>,
     val messagesByConversation: Map<Long, List<MessageUi>>,
     val profiles: Map<Long, AccountProfile> = emptyMap(),
-    val dynamicColor: Boolean = true,
-    val comfortableLayout: Boolean = true,
-    val appLockEnabled: Boolean = false,
-)
+    val settings: SettingsSnapshot = SettingsSnapshot(),
+    val accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+) {
+    // Convenience accessors kept for theme code and 0.1.6 contract tests.
+    val dynamicColor: Boolean get() = settings.dynamicColor
+
+    val comfortableLayout: Boolean get() = settings.comfortableLayout
+
+    val appLockEnabled: Boolean get() = settings.appLockEnabled
+}
 
 private data class TransportPollResult(
     val snapshot: FfiCoreSnapshot,
@@ -139,6 +145,17 @@ interface MindChatGateway {
     fun toggleDynamicColor()
     fun toggleComfortableLayout()
     fun toggleAppLock()
+
+    /**
+     * Writes one typed global setting through the shared decision path
+     * (sanitize in [GatewayInput], persist via [MindChatPreferences], then
+     * refresh). Pure and side-effect free: shell-level coordination such as
+     * the app lock host state machine stays outside this method.
+     */
+    fun <T> setSetting(key: SettingKey<T>, value: T)
+
+    /** Writes one account-scoped setting; persisted and reflected in state. */
+    fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any)
 }
 
 /**
@@ -168,7 +185,17 @@ class NativeMindChatGateway(
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
 ) : MindChatGateway {
     private var activeAccountId = 0L
-    private var customization = preferences.readCustomization()
+
+    /** Global settings backing the current UI state; [setSetting] is the only writer. */
+    private var settingsCache = SettingsSnapshot(preferences.readAll())
+
+    /**
+     * Per-account settings backing [MindChatUiState.accountSettings]. 0.1.7 has
+     * no PER_ACCOUNT keys yet, so this starts empty; 0.1.8 populates it when
+     * accounts load and [setAccountSetting] updates it.
+     */
+    private var accountSettingsCache: Map<Long, SettingsSnapshot> = emptyMap()
+
     private val pendingOutboxAccounts = mutableSetOf<Long>()
 
     /** When each account entered CONNECTING (epoch ms), used for stall detection. */
@@ -178,13 +205,14 @@ class NativeMindChatGateway(
     private var profilesCache = preferences.readProfiles()
 
     /**
-     * The raw snapshot, profiles, and customization that produced the current
+     * The raw snapshot, profiles, and settings that produced the current
      * [state]. Poll cycles compare against these so an unchanged core skips
      * rebuilding the whole UI state (and the recomposition that would cause).
      */
     private var lastSnapshot: FfiCoreSnapshot? = null
     private var lastProfiles: Map<Long, AccountProfile> = emptyMap()
-    private var lastCustomization: MindChatCustomization = customization
+    private var lastSettings: SettingsSnapshot = settingsCache
+    private var lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap()
 
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
@@ -312,7 +340,9 @@ class NativeMindChatGateway(
         try {
             core.deleteAccount(accountId.toULong())
             preferences.removeProfile(accountId)
+            preferences.removeAccountSettings(accountId)
             profilesCache = preferences.readProfiles()
+            accountSettingsCache = accountSettingsCache - accountId
             markDirty()
             refresh()
             activeAccountId = nextActiveAccountId(state.accounts, accountId, activeAccountId)
@@ -480,15 +510,31 @@ class NativeMindChatGateway(
     }
 
     override fun toggleDynamicColor() {
-        updateCustomization { it.copy(dynamicColor = !it.dynamicColor) }
+        setSetting(SettingsSchema.dynamicColor, !state.settings.dynamicColor)
     }
 
     override fun toggleComfortableLayout() {
-        updateCustomization { it.copy(comfortableLayout = !it.comfortableLayout) }
+        setSetting(SettingsSchema.comfortableLayout, !state.settings.comfortableLayout)
     }
 
     override fun toggleAppLock() {
-        updateCustomization { it.copy(appLockEnabled = !it.appLockEnabled) }
+        setSetting(SettingsSchema.appLockEnabled, !state.settings.appLockEnabled)
+    }
+
+    override fun <T> setSetting(key: SettingKey<T>, value: T) {
+        val sanitized = sanitizeSetting(key, value)
+        preferences.write(key, sanitized)
+        settingsCache = SettingsSnapshot(preferences.readAll())
+        refresh()
+    }
+
+    override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) {
+        @Suppress("UNCHECKED_CAST")
+        val sanitized = sanitizeSetting(key as SettingKey<Any>, value)
+        preferences.writeAccountSetting(accountId, key, sanitized)
+        settingsCache = SettingsSnapshot(preferences.readAll())
+        accountSettingsCache = accountSettingsCache + (accountId to SettingsSnapshot(preferences.readAccountSettings(accountId)))
+        refresh()
     }
 
     /** Test and development utility until server-backed contact search lands. */
@@ -531,10 +577,12 @@ class NativeMindChatGateway(
                 lastSnapshot = lastSnapshot,
                 publishedActiveAccountId = state.activeAccountId,
                 activeAccountId = activeAccountId,
-                customization = customization,
-                lastCustomization = lastCustomization,
+                settings = settingsCache,
+                lastSettings = lastSettings,
                 profiles = profilesCache,
                 lastProfiles = lastProfiles,
+                accountSettings = accountSettingsCache,
+                lastAccountSettings = lastAccountSettings,
             )
         ) {
             return
@@ -542,7 +590,8 @@ class NativeMindChatGateway(
         state = snapshotToUiState(snapshot, profilesCache)
         lastSnapshot = snapshot
         lastProfiles = profilesCache
-        lastCustomization = customization
+        lastSettings = settingsCache
+        lastAccountSettings = accountSettingsCache
     }
 
     private fun markDirty() {
@@ -572,12 +621,6 @@ class NativeMindChatGateway(
         saved
     }
 
-    private fun updateCustomization(update: (MindChatCustomization) -> MindChatCustomization) {
-        customization = update(customization)
-        preferences.writeCustomization(customization)
-        refresh()
-    }
-
     private fun snapshotToUiState(
         snapshot: FfiCoreSnapshot = core.snapshot(),
         profiles: Map<Long, AccountProfile> = profilesCache,
@@ -587,7 +630,8 @@ class NativeMindChatGateway(
             profiles = profiles,
             activeAccountId = activeAccountId,
             connectingSince = connectingSince,
-            customization = customization,
+            settings = settingsCache,
+            accountSettings = accountSettingsCache,
             now = System.currentTimeMillis(),
             timestampFormatter = ::formatTimestamp,
         )
@@ -603,11 +647,7 @@ class NativeMindChatGateway(
 class PreviewMindChatGateway(
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
 ) : MindChatGateway {
-    private var customization = preferences.readCustomization()
-
-    override var state by mutableStateOf(
-        seedState().withCustomization(customization).copy(profiles = preferences.readProfiles()),
-    )
+    override var state by mutableStateOf(seedPreviewState(preferences))
         private set
 
     override fun selectAccount(accountId: Long) {
@@ -715,6 +755,7 @@ class PreviewMindChatGateway(
             .map(ConversationUi::id)
             .toSet()
         preferences.removeProfile(accountId)
+        preferences.removeAccountSettings(accountId)
         state = state.copy(
             accounts = remainingAccounts,
             activeAccountId = nextActiveAccountId(state.accounts, accountId, state.activeAccountId),
@@ -722,6 +763,7 @@ class PreviewMindChatGateway(
             contacts = state.contacts.filterNot { it.accountId == accountId },
             messagesByConversation = state.messagesByConversation.filterKeys { it in remainingConversationIds },
             profiles = state.profiles - accountId,
+            accountSettings = state.accountSettings - accountId,
         )
     }
 
@@ -822,29 +864,50 @@ class PreviewMindChatGateway(
     }
 
     override fun toggleDynamicColor() {
-        updateCustomization { it.copy(dynamicColor = !it.dynamicColor) }
+        setSetting(SettingsSchema.dynamicColor, !state.settings.dynamicColor)
     }
 
     override fun toggleComfortableLayout() {
-        updateCustomization { it.copy(comfortableLayout = !it.comfortableLayout) }
+        setSetting(SettingsSchema.comfortableLayout, !state.settings.comfortableLayout)
     }
 
     override fun toggleAppLock() {
-        updateCustomization { it.copy(appLockEnabled = !it.appLockEnabled) }
+        setSetting(SettingsSchema.appLockEnabled, !state.settings.appLockEnabled)
     }
 
-    private fun updateCustomization(update: (MindChatCustomization) -> MindChatCustomization) {
-        customization = update(customization)
-        preferences.writeCustomization(customization)
-        state = state.withCustomization(customization)
+    override fun <T> setSetting(key: SettingKey<T>, value: T) {
+        val sanitized = sanitizeSetting(key, value)
+        preferences.write(key, sanitized)
+        state = state.copy(settings = SettingsSnapshot(preferences.readAll()))
+    }
+
+    override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) {
+        @Suppress("UNCHECKED_CAST")
+        val sanitized = sanitizeSetting(key as SettingKey<Any>, value)
+        preferences.writeAccountSetting(accountId, key, sanitized)
+        state = state.copy(
+            settings = SettingsSnapshot(preferences.readAll()),
+            accountSettings = state.accountSettings +
+                (accountId to SettingsSnapshot(preferences.readAccountSettings(accountId))),
+        )
     }
 }
 
-private fun MindChatUiState.withCustomization(customization: MindChatCustomization): MindChatUiState = copy(
-    dynamicColor = customization.dynamicColor,
-    comfortableLayout = customization.comfortableLayout,
-    appLockEnabled = customization.appLockEnabled,
-)
+/**
+ * Seeds the preview state: the demo accounts plus any persisted settings,
+ * profiles and account settings, so a gateway instance created over the same
+ * preferences restores everything the previous instance wrote.
+ */
+private fun seedPreviewState(preferences: MindChatPreferences): MindChatUiState {
+    val seed = seedState()
+    return seed.copy(
+        settings = SettingsSnapshot(preferences.readAll()),
+        profiles = preferences.readProfiles(),
+        accountSettings = seed.accounts.associate { account ->
+            account.id to SettingsSnapshot(preferences.readAccountSettings(account.id))
+        },
+    )
+}
 
 private fun seedState(): MindChatUiState {
     val account = AccountUi(

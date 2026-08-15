@@ -7,14 +7,26 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
@@ -29,7 +41,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
@@ -64,34 +78,415 @@ internal fun clearProfileImages(filesDir: File): Int {
 }
 
 /**
- * 0.1.6 detailed settings with M3 Expressive categories. The screen is
- * intentionally explicit about what is implemented: toggles with real backing
- * (dynamic color, comfortable layout, app lock), rows that navigate to
- * existing flows (account drawer, profile sheet, add-account dialog), and
- * local-only placeholders with clear "not implemented yet" supporting text
- * where the domain core does not support the feature yet.
+ * 0.1.7 settings platform. The screen is a thin renderer of pure, JVM-tested
+ * logic: navigation comes from [SettingsNavState], rows come from
+ * [GatewayInput.catalogRows], and every mutation goes through the gateway
+ * contract. Rows without core support render honestly disabled with the
+ * "not implemented yet" supporting text; nothing here fakes behavior.
+ *
+ * The shell owns the three cross-cutting flows that live outside settings
+ * ([onOpenAccountDrawer], [onAddAccount]) plus the device app-lock capability
+ * and the app lock host coordination ([appLockHostAvailable],
+ * [onAppLockToggle]); everything else is driven by [gateway] directly.
  */
 @Composable
 fun SettingsScreen(
+    gateway: MindChatGateway,
+    state: MindChatUiState,
+    navState: SettingsNavState,
+    contentPadding: PaddingValues,
+    onOpenAccountDrawer: () -> Unit,
+    onAddAccount: () -> Unit,
+    appLockHostAvailable: Boolean,
+    onAppLockToggle: (Boolean) -> Unit,
+) {
+    val route = navState.backStack.last()
+    when (route) {
+        SettingsRoute.Root -> SettingsRootScreen(
+            state = state,
+            contentPadding = contentPadding,
+            onCategoryClick = { category ->
+                navState.navigate(
+                    if (category == SettingCategory.ACCOUNTS) {
+                        SettingsRoute.Accounts
+                    } else {
+                        SettingsRoute.Category(category)
+                    },
+                )
+            },
+        )
+
+        is SettingsRoute.Category -> when (route.category) {
+            SettingCategory.ACCOUNTS -> SettingsAccountsScreen(
+                state = state,
+                contentPadding = contentPadding,
+                onBack = { navState.back() },
+                onAccountClick = { accountId -> navState.navigate(SettingsRoute.AccountSettings(accountId)) },
+                onOpenAccountDrawer = onOpenAccountDrawer,
+                onAddAccount = onAddAccount,
+            )
+
+            SettingCategory.STORAGE -> SettingsStorageScreen(
+                state = state,
+                gateway = gateway,
+                contentPadding = contentPadding,
+                onBack = { navState.back() },
+            )
+
+            SettingCategory.ABOUT -> SettingsAboutScreen(
+                contentPadding = contentPadding,
+                onBack = { navState.back() },
+            )
+
+            else -> SettingsCategoryScreen(
+                category = route.category,
+                rows = catalogRows(route.category, state.settings, state.activeAccountId, appLockHostAvailable),
+                contentPadding = contentPadding,
+                onBack = { navState.back() },
+                onToggle = { key, checked ->
+                    if (key == SettingsSchema.appLockEnabled) {
+                        onAppLockToggle(checked)
+                    } else {
+                        gateway.setSetting(key, checked)
+                    }
+                },
+                onAction = { action ->
+                    when (action) {
+                        SettingRowAction.OPEN_ACCENT_PROFILE -> navState.navigate(
+                            SettingsRoute.AccountSettings(state.activeAccountId),
+                        )
+                    }
+                },
+            )
+        }
+
+        SettingsRoute.Accounts -> SettingsAccountsScreen(
+            state = state,
+            contentPadding = contentPadding,
+            onBack = { navState.back() },
+            onAccountClick = { accountId -> navState.navigate(SettingsRoute.AccountSettings(accountId)) },
+            onOpenAccountDrawer = onOpenAccountDrawer,
+            onAddAccount = onAddAccount,
+        )
+
+        is SettingsRoute.AccountSettings -> SettingsAccountSettingsScreen(
+            gateway = gateway,
+            state = state,
+            accountId = route.accountId,
+            contentPadding = contentPadding,
+            onBack = { navState.back() },
+        )
+    }
+}
+
+@Composable
+private fun SettingsRootScreen(
     state: MindChatUiState,
     contentPadding: PaddingValues,
-    onDynamicColorChange: () -> Unit,
-    onComfortableLayoutChange: () -> Unit,
-    appLockAvailable: Boolean,
-    onAppLockChange: () -> Unit,
+    onCategoryClick: (SettingCategory) -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding),
+        contentPadding = PaddingValues(
+            start = 12.dp,
+            top = 8.dp,
+            end = 12.dp,
+            bottom = 24.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.settings_search),
+                supportingText = stringResource(R.string.coming_in_later_release),
+                enabled = false,
+                onClick = {},
+            )
+        }
+        SettingCategory.entries.forEach { category ->
+            item {
+                SettingsCategoryRow(category = category, onClick = { onCategoryClick(category) })
+            }
+        }
+        item {
+            SettingsStaticRow(
+                title = stringResource(R.string.version),
+                supportingText = BuildConfig.VERSION_NAME,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsCategoryScreen(
+    category: SettingCategory,
+    rows: List<SettingRowSpec>,
+    contentPadding: PaddingValues,
+    onBack: () -> Unit,
+    onToggle: (BooleanKey, Boolean) -> Unit,
+    onAction: (SettingRowAction) -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding),
+        contentPadding = PaddingValues(
+            start = 12.dp,
+            top = 8.dp,
+            end = 12.dp,
+            bottom = 24.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            SettingsSubHeader(
+                title = stringResource(categoryLabelRes(category)),
+                onBack = onBack,
+            )
+        }
+        rows.forEach { row ->
+            item {
+                when (row) {
+                    is SettingToggleRowSpec -> SettingsSwitch(
+                        title = stringResource(row.labelRes),
+                        checked = row.checked,
+                        enabled = row.enabled,
+                        supportingText = row.supportingRes?.let { stringResource(it) },
+                        notImplemented = row.notImplemented,
+                        onCheckedChange = { checked -> onToggle(row.key, checked) },
+                    )
+
+                    is SettingActionRowSpec -> SettingsLinkRow(
+                        title = stringResource(row.labelRes),
+                        supportingText = row.supportingRes?.let { stringResource(it) },
+                        enabled = row.enabled,
+                        onClick = { onAction(row.action) },
+                    )
+
+                    is SettingInfoRowSpec -> SettingsStaticRow(
+                        title = stringResource(row.labelRes),
+                        supportingText = row.supportingRes?.let { stringResource(it) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SettingsAccountsScreen(
+    state: MindChatUiState,
+    contentPadding: PaddingValues,
+    onBack: () -> Unit,
+    onAccountClick: (Long) -> Unit,
     onOpenAccountDrawer: () -> Unit,
-    onOpenActiveProfile: () -> Unit,
     onAddAccount: () -> Unit,
-    onClearProfileImages: () -> Unit,
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding),
+        contentPadding = PaddingValues(
+            start = 12.dp,
+            top = 8.dp,
+            end = 12.dp,
+            bottom = 24.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            SettingsSubHeader(
+                title = stringResource(R.string.accounts),
+                onBack = onBack,
+            )
+        }
+        if (state.accounts.isEmpty()) {
+            item {
+                SettingsStaticRow(
+                    title = stringResource(R.string.accounts_empty),
+                )
+            }
+        } else {
+            state.accounts.forEach { account ->
+                item {
+                    SettingsAccountRow(
+                        account = account,
+                        avatarUri = state.profiles[account.id]?.avatarUri,
+                        onClick = { onAccountClick(account.id) },
+                    )
+                }
+            }
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.open_account_menu),
+                onClick = onOpenAccountDrawer,
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.add_account),
+                supportingText = stringResource(R.string.add_account_summary),
+                onClick = onAddAccount,
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsAccountSettingsScreen(
+    gateway: MindChatGateway,
+    state: MindChatUiState,
+    accountId: Long,
+    contentPadding: PaddingValues,
+    onBack: () -> Unit,
+) {
+    val account = state.accounts.firstOrNull { it.id == accountId }
+    if (account == null) {
+        // The account was deleted (from this screen or elsewhere); leave.
+        LaunchedEffect(accountId) { onBack() }
+        return
+    }
+
+    var showReconnect by remember(accountId) { mutableStateOf(false) }
+    var showRename by remember(accountId) { mutableStateOf(false) }
+    var showDelete by remember(accountId) { mutableStateOf(false) }
+
+    if (showReconnect) {
+        ReconnectDialog(
+            account = account,
+            onDismiss = { showReconnect = false },
+            onReconnect = { password ->
+                if (gateway.reconnectAccount(account.id, password)) {
+                    showReconnect = false
+                    true
+                } else {
+                    false
+                }
+            },
+        )
+    }
+
+    if (showRename) {
+        RenameAccountDialog(
+            account = account,
+            onDismiss = { showRename = false },
+            onRename = { name ->
+                runCatching { gateway.renameAccount(account.id, name) }
+                    .onSuccess { showRename = false }
+                    .isSuccess
+            },
+        )
+    }
+
+    if (showDelete) {
+        DeleteAccountDialog(
+            account = account,
+            onDismiss = { showDelete = false },
+            onConfirm = {
+                val deleted = runCatching { gateway.deleteAccount(account.id) }.isSuccess
+                if (deleted) {
+                    showDelete = false
+                    onBack()
+                }
+                deleted
+            },
+        )
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding),
+        contentPadding = PaddingValues(
+            start = 12.dp,
+            top = 8.dp,
+            end = 12.dp,
+            bottom = 24.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            SettingsSubHeader(
+                title = account.displayName,
+                onBack = onBack,
+            )
+        }
+        item {
+            Text(
+                text = account.jid,
+                modifier = Modifier.padding(start = 16.dp, bottom = 4.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        item {
+            SettingsSectionTitle(
+                title = stringResource(R.string.edit_profile_summary, account.displayName),
+            )
+        }
+        item {
+            // Reuses the same editor body as the drawer's ProfileSheet: one
+            // editor, no duplication (T10). The save flow mirrors the sheet.
+            ProfileEditorContent(
+                account = account,
+                profile = state.profiles[accountId],
+                onSave = { updatedProfile, newDisplayName ->
+                    saveProfile(gateway, account, updatedProfile, newDisplayName)
+                },
+            )
+        }
+        item {
+            SettingsSectionTitle(
+                title = stringResource(R.string.actions_for_account, account.displayName),
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.reconnect),
+                supportingText = stringResource(R.string.reconnect_title),
+                onClick = { showReconnect = true },
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.disconnect),
+                onClick = { gateway.disconnectAccount(account.id) },
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.rename_account),
+                onClick = { showRename = true },
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.delete_account),
+                onClick = { showDelete = true },
+            )
+        }
+        // Per-account toggle slots arrive with 0.1.8: rows for
+        // SettingsSchema keys with scope == PER_ACCOUNT render here via
+        // catalogRows, with zero changes to this screen.
+    }
+}
+
+@Composable
+private fun SettingsStorageScreen(
+    state: MindChatUiState,
+    gateway: MindChatGateway,
+    contentPadding: PaddingValues,
+    onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val activeAccount = state.accounts.firstOrNull { it.id == state.activeAccountId }
 
     var localDataBytes by remember { mutableLongStateOf(-1L) }
     var refreshNonce by remember { mutableIntStateOf(0) }
     var showClearImagesDialog by remember { mutableStateOf(false) }
-    var showLicensesDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(refreshNonce) {
         localDataBytes = withContext(Dispatchers.IO) {
@@ -115,7 +510,9 @@ fun SettingsScreen(
                             }
                             // Drop the stored avatar references so the cleared
                             // files are not re-pointed at by stale profiles.
-                            onClearProfileImages()
+                            state.profiles.forEach { (accountId, profile) ->
+                                gateway.updateProfile(accountId, profile.copy(avatarUri = null))
+                            }
                             refreshNonce++
                         }
                     },
@@ -130,6 +527,53 @@ fun SettingsScreen(
             },
         )
     }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(contentPadding),
+        contentPadding = PaddingValues(
+            start = 12.dp,
+            top = 8.dp,
+            end = 12.dp,
+            bottom = 24.dp,
+        ),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        item {
+            SettingsSubHeader(
+                title = stringResource(R.string.storage),
+                onBack = onBack,
+            )
+        }
+        item {
+            val sizeText = if (localDataBytes >= 0L) {
+                Formatter.formatShortFileSize(context, localDataBytes)
+            } else {
+                stringResource(R.string.storage_calculating)
+            }
+            SettingsStaticRow(
+                title = stringResource(R.string.local_data_size),
+                supportingText = stringResource(R.string.local_data_size_summary, sizeText),
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.clear_profile_images),
+                supportingText = stringResource(R.string.clear_profile_images_summary),
+                onClick = { showClearImagesDialog = true },
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingsAboutScreen(
+    contentPadding: PaddingValues,
+    onBack: () -> Unit,
+) {
+    val context = LocalContext.current
+    var showLicensesDialog by remember { mutableStateOf(false) }
 
     if (showLicensesDialog) {
         AlertDialog(
@@ -157,124 +601,12 @@ fun SettingsScreen(
         ),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        item { SettingsSectionTitle(stringResource(R.string.appearance)) }
         item {
-            SettingsSwitch(
-                title = stringResource(R.string.use_dynamic_colors),
-                checked = state.dynamicColor,
-                onCheckedChange = { onDynamicColorChange() },
+            SettingsSubHeader(
+                title = stringResource(R.string.about),
+                onBack = onBack,
             )
         }
-        item {
-            SettingsSwitch(
-                title = stringResource(R.string.comfortable_layout),
-                checked = state.comfortableLayout,
-                onCheckedChange = { onComfortableLayoutChange() },
-            )
-        }
-        item {
-            SettingsLinkRow(
-                title = stringResource(R.string.accent_color),
-                supportingText = stringResource(R.string.accent_per_account),
-                enabled = activeAccount != null,
-                onClick = onOpenActiveProfile,
-            )
-        }
-
-        item { SettingsSectionTitle(stringResource(R.string.accounts)) }
-        item {
-            SettingsSwitch(
-                title = stringResource(R.string.app_lock),
-                checked = state.appLockEnabled,
-                supportingText = stringResource(
-                    if (appLockAvailable) R.string.app_lock_summary else R.string.app_lock_unavailable,
-                ),
-                enabled = appLockAvailable || state.appLockEnabled,
-                onCheckedChange = { onAppLockChange() },
-            )
-        }
-        item {
-            SettingsLinkRow(
-                title = stringResource(R.string.manage_accounts),
-                supportingText = stringResource(R.string.manage_accounts_summary),
-                onClick = onOpenAccountDrawer,
-            )
-        }
-        item {
-            SettingsLinkRow(
-                title = stringResource(R.string.add_account),
-                supportingText = stringResource(R.string.add_account_summary),
-                onClick = onAddAccount,
-            )
-        }
-        item {
-            SettingsLinkRow(
-                title = stringResource(R.string.edit_profile),
-                supportingText = activeAccount?.let {
-                    stringResource(R.string.edit_profile_summary, it.displayName)
-                },
-                enabled = activeAccount != null,
-                onClick = onOpenActiveProfile,
-            )
-        }
-
-        item { SettingsSectionTitle(stringResource(R.string.privacy)) }
-        item {
-            SettingsSwitch(
-                title = stringResource(R.string.message_search),
-                supportingText = stringResource(R.string.message_search_summary),
-                checked = false,
-                enabled = false,
-                notImplemented = true,
-                onCheckedChange = {},
-            )
-        }
-        item {
-            SettingsSwitch(
-                title = stringResource(R.string.encryption),
-                supportingText = stringResource(R.string.encryption_summary),
-                checked = false,
-                enabled = false,
-                notImplemented = true,
-                onCheckedChange = {},
-            )
-        }
-
-        item { SettingsSectionTitle(stringResource(R.string.notifications)) }
-        item {
-            SettingsStaticRow(
-                title = stringResource(R.string.message_notifications),
-                supportingText = stringResource(R.string.coming_in_later_release),
-            )
-        }
-        item {
-            SettingsStaticRow(
-                title = stringResource(R.string.group_notifications),
-                supportingText = stringResource(R.string.coming_in_later_release),
-            )
-        }
-
-        item { SettingsSectionTitle(stringResource(R.string.storage)) }
-        item {
-            val sizeText = if (localDataBytes >= 0L) {
-                Formatter.formatShortFileSize(context, localDataBytes)
-            } else {
-                stringResource(R.string.storage_calculating)
-            }
-            SettingsStaticRow(
-                title = stringResource(R.string.local_data_size),
-                supportingText = stringResource(R.string.local_data_size_summary, sizeText),
-            )
-        }
-        item {
-            SettingsLinkRow(
-                title = stringResource(R.string.clear_profile_images),
-                supportingText = stringResource(R.string.clear_profile_images_summary),
-                onClick = { showClearImagesDialog = true },
-            )
-        }
-
-        item { SettingsSectionTitle(stringResource(R.string.about)) }
         item {
             SettingsStaticRow(
                 title = stringResource(R.string.version),
@@ -307,6 +639,114 @@ fun SettingsScreen(
                 },
             )
         }
+    }
+}
+
+@Composable
+private fun SettingsCategoryRow(category: SettingCategory, onClick: () -> Unit) {
+    ListItem(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        leadingContent = {
+            Icon(
+                imageVector = categoryIcon(category),
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+            )
+        },
+        headlineContent = { Text(stringResource(categoryLabelRes(category))) },
+        supportingContent = { Text(stringResource(categorySummaryRes(category))) },
+        trailingContent = {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        },
+    )
+}
+
+@Composable
+private fun SettingsAccountRow(
+    account: AccountUi,
+    avatarUri: String?,
+    onClick: () -> Unit,
+) {
+    ListItem(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        leadingContent = {
+            ProfileAvatar(
+                account = account,
+                avatarUri = avatarUri,
+                contentDescription = stringResource(R.string.account_avatar, account.displayName),
+                modifier = Modifier.size(40.dp),
+            )
+        },
+        headlineContent = { Text(account.displayName) },
+        supportingContent = { Text(account.jid) },
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                ConnectionStatusIndicator(account.connectionState)
+                Spacer(Modifier.width(8.dp))
+                Icon(
+                    imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+    )
+}
+
+private fun categoryLabelRes(category: SettingCategory): Int = when (category) {
+    SettingCategory.APPEARANCE -> R.string.appearance
+    SettingCategory.ACCOUNTS -> R.string.manage_accounts
+    SettingCategory.PRIVACY_SECURITY -> R.string.privacy
+    SettingCategory.NOTIFICATIONS -> R.string.notifications
+    SettingCategory.STORAGE -> R.string.storage
+    SettingCategory.ABOUT -> R.string.about
+}
+
+private fun categorySummaryRes(category: SettingCategory): Int = when (category) {
+    SettingCategory.APPEARANCE -> R.string.settings_category_appearance_summary
+    SettingCategory.ACCOUNTS -> R.string.manage_accounts_summary
+    SettingCategory.PRIVACY_SECURITY -> R.string.settings_category_privacy_summary
+    SettingCategory.NOTIFICATIONS -> R.string.settings_category_notifications_summary
+    SettingCategory.STORAGE -> R.string.settings_category_storage_summary
+    SettingCategory.ABOUT -> R.string.settings_category_about_summary
+}
+
+private fun categoryIcon(category: SettingCategory): ImageVector = when (category) {
+    SettingCategory.APPEARANCE -> Icons.Filled.Star
+    SettingCategory.ACCOUNTS -> Icons.Filled.Person
+    SettingCategory.PRIVACY_SECURITY -> Icons.Filled.Lock
+    SettingCategory.NOTIFICATIONS -> Icons.Filled.Notifications
+    SettingCategory.STORAGE -> Icons.AutoMirrored.Filled.List
+    SettingCategory.ABOUT -> Icons.Filled.Info
+}
+
+@Composable
+private fun SettingsSubHeader(title: String, onBack: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onBack) {
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                contentDescription = stringResource(R.string.back),
+            )
+        }
+        Spacer(Modifier.width(4.dp))
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+        )
     }
 }
 
@@ -372,7 +812,7 @@ private fun SettingsLinkRow(
         supportingContent = supportingText?.let { text -> { Text(text) } },
         trailingContent = {
             Icon(
-                imageVector = Icons.Filled.KeyboardArrowRight,
+                imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )

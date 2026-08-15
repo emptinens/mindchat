@@ -40,14 +40,16 @@ class SnapshotMappingTest {
         reactions: List<FfiReaction> = emptyList(),
         activeAccountId: Long = 1L,
         connectingSince: Map<Long, Long> = emptyMap(),
-        customization: MindChatCustomization = MindChatCustomization(),
+        settings: SettingsSnapshot = SettingsSnapshot(),
+        accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
         now: Long = 100_000L,
     ) = mapSnapshotToUiState(
         snapshot = FfiCoreSnapshot(accounts, contacts, conversations, messages, reactions),
         profiles = mapOf(1L to AccountProfile(statusMessage = "busy")),
         activeAccountId = activeAccountId,
         connectingSince = connectingSince,
-        customization = customization,
+        settings = settings,
+        accountSettings = accountSettings,
         now = now,
         timestampFormatter = formatter,
     )
@@ -250,21 +252,34 @@ class SnapshotMappingTest {
         assertEquals(Presence.OFFLINE, state.contacts[3].presence)
     }
 
-    // --- Profiles and customization -------------------------------------------
+    // --- Profiles and settings --------------------------------------------------
 
     @Test
-    fun profilesAndCustomizationFlowIntoTheState() {
-        val customization = MindChatCustomization(
-            dynamicColor = false,
-            comfortableLayout = true,
-            appLockEnabled = true,
+    fun profilesAndSettingsFlowIntoTheState() {
+        val settings = SettingsSnapshot(
+            mapOf(
+                SettingsSchema.dynamicColor to false,
+                SettingsSchema.comfortableLayout to true,
+                SettingsSchema.appLockEnabled to true,
+            ),
         )
-        val mapping = map(customization = customization)
+        val mapping = map(settings = settings)
 
         assertEquals(AccountProfile(statusMessage = "busy"), mapping.state.profiles[1L])
         assertFalse(mapping.state.dynamicColor)
         assertTrue(mapping.state.comfortableLayout)
         assertTrue(mapping.state.appLockEnabled)
+    }
+
+    @Test
+    fun accountSettingsFlowIntoTheState() {
+        val mapping = map(
+            accountSettings = mapOf(
+                1L to SettingsSnapshot(mapOf(SettingsSchema.appLockEnabled to true)),
+            ),
+        )
+
+        assertEquals(true, mapping.state.accountSettings[1L]?.get(SettingsSchema.appLockEnabled))
     }
 
     // --- fixtures -------------------------------------------------------------

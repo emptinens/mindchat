@@ -127,4 +127,12 @@
     <string name="repository">Source code</string>
     <string name="repository_summary">github.com/emptinens/mindchat</string>
     <string name="close">Close</string>
+    <string name="settings_search">Search settings</string>
+    <string name="settings_category_appearance_summary">Colors, layout, and accent</string>
+    <string name="settings_category_privacy_summary">Security and privacy controls</string>
+    <string name="settings_category_notifications_summary">Message and group chat alerts</string>
+    <string name="settings_category_storage_summary">Local data and storage</string>
+    <string name="settings_category_about_summary">Version, licenses, and source</string>
+    <string name="back">Back</string>
+    <string name="accounts_empty">No accounts on this device</string>
 </resources>
