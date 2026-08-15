@@ -159,6 +159,27 @@ impl ConnectedState {
         };
     }
 
+    /// MindChat 0.1.8: force an established session down on external request
+    /// (idle watchdog). Stream management state is preserved so a reconnect
+    /// can resume (XEP-0198). Returns `None` when the session is not in the
+    /// ready state (still negotiating, already failing, or shut down).
+    pub(super) fn force_disconnect(&mut self) -> Option<ConnectedEvent> {
+        let Self::Ready { sm_state } = self else {
+            return None;
+        };
+        let sm_state = sm_state.take();
+        *self = Self::Failed {
+            error: Some(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "reconnect requested by local watchdog",
+            )),
+            // The extracted SM state travels inside the returned event; the
+            // worker hands it to the next connecting state for resumption.
+            sm_state: None,
+        };
+        Some(ConnectedEvent::Disconnect { sm_state, error: None })
+    }
+
     fn poll_write_sm_req(
         mut sm_state: Option<&mut SmState>,
         mut stream: Pin<&mut XmppStream>,

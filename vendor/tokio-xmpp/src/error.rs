@@ -61,6 +61,13 @@ pub enum Error {
     /// Received a stream error
     #[error("{0}")]
     StreamError(ReceivedStreamError),
+
+    /// MindChat patch: the jittered reconnect loop exhausted its total retry
+    /// budget (~5 minutes) without re-establishing the stream. The stream is
+    /// still considered recoverable (a later manual connect can succeed), but
+    /// this worker will not retry again on its own.
+    #[error("reconnect attempts exceeded the retry budget")]
+    ReconnectBudgetExhausted,
 }
 
 impl<T: ServerConnectorError + 'static> From<T> for Error {

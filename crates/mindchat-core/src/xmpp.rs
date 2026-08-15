@@ -17,7 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder as RuntimeBuilder;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_xmpp::{
@@ -33,6 +33,7 @@ use tokio_xmpp::{
         jid::{BareJid, Jid},
         message::{Id as XmppMessageId, Lang, Message, MessageType},
         ns,
+        ping::Ping,
         presence::{Presence, Show, Type as PresenceType},
         receipts::{Received as ReceiptReceived, Request as ReceiptRequest},
         roster::{Ask, Item as RosterItem, Roster, Subscription},
@@ -70,6 +71,31 @@ const REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// Backstop for the registration worker channel: slightly longer than the
 /// phase deadline so the worker's own timeout wins with a precise reason.
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(35);
+/// Tuned XMPP stream timeouts (0.1.8 P0-2), applied at both connector sites.
+/// A soft timeout after `read_timeout` of silence makes the stanzastream
+/// worker emit a liveness ping; if the peer stays silent for another
+/// `response_timeout`, the stream hard-fails and reconnects. The previous
+/// 300s/300s defaults let a dead link sit as stale "Online" for ~10 minutes.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(90);
+const STREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_TIMEOUTS: Timeouts =
+    Timeouts { read_timeout: STREAM_READ_TIMEOUT, response_timeout: STREAM_RESPONSE_TIMEOUT };
+/// XEP-0199 ping cadence in the worker loop while a session is live. The
+/// server's answer counts as inbound data, keeping the stale watchdog from
+/// tripping on otherwise idle-but-healthy sessions.
+const PING_INTERVAL: Duration = Duration::from_secs(45);
+/// How long a live session may go without any inbound data before the
+/// watchdog forces a reconnect (bounds stale "Online" to ~3 minutes even
+/// against a half-dead server that only echoes keep-alives).
+const INBOUND_STALE_TIMEOUT: Duration = Duration::from_secs(180);
+/// Granularity of the stale-session check; the actual decision uses
+/// [`INBOUND_STALE_TIMEOUT`], not this interval.
+const WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Happy Eyeballs-lite head start for the preferred address family before
+/// racing the remaining candidates of the same endpoint.
+const HAPPY_EYEBALLS_HEAD_START: Duration = Duration::from_millis(250);
+/// Upper bound on addresses collected per port during resolution.
+const MAX_ADDRESSES_PER_PORT: usize = 4;
 
 /// One-shot XEP-0077 in-band registration request.
 ///
@@ -352,6 +378,7 @@ struct WorkerConnection {
     jid: BareJid,
     password: String,
     server: String,
+    auto_reconnect: bool,
 }
 
 impl WorkerConnection {
@@ -371,6 +398,7 @@ impl WorkerConnection {
             jid,
             password: request.password.into_inner(),
             server,
+            auto_reconnect: request.auto_reconnect,
         })
     }
 }
@@ -383,12 +411,16 @@ async fn run_worker(
 ) {
     install_rustls_provider();
     let account_id = connection.account_id;
+    let auto_reconnect = connection.auto_reconnect;
+    // P0-3: one TokioResolver reused for every SRV lookup of this worker,
+    // instead of rebuilding the system configuration per resolution.
+    let mut srv_resolver: Option<TokioResolver> = None;
     // The entire connect phase (DNS plus every candidate handshake) runs under
     // one hard deadline so a terminal event is guaranteed within
     // CONNECT_PHASE_TIMEOUT, and it is selectable against the command channel
     // so a user disconnect during "connecting" is honored immediately.
     let phase = async {
-        let attempts = resolve_endpoints(&connection.server)
+        let attempts = resolve_endpoints_with(&connection.server, &mut srv_resolver)
             .await
             .map_err(|detail| ConnectFailure { detail, recoverable: true })?;
         connect_attempt(&connection, attempts).await
@@ -436,19 +468,33 @@ async fn run_worker(
         }
     };
     let mut stream_capabilities = BTreeSet::new();
+    // P0-1/P0-2: whether the account currently has a live session. The ping
+    // and the stale-inbound watchdog only run while live; a recoverable
+    // Disconnected drops it to false but keeps the worker polling so the
+    // vendored stanzastream can resume (XEP-0198).
+    let mut session_live = false;
     if let Some(event) = pending_event {
-        let keep_running = handle_client_event(
+        let action = handle_client_event(
             account_id,
             &mut client,
             event,
             &mut stream_capabilities,
             &event_sender,
+            auto_reconnect,
+            &mut session_live,
         )
         .await;
-        if !keep_running {
+        if action == LoopAction::Stop {
             return;
         }
     }
+
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut watchdog_interval = tokio::time::interval(WATCHDOG_CHECK_INTERVAL);
+    watchdog_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_inbound = Instant::now();
+    let mut ping_counter = 0u64;
 
     loop {
         tokio::select! {
@@ -466,6 +512,8 @@ async fn run_worker(
                     let _ = response_sender.send(result);
                 }
                 Some(WorkerCommand::Disconnect { response_sender }) => {
+                    // A user-requested disconnect stays immediate: the worker
+                    // closes the stream and exits regardless of auto_reconnect.
                     let result =
                         match tokio::time::timeout(WORKER_SEND_TIMEOUT, client.send_end()).await {
                             Ok(result) => result.map_err(map_xmpp_error),
@@ -481,15 +529,57 @@ async fn run_worker(
                     break;
                 }
             },
+            _ = ping_interval.tick(), if session_live => {
+                // XEP-0199 keep-alive. Bounded like every send; the response
+                // counts as inbound data for the watchdog.
+                ping_counter = ping_counter.wrapping_add(1);
+                let ping: Stanza =
+                    Iq::from_get(format!("mindchat-ping-{ping_counter}"), Ping).into();
+                send_stanza_bounded(&mut client, ping).await;
+            }
+            _ = watchdog_interval.tick(), if session_live => {
+                if is_inbound_stale(
+                    Instant::now().duration_since(last_inbound),
+                    INBOUND_STALE_TIMEOUT,
+                ) {
+                    session_live = false;
+                    send_event(
+                        &event_sender,
+                        TransportEvent::Disconnected {
+                            account_id,
+                            recoverable: true,
+                            detail: Some(
+                                "no inbound data from the server for 3 minutes".to_owned(),
+                            ),
+                        },
+                    );
+                    if auto_reconnect {
+                        // Force the stale session down; the vendored
+                        // stanzastream reconnects with jittered backoff and
+                        // XEP-0198 resume.
+                        client.request_reconnect().await;
+                    } else {
+                        // Without auto-reconnect the worker exits exactly
+                        // like any other disconnect; a manual connect can
+                        // bring the account back.
+                        break;
+                    }
+                }
+            }
             event = client.next() => if let Some(event) = event {
-                    let keep_running = handle_client_event(
+                    // Any inbound activity (stanzas, resets, resumes) proves
+                    // the link is alive; reset the stale watchdog.
+                    last_inbound = Instant::now();
+                    let action = handle_client_event(
                         account_id,
                         &mut client,
                         event,
                         &mut stream_capabilities,
                         &event_sender,
+                        auto_reconnect,
+                        &mut session_live,
                     ).await;
-                    if !keep_running {
+                    if action == LoopAction::Stop {
                         break;
                     }
             } else {
@@ -513,6 +603,7 @@ struct ReadyClient {
 }
 
 /// A terminal connect failure with a UI-safe reason.
+#[derive(Clone)]
 struct ConnectFailure {
     detail: String,
     /// False when the server rejected the credentials, so the account is
@@ -520,9 +611,40 @@ struct ConnectFailure {
     recoverable: bool,
 }
 
-/// Attempts each candidate endpoint in order and returns the first client
-/// whose handshake produces a usable event within
-/// [`CONNECT_ATTEMPT_TIMEOUT`].
+/// Candidates for one connection attempt grouped by `(port, use_direct_tls)`.
+///
+/// Addresses of the same endpoint (for example one A and one AAAA record for
+/// `host:5222`) form one race group so a dead address family cannot block the
+/// other for a full attempt budget.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct AttemptGroup {
+    port: u16,
+    direct_tls: bool,
+    addresses: Vec<SocketAddr>,
+}
+
+/// Splits the ordered candidate list into consecutive groups that share a
+/// port and TLS mode, preserving the plain-endpoints-before-SRV ordering.
+#[must_use]
+fn group_attempts(attempts: Vec<(SocketAddr, bool)>) -> Vec<AttemptGroup> {
+    let mut groups: Vec<AttemptGroup> = Vec::new();
+    for (address, direct_tls) in attempts {
+        match groups.last_mut() {
+            Some(group) if group.port == address.port() && group.direct_tls == direct_tls => {
+                group.addresses.push(address);
+            }
+            _ => groups.push(AttemptGroup {
+                port: address.port(),
+                direct_tls,
+                addresses: vec![address],
+            }),
+        }
+    }
+    groups
+}
+
+/// Attempts each candidate group in order and returns the first client whose
+/// handshake produces a usable event within [`CONNECT_ATTEMPT_TIMEOUT`].
 ///
 /// tokio-xmpp retries failed connections internally without surfacing them,
 /// so each attempt is bounded here and the next candidate (for example
@@ -536,42 +658,149 @@ async fn connect_attempt(
     connection: &WorkerConnection,
     attempts: Vec<(SocketAddr, bool)>,
 ) -> Result<ReadyClient, ConnectFailure> {
-    let mut last_error = String::from("no connection candidates");
-    for (endpoint, direct_tls) in attempts {
-        let mut client = if direct_tls {
-            Client::new_direct_tls_with_config(
-                connection.jid.clone(),
-                connection.password.clone(),
-                DnsConfig::addr(&endpoint.to_string()),
-                Timeouts::default(),
-            )
-        } else {
-            Client::new_starttls(
-                connection.jid.clone(),
-                connection.password.clone(),
-                DnsConfig::addr(&endpoint.to_string()),
-                Timeouts::default(),
-            )
-        };
-        match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, client.next()).await {
-            Ok(Some(event)) => {
-                if let Some(failure) = terminal_failure_for_event(&event) {
-                    return Err(failure);
+    let mut last_failure =
+        ConnectFailure { detail: String::from("no connection candidates"), recoverable: true };
+    for group in group_attempts(attempts) {
+        match try_group(connection, group).await {
+            Ok(ready) => return Ok(ready),
+            Err(failure) => {
+                if let Some(terminal) = terminal_if_auth(failure.clone()) {
+                    // Rejected credentials are terminal: the server decided,
+                    // so no other candidate can succeed. Fail fast without a
+                    // second handshake, exactly like 0.1.7.
+                    return Err(terminal);
                 }
-                return Ok(ReadyClient { client, pending_event: Some(event) });
-            }
-            Ok(None) => {
-                last_error = format!("connection to {endpoint} closed during handshake");
-            }
-            Err(_) => {
-                last_error = format!(
-                    "connection to {endpoint} timed out after {} seconds",
-                    CONNECT_ATTEMPT_TIMEOUT.as_secs()
-                );
+                last_failure = failure;
             }
         }
     }
-    Err(ConnectFailure { detail: last_error, recoverable: true })
+    Err(last_failure)
+}
+
+/// Returns the failure when it is non-recoverable (the server rejected the
+/// credentials and no other candidate can help), so `connect_attempt` can
+/// fail fast instead of trying another handshake. Recoverable failures are
+/// filtered out and only remembered as the last detail.
+#[must_use]
+fn terminal_if_auth(failure: ConnectFailure) -> Option<ConnectFailure> {
+    (!failure.recoverable).then_some(failure)
+}
+
+/// Races every address of one `(port, TLS mode)` group with a Happy
+/// Eyeballs-lite head start: the first address is polled for
+/// [`HAPPY_EYEBALLS_HEAD_START`], then all remaining addresses are raced
+/// concurrently. The whole group is bounded by [`CONNECT_ATTEMPT_TIMEOUT`].
+async fn try_group(
+    connection: &WorkerConnection,
+    group: AttemptGroup,
+) -> Result<ReadyClient, ConnectFailure> {
+    let mut addresses = group.addresses.into_iter();
+    let first_address =
+        addresses.next().expect("an attempt group always contains at least one address");
+    let mut first_client = new_connect_client(connection, first_address, group.direct_tls);
+
+    // Head start for the preferred address family.
+    let head_start = tokio::time::timeout(HAPPY_EYEBALLS_HEAD_START, first_client.next()).await;
+    match head_start {
+        Ok(Some(event)) => return first_event_to_ready(first_client, event),
+        Ok(None) => {
+            return Err(ConnectFailure {
+                detail: format!("connection to {first_address} closed during handshake"),
+                recoverable: true,
+            });
+        }
+        // Head start elapsed (or the first client errored) without a usable
+        // event: race the first client against the remaining addresses.
+        Err(_) => {}
+    }
+
+    let mut racing: Vec<Client> = Vec::with_capacity(addresses.len() + 1);
+    racing.push(first_client);
+    for address in addresses {
+        racing.push(new_connect_client(connection, address, group.direct_tls));
+    }
+    let outcome = tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, async {
+        // Each racer owns its client and yields it back with the first event,
+        // so the winner's client can be returned to the session loop.
+        let mut pending = racing
+            .into_iter()
+            .map(|mut client| {
+                Box::pin(async move { (client.next().await, client) })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<Output = (Option<TokioXmppEvent>, Client)>
+                                + Send,
+                        >,
+                    >
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let (result, _, remaining) = futures::future::select_all(pending).await;
+            pending = remaining;
+            let (event, client) = result;
+            match event {
+                Some(event) => return Ok((client, event)),
+                None if pending.is_empty() => {
+                    return Err(());
+                }
+                None => {
+                    // This racer's handshake closed without an event; keep
+                    // racing the remaining addresses.
+                }
+            }
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok((client, event))) => first_event_to_ready(client, event),
+        Ok(Err(())) => Err(ConnectFailure {
+            detail: format!("connection to port {} closed during handshake", group.port),
+            recoverable: true,
+        }),
+        Err(_) => Err(ConnectFailure {
+            detail: format!(
+                "connection to port {} timed out after {} seconds",
+                group.port,
+                CONNECT_ATTEMPT_TIMEOUT.as_secs()
+            ),
+            recoverable: true,
+        }),
+    }
+}
+
+/// Builds a client for one concrete endpoint with the tuned stream timeouts.
+fn new_connect_client(
+    connection: &WorkerConnection,
+    endpoint: SocketAddr,
+    direct_tls: bool,
+) -> Client {
+    if direct_tls {
+        Client::new_direct_tls_with_config(
+            connection.jid.clone(),
+            connection.password.clone(),
+            DnsConfig::addr(&endpoint.to_string()),
+            STREAM_TIMEOUTS,
+        )
+    } else {
+        Client::new_starttls(
+            connection.jid.clone(),
+            connection.password.clone(),
+            DnsConfig::addr(&endpoint.to_string()),
+            STREAM_TIMEOUTS,
+        )
+    }
+}
+
+/// Converts the winning handshake event into a ready client, or surfaces a
+/// terminal failure (rejected credentials) with its precise reason.
+fn first_event_to_ready(
+    client: Client,
+    event: TokioXmppEvent,
+) -> Result<ReadyClient, ConnectFailure> {
+    if let Some(failure) = terminal_failure_for_event(&event) {
+        return Err(failure);
+    }
+    Ok(ReadyClient { client, pending_event: Some(event) })
 }
 
 /// Bounded wrapper around the full registration session so a stalled server
@@ -667,7 +896,7 @@ async fn registration_attempt<C: ServerConnector>(
     connector: C,
 ) -> Result<(), RegistrationAttemptError> {
     let (pending, _channel_binding) = connector
-        .connect(jid, ns::JABBER_CLIENT, Timeouts::default())
+        .connect(jid, ns::JABBER_CLIENT, STREAM_TIMEOUTS)
         .await
         .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
     let (features, mut stream) = pending
@@ -883,6 +1112,51 @@ fn disconnected_is_recoverable(error: &tokio_xmpp::Error) -> bool {
     !is_auth_error(error)
 }
 
+/// What the worker loop should do after handling one client event.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum LoopAction {
+    /// Keep polling the same client. For a recoverable mid-session
+    /// `Disconnected` with auto-reconnect enabled this means the vendored
+    /// stanzastream keeps reconnecting (XEP-0198 resume).
+    Keep,
+    /// Drop the client and end the worker (non-recoverable failure, disabled
+    /// auto-reconnect, reconnect budget exhausted, or stream end).
+    Stop,
+}
+
+/// True when the vendored reconnect loop gave up after its total retry
+/// budget. The account is still recoverable, but this worker will not retry
+/// on its own, so the loop must end.
+#[must_use]
+fn reconnect_budget_exhausted(error: &tokio_xmpp::Error) -> bool {
+    matches!(error, tokio_xmpp::Error::ReconnectBudgetExhausted)
+}
+
+/// Pure reconnect decision for a client event. This is the single place that
+/// maps a `Disconnected` to keep-polling (resume) or worker exit, so tests
+/// can drive it without a network.
+#[must_use]
+fn reconnect_decision(event: &TokioXmppEvent, auto_reconnect: bool) -> LoopAction {
+    let TokioXmppEvent::Disconnected(error) = event else {
+        return LoopAction::Keep;
+    };
+    if reconnect_budget_exhausted(error) {
+        return LoopAction::Stop;
+    }
+    if disconnected_is_recoverable(error) && auto_reconnect {
+        return LoopAction::Keep;
+    }
+    LoopAction::Stop
+}
+
+/// Pure stale-session decision for the inbound watchdog. `idle` is the time
+/// since the last inbound event; `threshold` is [`INBOUND_STALE_TIMEOUT`].
+/// Kept free of time sources so unit tests can drive it deterministically.
+#[must_use]
+fn is_inbound_stale(idle: Duration, threshold: Duration) -> bool {
+    idle > threshold
+}
+
 #[allow(clippy::too_many_lines)]
 async fn handle_client_event(
     account_id: AccountId,
@@ -890,9 +1164,12 @@ async fn handle_client_event(
     event: TokioXmppEvent,
     stream_capabilities: &mut BTreeSet<ProtocolCapability>,
     event_sender: &Sender<TransportEvent>,
-) -> bool {
+    auto_reconnect: bool,
+    session_live: &mut bool,
+) -> LoopAction {
     match event {
         TokioXmppEvent::Online { bound_jid, features, .. } => {
+            *session_live = true;
             *stream_capabilities = stream_capabilities_from_features(&features);
             send_event(
                 event_sender,
@@ -914,9 +1191,10 @@ async fn handle_client_event(
                 )
                 .await;
             }
-            true
+            LoopAction::Keep
         }
         TokioXmppEvent::Disconnected(error) => {
+            *session_live = false;
             send_event(
                 event_sender,
                 TransportEvent::Disconnected {
@@ -925,7 +1203,7 @@ async fn handle_client_event(
                     detail: Some(error.to_string()),
                 },
             );
-            false
+            reconnect_decision(&TokioXmppEvent::Disconnected(error), auto_reconnect)
         }
         TokioXmppEvent::Stanza(Stanza::Message(message)) => {
             // Receipt payloads are independent of message bodies: a stanza may
@@ -943,17 +1221,17 @@ async fn handle_client_event(
             if let Some(event) = translate_incoming_message(account_id, message) {
                 send_event(event_sender, event);
             }
-            true
+            LoopAction::Keep
         }
         TokioXmppEvent::Stanza(Stanza::Presence(presence)) => {
             if let Some(event) = translate_presence(account_id, presence) {
                 send_event(event_sender, event);
             }
-            true
+            LoopAction::Keep
         }
         TokioXmppEvent::Stanza(Stanza::Iq(iq)) => {
             handle_iq(account_id, client, iq, stream_capabilities, event_sender).await;
-            true
+            LoopAction::Keep
         }
     }
 }
@@ -1217,23 +1495,56 @@ pub async fn resolve_endpoint(server: &str) -> Result<SocketAddr, String> {
         .ok_or_else(|| format!("cannot resolve XMPP server {server}"))
 }
 
+/// One SRV answer used by the pure RFC 2782 ordering decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SrvCandidate {
+    priority: u16,
+    weight: u16,
+    target: String,
+    port: u16,
+}
+
+/// Orders SRV answers per RFC 2782: priority ascending, then weight
+/// descending (higher weight is tried first). Deterministic and pure so the
+/// connect path is testable without DNS.
+#[must_use]
+fn order_srv_candidates(mut records: Vec<SrvCandidate>) -> Vec<SrvCandidate> {
+    records.sort_by(|a, b| a.priority.cmp(&b.priority).then(b.weight.cmp(&a.weight)));
+    records
+}
+
 /// Resolves the ordered connection candidates for a server.
 ///
 /// Each candidate is a `(socket address, use_direct_tls)` pair. Explicit
-/// endpoints resolve to a single candidate (StartTLS unless the port is the
-/// direct-TLS port 5223); bare domains get a StartTLS candidate on the default
-/// port 5222, a direct-TLS fallback on port 5223, and finally a bounded
-/// best-effort hickory SRV candidate appended after the plain ones. The whole
-/// resolution is capped by [`DNS_TOTAL_TIMEOUT`] so a wedged system resolver
-/// cannot stall the connect phase forever.
+/// endpoints resolve to their addresses (StartTLS unless the port is the
+/// direct-TLS port 5223); bare domains get StartTLS addresses on the default
+/// port 5222, a direct-TLS fallback on port 5223, and finally the bounded
+/// best-effort hickory SRV candidates appended after the plain ones (0.1.4
+/// rationale). All addresses of a host are collected, capped at
+/// [`MAX_ADDRESSES_PER_PORT`], so the connect path can race address families.
+/// The whole resolution is capped by [`DNS_TOTAL_TIMEOUT`] so a wedged system
+/// resolver cannot stall the connect phase forever.
 async fn resolve_endpoints(server: &str) -> Result<Vec<(SocketAddr, bool)>, String> {
+    let mut resolver_cache = None;
+    resolve_endpoints_with(server, &mut resolver_cache).await
+}
+
+/// [`resolve_endpoints`] against a worker-cached [`TokioResolver`] (P0-3):
+/// the resolver is built once from the system configuration and reused for
+/// every SRV lookup of the worker instead of being rebuilt per resolution.
+async fn resolve_endpoints_with(
+    server: &str,
+    resolver_cache: &mut Option<TokioResolver>,
+) -> Result<Vec<(SocketAddr, bool)>, String> {
     let server = server.trim();
     tokio::time::timeout(DNS_TOTAL_TIMEOUT, async {
         let mut attempts = Vec::new();
         if let Some((host, port)) =
             split_host_and_port(server).map_err(|error| error.to_string())?
         {
-            attempts.push((resolve_host(&host, port).await?, port == 5223));
+            attempts.extend(
+                resolve_host(&host, port).await?.into_iter().map(|address| (address, port == 5223)),
+            );
             return Ok(attempts);
         }
         if let Ok(ip) = server.parse::<IpAddr>() {
@@ -1244,15 +1555,17 @@ async fn resolve_endpoints(server: &str) -> Result<Vec<(SocketAddr, bool)>, Stri
         // Plain getaddrinfo candidates come first: they are reliable on
         // Android and usually succeed or fail fast. A failed single lookup is
         // skipped, not fatal, so SRV can still rescue SRV-dependent domains.
-        if let Ok(endpoint) = resolve_host(server, 5222).await {
-            attempts.push((endpoint, false));
+        if let Ok(addresses) = resolve_host(server, 5222).await {
+            attempts.extend(addresses.into_iter().map(|address| (address, false)));
         }
-        if let Ok(endpoint) = resolve_host(server, 5223).await {
-            attempts.push((endpoint, true));
+        if let Ok(addresses) = resolve_host(server, 5223).await {
+            attempts.extend(addresses.into_iter().map(|address| (address, true)));
         }
         // Bounded best-effort SRV fallback, never on the hot path.
-        if let Ok(Some(endpoint)) = tokio::time::timeout(SRV_TIMEOUT, srv_endpoint(server)).await {
-            attempts.push((endpoint, false));
+        if let Ok(srv_attempts) =
+            tokio::time::timeout(SRV_TIMEOUT, srv_endpoints(server, resolver_cache)).await
+        {
+            attempts.extend(srv_attempts);
         }
         if attempts.is_empty() {
             return Err(format!("cannot resolve XMPP server {server}"));
@@ -1263,41 +1576,74 @@ async fn resolve_endpoints(server: &str) -> Result<Vec<(SocketAddr, bool)>, Stri
     .map_err(|_| "DNS resolution timed out".to_owned())?
 }
 
-/// Attempts a `_xmpp-client._tcp` SRV lookup, then resolves the best target.
-async fn srv_endpoint(domain: &str) -> Option<SocketAddr> {
-    let Ok((_, mut options)) = hickory_resolver::system_conf::read_system_conf() else {
-        return None;
-    };
-    options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-    let Ok(resolver) = TokioResolver::builder_tokio().ok()?.with_options(options).build() else {
-        return None;
-    };
-    let Ok(lookup) = resolver.srv_lookup(format!("_xmpp-client._tcp.{domain}.")).await else {
-        return None;
-    };
-    for record in lookup.answers() {
-        let RData::SRV(ref srv) = record.data else { continue };
-        let target = srv.target.to_ascii();
-        if target != "."
-            && let Ok(endpoint) = resolve_host(&target, srv.port).await
-        {
-            return Some(endpoint);
-        }
+/// Lazily builds the worker's [`TokioResolver`] from the system
+/// configuration. The resolver is kept for the worker's lifetime so repeated
+/// SRV lookups do not re-read the system configuration.
+fn cached_srv_resolver(cache: &mut Option<TokioResolver>) -> Option<&TokioResolver> {
+    if cache.is_none() {
+        let (_, mut options) = hickory_resolver::system_conf::read_system_conf().ok()?;
+        options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+        *cache = TokioResolver::builder_tokio().ok()?.with_options(options).build().ok();
     }
-    None
+    cache.as_ref()
 }
 
-/// Resolves a hostname through the operating system resolver (getaddrinfo).
-async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr, String> {
+/// Attempts a `_xmpp-client._tcp` SRV lookup, orders all answers by priority
+/// then weight (RFC 2782), and resolves every target to its addresses
+/// (capped at [`MAX_ADDRESSES_PER_PORT`] each). Returns the ordered
+/// `(address, use_direct_tls)` candidates; SRV targets are StartTLS unless
+/// the record explicitly points at port 5223.
+async fn srv_endpoints(
+    domain: &str,
+    resolver_cache: &mut Option<TokioResolver>,
+) -> Vec<(SocketAddr, bool)> {
+    let Some(resolver) = cached_srv_resolver(resolver_cache) else {
+        return Vec::new();
+    };
+    let Ok(lookup) = resolver.srv_lookup(format!("_xmpp-client._tcp.{domain}.")).await else {
+        return Vec::new();
+    };
+    let records = lookup
+        .answers()
+        .iter()
+        .filter_map(|record| {
+            let RData::SRV(ref srv) = record.data else { return None };
+            let target = srv.target.to_ascii();
+            (target != ".").then_some(SrvCandidate {
+                priority: srv.priority,
+                weight: srv.weight,
+                target,
+                port: srv.port,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut attempts = Vec::new();
+    for record in order_srv_candidates(records) {
+        if let Ok(addresses) = resolve_host(&record.target, record.port).await {
+            attempts.extend(addresses.into_iter().map(|address| (address, record.port == 5223)));
+        }
+    }
+    attempts
+}
+
+/// Resolves a hostname through the operating system resolver (getaddrinfo),
+/// collecting up to [`MAX_ADDRESSES_PER_PORT`] addresses per port so the
+/// connect path can race address families (Happy Eyeballs-lite) instead of
+/// pinning to whatever address the system resolver listed first.
+async fn resolve_host(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     let host = host.trim();
     if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(vec![SocketAddr::new(ip, port)]);
     }
-    tokio::net::lookup_host((host, port))
+    let addresses = tokio::net::lookup_host((host, port))
         .await
         .map_err(|error| format!("cannot resolve XMPP server {host}:{port}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("XMPP server {host}:{port} resolved to no addresses"))
+        .take(MAX_ADDRESSES_PER_PORT)
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!("XMPP server {host}:{port} resolved to no addresses"));
+    }
+    Ok(addresses)
 }
 
 fn split_host_and_port(server: &str) -> Result<Option<(String, u16)>, TransportError> {
@@ -1838,6 +2184,176 @@ mod tests {
         assert_eq!(
             registration_error_detail(&error(DefinedCondition::InternalServerError)),
             "the server refused the registration"
+        );
+    }
+
+    #[test]
+    fn backoff_sequence_is_jittered_deterministic_and_budgeted() {
+        // Pure generator from the vendored stanzastream: same seed reproduces
+        // the same sequence, every sleep lies in [base/2, base], the base
+        // doubles 1s -> 30s cap, and a small budget terminates the cycle.
+        use tokio_xmpp::stanzastream::backoff::{Backoff, MAX_BACKOFF_BASE, RECONNECT_BUDGET};
+        let mut a = Backoff::new(42, RECONNECT_BUDGET);
+        let mut b = Backoff::new(42, RECONNECT_BUDGET);
+        let mut expected_base = Duration::from_secs(1);
+        for _ in 0..10 {
+            let sleep_a = a.next_sleep().expect("budget must not run out");
+            let sleep_b = b.next_sleep().expect("budget must not run out");
+            assert_eq!(sleep_a, sleep_b, "same seed must reproduce the sequence");
+            let half = expected_base / 2;
+            assert!(sleep_a >= half, "sleep {sleep_a:?} below base/2 {half:?}");
+            assert!(sleep_a <= expected_base, "sleep {sleep_a:?} above base {expected_base:?}");
+            let doubled = expected_base * 2;
+            expected_base = if doubled > MAX_BACKOFF_BASE { MAX_BACKOFF_BASE } else { doubled };
+        }
+        assert_eq!(expected_base, MAX_BACKOFF_BASE, "base must cap at 30s");
+
+        // A tiny budget must terminate instead of overflowing.
+        let mut tiny = Backoff::new(7, Duration::from_secs(2));
+        let mut emitted = 0;
+        while tiny.next_sleep().is_some() {
+            emitted += 1;
+            assert!(emitted < 100, "budgeted backoff must terminate");
+        }
+        assert!(emitted >= 1, "a 2s budget covers at least one sleep");
+    }
+
+    #[test]
+    fn reconnect_decision_keeps_polling_only_for_recoverable_loss_with_auto_reconnect() {
+        let io_loss = |kind: std::io::ErrorKind| {
+            TokioXmppEvent::Disconnected(tokio_xmpp::Error::Io(std::io::Error::new(
+                kind,
+                "network loss",
+            )))
+        };
+        let auth_failure = TokioXmppEvent::Disconnected(tokio_xmpp::Error::Auth(
+            tokio_xmpp::error::AuthError::Fail(
+                tokio_xmpp::parsers::sasl::DefinedCondition::NotAuthorized,
+            ),
+        ));
+        let budget_exhausted =
+            TokioXmppEvent::Disconnected(tokio_xmpp::Error::ReconnectBudgetExhausted);
+
+        // A recoverable loss keeps the worker polling only when auto-reconnect
+        // is enabled; otherwise the worker exits exactly like 0.1.7.
+        assert_eq!(
+            reconnect_decision(&io_loss(std::io::ErrorKind::ConnectionReset), true),
+            LoopAction::Keep
+        );
+        assert_eq!(
+            reconnect_decision(&io_loss(std::io::ErrorKind::ConnectionReset), false),
+            LoopAction::Stop
+        );
+
+        // Rejected credentials are terminal regardless of the toggle.
+        assert_eq!(reconnect_decision(&auth_failure, true), LoopAction::Stop);
+
+        // Budget exhaustion ends this worker even though the account stays
+        // recoverable for a later manual connect.
+        assert_eq!(reconnect_decision(&budget_exhausted, true), LoopAction::Stop);
+
+        // Non-disconnect events always keep polling.
+        let online = TokioXmppEvent::Online {
+            bound_jid: "bob@example.org/resource".parse().expect("valid jid"),
+            features: xmpp_parsers::stream_features::StreamFeatures::default(),
+            resumed: false,
+        };
+        assert_eq!(reconnect_decision(&online, false), LoopAction::Keep);
+    }
+
+    #[test]
+    fn inbound_watchdog_is_stale_only_past_the_threshold() {
+        let threshold = Duration::from_secs(180);
+        assert!(!is_inbound_stale(Duration::ZERO, threshold));
+        assert!(!is_inbound_stale(threshold, threshold), "exactly at the threshold is not stale");
+        assert!(is_inbound_stale(threshold + Duration::from_millis(1), threshold));
+        assert!(is_inbound_stale(Duration::from_secs(300), threshold));
+    }
+
+    #[test]
+    fn srv_candidates_order_by_priority_then_weight() {
+        let candidate = |priority: u16, weight: u16, target: &str, port: u16| SrvCandidate {
+            priority,
+            weight,
+            target: target.to_owned(),
+            port,
+        };
+        let ordered = order_srv_candidates(vec![
+            candidate(10, 1, "b.example.org", 5222),
+            candidate(5, 50, "a.example.org", 5222),
+            candidate(10, 100, "c.example.org", 5222),
+            candidate(5, 90, "d.example.org", 5222),
+        ]);
+        // Priority ascending first: all priority-5 targets beat priority-10.
+        // Within the same priority, higher weight is tried first (RFC 2782).
+        assert_eq!(
+            ordered,
+            vec![
+                candidate(5, 90, "d.example.org", 5222),
+                candidate(5, 50, "a.example.org", 5222),
+                candidate(10, 100, "c.example.org", 5222),
+                candidate(10, 1, "b.example.org", 5222),
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_address_candidates_group_for_happy_eyeballs() {
+        let v4 = |port: u16| SocketAddr::new(IpAddr::from([192, 0, 2, 1]), port);
+        let v6 = |port: u16| SocketAddr::new(IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1]), port);
+        // Two families on 5222 and one on 5223: consecutive same-(port, TLS)
+        // addresses must merge into race groups, preserving order.
+        let attempts =
+            vec![(v4(5222), false), (v6(5222), false), (v4(5222), false), (v4(5223), true)];
+        assert_eq!(
+            group_attempts(attempts),
+            vec![
+                AttemptGroup {
+                    port: 5222,
+                    direct_tls: false,
+                    addresses: vec![v4(5222), v6(5222), v4(5222)],
+                },
+                AttemptGroup { port: 5223, direct_tls: true, addresses: vec![v4(5223)] },
+            ]
+        );
+    }
+
+    #[test]
+    fn connect_attempt_keeps_auth_failures_non_recoverable() {
+        // Regression guard: the connect phase must surface rejected
+        // credentials as non-recoverable (Failed in the UI) instead of
+        // degrading them to a generic recoverable connection failure.
+        let auth = ConnectFailure { detail: "authentication error".to_owned(), recoverable: false };
+        let network =
+            ConnectFailure { detail: "connection to x timed out".to_owned(), recoverable: true };
+        assert!(
+            matches!(terminal_if_auth(auth.clone()), Some(failure) if !failure.recoverable),
+            "an auth failure must be returned as terminal"
+        );
+        assert!(
+            terminal_if_auth(network).is_none(),
+            "a recoverable failure must not short-circuit the candidate list"
+        );
+    }
+
+    #[test]
+    fn ipv6_endpoint_resolves_without_dns() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        // resolve_host on an IPv6 literal returns exactly that address.
+        assert_eq!(
+            runtime.block_on(resolve_host("::1", 5222)).expect("literal resolves"),
+            vec![SocketAddr::new(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]), 5222)]
+        );
+        // A bracketed endpoint resolves to StartTLS on the requested port.
+        let candidates = runtime
+            .block_on(resolve_endpoints("[::1]:5222"))
+            .expect("bracketed IPv6 resolves without DNS");
+        assert_eq!(
+            candidates,
+            vec![(SocketAddr::new(IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]), 5222), false)]
         );
     }
 }

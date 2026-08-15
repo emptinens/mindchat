@@ -328,6 +328,38 @@ mod tests {
     }
 
     #[test]
+    fn load_state_defaults_auto_reconnect_for_pre_018_snapshots() {
+        // 0.1.7 snapshots have no `auto_reconnect` field; a restore must fall
+        // back to the default (true) so existing accounts silently gain the
+        // network-robustness behavior instead of losing it.
+        let temp = TempState::new("auto-reconnect-default");
+        let json = r#"{
+            "schema_version": 1,
+            "snapshot": {
+                "accounts": [{
+                    "id": 7,
+                    "jid": "alice@example.org",
+                    "server": "example.org",
+                    "display_name": "Alice",
+                    "connection_state": "Offline",
+                    "capabilities": [],
+                    "connection_error": null
+                }],
+                "contacts": [],
+                "conversations": [],
+                "messages": [],
+                "reactions": []
+            }
+        }"#;
+        std::fs::write(temp.path(), json).expect("write versioned file");
+        let loaded = load_state(temp.path()).expect("load succeeds").expect("file exists");
+        assert!(
+            loaded.accounts[0].auto_reconnect,
+            "pre-0.1.8 snapshots must restore with auto-reconnect enabled"
+        );
+    }
+
+    #[test]
     fn load_state_rejects_corrupt_json() {
         let temp = TempState::new("corrupt");
         std::fs::write(temp.path(), b"this is not json").expect("write corrupt file");
@@ -382,6 +414,7 @@ mod tests {
                     connection_state: ConnectionState::Online,
                     capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
                     connection_error: Some("not authorized".to_owned()),
+                    auto_reconnect: true,
                 },
                 Account {
                     id: 8,
@@ -391,6 +424,7 @@ mod tests {
                     connection_state: ConnectionState::Connecting,
                     capabilities: BTreeSet::new(),
                     connection_error: None,
+                    auto_reconnect: true,
                 },
             ],
             contacts: vec![Contact {

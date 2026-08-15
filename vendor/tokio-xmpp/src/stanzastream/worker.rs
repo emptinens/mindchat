@@ -13,7 +13,7 @@ use std::io;
 use futures::{ready, SinkExt, StreamExt};
 
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::Instant,
 };
 
@@ -138,6 +138,24 @@ impl WorkerStream {
             sm_state,
         };
         WorkerEvent::Disconnected { slot: tx }
+    }
+
+    /// MindChat 0.1.8: force an established session down on external request
+    /// (idle watchdog). Stream management state is preserved so the reconnect
+    /// can resume (XEP-0198). Returns `None` when no established session is
+    /// available to tear down (already reconnecting, negotiating, or
+    /// terminated).
+    fn force_disconnect(&mut self) -> Option<WorkerEvent> {
+        let Self::Connected { substate, .. } = self else {
+            return None;
+        };
+        let ConnectedEvent::Disconnect { sm_state, error } = substate.force_disconnect()?
+        else {
+            // Only Disconnect is ever produced by force_disconnect; anything
+            // else is an internal invariant violation we cannot recover from.
+            return None;
+        };
+        Some(self.disconnect(sm_state, error))
     }
 
     fn poll_duplex(
@@ -425,6 +443,8 @@ pub(super) struct StanzaStreamWorker {
     frontend_tx: mpsc::Sender<Event>,
     stream: WorkerStream,
     transmit_queue: TransmitQueue<QueueEntry>,
+    /// MindChat 0.1.8: external reconnect requests (idle watchdog).
+    reconnect_rx: watch::Receiver<()>,
 }
 
 macro_rules! send_or_break {
@@ -456,6 +476,7 @@ impl StanzaStreamWorker {
                 + 'static,
         >,
         queue_depth: usize,
+        reconnect_rx: watch::Receiver<()>,
     ) -> (mpsc::Sender<QueueEntry>, mpsc::Receiver<Event>) {
         let (conn_tx, conn_rx) = oneshot::channel();
         reconnector(None, conn_tx);
@@ -472,6 +493,7 @@ impl StanzaStreamWorker {
                 notify: None,
             },
             transmit_queue,
+            reconnect_rx,
         };
         tokio::spawn(async move { worker.run().await });
         (f2c_tx, c2f_rx)
@@ -562,6 +584,25 @@ impl StanzaStreamWorker {
                         WorkerEvent::ReconnectAborted => {
                             panic!("Backend was unable to handle reconnect request.");
                         }
+                    }
+                },
+                // MindChat 0.1.8: an external request (idle watchdog) forces
+                // the current session down so the jittered reconnector
+                // establishes a fresh connection (XEP-0198 resume when the
+                // peer supports it). The worker stays alive and keeps the
+                // frontend open, exactly like a spontaneous disconnect.
+                _ = self.reconnect_rx.changed() => {
+                    if let Some(WorkerEvent::Disconnected { slot, .. }) =
+                        self.stream.force_disconnect()
+                    {
+                        send_or_break!(
+                            Event::Stream(StreamEvent::Suspended) => permit in self.frontend_tx,
+                            self.transmit_queue => self.stream,
+                        );
+                        if self.frontend_tx.is_closed() || self.transmit_queue.is_closed() {
+                            break;
+                        }
+                        (self.reconnector)(None, slot);
                     }
                 },
             }

@@ -21,7 +21,6 @@
 
 use core::pin::Pin;
 use core::task::{Context, Poll};
-use core::time::Duration;
 
 // TODO: ensure that IDs are always set on stanzas.
 
@@ -31,14 +30,19 @@ use core::time::Duration;
 
 use futures::{SinkExt, Stream};
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::watch;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use xmpp_parsers::{jid::Jid, stream_features::StreamFeatures};
 
 use crate::connect::ServerConnector;
 use crate::xmlstream::Timeouts;
 use crate::Stanza;
 
+/// Jittered, budgeted reconnect backoff (MindChat 0.1.8 patch).
+///
+/// Public so the host crate can drive the pure generator in its own unit
+/// tests with a fixed seed.
+pub mod backoff;
 mod connected;
 mod error;
 mod negotiation;
@@ -102,9 +106,22 @@ pub enum Event {
 pub struct StanzaStream {
     rx: mpsc::Receiver<Event>,
     tx: mpsc::Sender<QueueEntry>,
+    /// MindChat 0.1.8: signal channel for externally forced reconnects (e.g.
+    /// an idle watchdog). Sending here asks the worker to tear down the
+    /// current connection and reconnect through the normal jittered path.
+    reconnect_tx: watch::Sender<()>,
 }
 
 impl StanzaStream {
+    /// Ask the worker to break the current connection and reconnect.
+    ///
+    /// MindChat 0.1.8: this is how a host-side liveness watchdog forces a
+    /// stale session down. The worker keeps running; stream management state
+    /// is preserved so the reconnect can resume (XEP-0198). It is a no-op
+    /// when no session is currently established.
+    pub fn request_reconnect(&self) {
+        let _ = self.reconnect_tx.send(());
+    }
     /// Establish a new client-to-server stream using the given
     /// [`ServerConnector`].
     ///
@@ -137,8 +154,12 @@ impl StanzaStream {
                 let server = server.clone();
                 let password = password.clone();
                 tokio::spawn(async move {
-                    const MAX_DELAY: Duration = Duration::new(30, 0);
-                    let mut delay = Duration::new(1, 0);
+                    // MindChat 0.1.8: full-jitter backoff with a total retry
+                    // budget (~5 minutes). The budget is per reconnect cycle:
+                    // each fresh disconnect starts a new one, so a long
+                    // outage gives up with a terminal error instead of
+                    // retrying forever, while a short blip keeps trying.
+                    let mut backoff = backoff::Backoff::new_with_default_budget(rand::random());
                     loop {
                         // MindChat patch: stop retrying as soon as the stream
                         // worker has gone away (cancelled connect or dropped
@@ -192,11 +213,15 @@ impl StanzaStream {
                                     let _ = slot.send(Err(e));
                                     return;
                                 }
+                                // MindChat 0.1.8: jittered sleep inside the
+                                // retry budget. When the budget is spent, the
+                                // reconnect cycle ends with a terminal error
+                                // instead of looping forever.
+                                let Some(delay) = backoff.next_sleep() else {
+                                    let _ = slot.send(Err(crate::Error::ReconnectBudgetExhausted));
+                                    return;
+                                };
                                 tokio::time::sleep(delay).await;
-                                delay *= 2;
-                                if delay > MAX_DELAY {
-                                    delay = MAX_DELAY;
-                                }
                             }
                         }
                     }
@@ -246,11 +271,9 @@ impl StanzaStream {
         queue_depth: usize,
     ) -> Self {
         // c2f = core to frontend, f2c = frontend to core
-        let (f2c_tx, c2f_rx) = StanzaStreamWorker::spawn(connector, queue_depth);
-        Self {
-            tx: f2c_tx,
-            rx: c2f_rx,
-        }
+        let (reconnect_tx, reconnect_rx) = watch::channel(());
+        let (f2c_tx, c2f_rx) = StanzaStreamWorker::spawn(connector, queue_depth, reconnect_rx);
+        Self { tx: f2c_tx, rx: c2f_rx, reconnect_tx }
     }
 
     async fn assert_send(&self, cmd: QueueEntry) {
@@ -334,6 +357,13 @@ impl StanzaSender {
     /// See the documentation of [`StanzaStream::send()`].
     pub async fn send(&self, stanza: Box<Stanza>) -> StanzaToken {
         self.0.lock().await.send(stanza).await
+    }
+
+    /// Ask the stream to break the current connection and reconnect.
+    ///
+    /// See [`StanzaStream::request_reconnect()`].
+    pub async fn request_reconnect(&self) {
+        self.0.lock().await.request_reconnect();
     }
 }
 

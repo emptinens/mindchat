@@ -42,6 +42,11 @@ pub struct ConnectionRequest {
     pub jid: String,
     pub server: String,
     pub password: SecretString,
+    /// Whether a mid-session network loss should be retried automatically
+    /// (XEP-0198 resume). When `false` the transport exits immediately on a
+    /// disconnect, exactly like the 0.1.7 behavior; a user-requested
+    /// disconnect is immediate either way.
+    pub auto_reconnect: bool,
 }
 
 /// Outgoing message data after the domain core has validated it.

@@ -139,6 +139,16 @@ impl Client {
         self.features.as_ref()
     }
 
+    /// Force the underlying stream to break and reconnect.
+    ///
+    /// MindChat 0.1.8: hosts use this (e.g. from an idle watchdog) to tear
+    /// down a stale session. The worker keeps running and reconnects through
+    /// the normal jittered backoff, resuming via XEP-0198 when the peer
+    /// supports it.
+    pub async fn request_reconnect(&mut self) {
+        self.stream_tx.request_reconnect().await;
+    }
+
     /// Close the client cleanly.
     ///
     /// This performs an orderly stream shutdown, ensuring that all resources

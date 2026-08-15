@@ -187,6 +187,17 @@ pub struct Account {
     pub capabilities: BTreeSet<ProtocolCapability>,
     /// Last connection failure reason, cleared on the next successful connect.
     pub connection_error: Option<String>,
+    /// Whether a mid-session network loss is retried automatically (XEP-0198
+    /// resume). Non-secret and persisted, so it survives a restore. Defaults
+    /// to `true`: a user-requested disconnect is immediate either way.
+    #[serde(default = "default_auto_reconnect")]
+    pub auto_reconnect: bool,
+}
+
+/// Accounts default to automatic reconnection; 0.1.8 made mid-session network
+/// loss recoverable instead of terminal.
+fn default_auto_reconnect() -> bool {
+    true
 }
 
 /// A roster contact projection owned by one account.
@@ -462,6 +473,7 @@ impl MindChatCore {
                 connection_state: ConnectionState::Offline,
                 capabilities: BTreeSet::new(),
                 connection_error: None,
+                auto_reconnect: true,
             },
         );
         self.events.push(CoreEvent::AccountChanged(id));
@@ -1349,6 +1361,7 @@ impl<T: XmppTransport> TransportCoordinator<T> {
             jid: account.jid.clone(),
             server: account.server.clone(),
             password,
+            auto_reconnect: account.auto_reconnect,
         };
         self.core.set_connection_state(account_id, ConnectionState::Connecting)?;
         if let Err(error) = self.transport.connect(request) {
@@ -1545,6 +1558,37 @@ mod tests {
     fn account(core: &mut MindChatCore) -> AccountId {
         core.add_account(AccountSetup::new("alice@example.org", "example.org", "Alice"))
             .expect("test account is valid")
+    }
+
+    #[test]
+    fn duplicate_connected_events_are_idempotent() {
+        // 0.1.8: after a mid-session network loss the worker keeps polling the
+        // same client, so a reconnect (XEP-0198 resume or a fresh bind) emits
+        // a second Connected for the same account. Applying it must leave the
+        // account Online with the newest capabilities and no error.
+        let mut core = MindChatCore::default();
+        let account_id = account(&mut core);
+        core.apply_transport_event(TransportEvent::Connected {
+            account_id,
+            capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
+        })
+        .expect("first connected applies");
+        assert_eq!(core.accounts()[0].connection_state, ConnectionState::Online);
+
+        core.apply_transport_event(TransportEvent::Connected {
+            account_id,
+            capabilities: BTreeSet::from([
+                ProtocolCapability::Receipts,
+                ProtocolCapability::StreamManagement,
+            ]),
+        })
+        .expect("duplicate connected applies");
+        assert_eq!(core.accounts()[0].connection_state, ConnectionState::Online);
+        assert_eq!(
+            core.accounts()[0].capabilities,
+            BTreeSet::from([ProtocolCapability::Receipts, ProtocolCapability::StreamManagement,])
+        );
+        assert_eq!(core.accounts()[0].connection_error, None);
     }
 
     #[test]
