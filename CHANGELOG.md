@@ -15,8 +15,9 @@ the roadmap cleanup commit; their content lives in git history.
 - `ROADMAP.md`: four-release plan (0.1.7 through 0.2.0) synthesized from 20
   domain advisor reports: customization and QoL polish (0.1.7), network and
   release-build hardening with a zero-log purge (0.1.8), storage encryption,
-  transport hardening, OMEMO and privacy controls (0.1.9), donations and
-  release engineering (0.2.0).
+  transport hardening, OMEMO and privacy controls (0.1.9), release
+  engineering and repo finalization (0.2.0; donations removed by product
+  decision on 2026-08-15).
 - `CHANGELOG.md`: canonical release history (this file).
 
 ### Changed

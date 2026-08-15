@@ -141,8 +141,7 @@ flowchart LR
     C3[Credentials hardening] --> C2
     C4[Transport security] --> C5[Privacy controls]
   end
-  subgraph R20["0.2.0 Sustainability"]
-    D1[Donations UI]
+  subgraph R20["0.2.0 Release engineering"]
     D2[Release engineering] --> D3[Repo finalization]
   end
   R17 --> R18 --> R19 --> R20
@@ -700,31 +699,14 @@ the listed features require (none are expected).
 - 0.1.9 APK signed for real users (release key validated per R7; see
   0.2.0 tooling).
 
-## 8. Release 0.2.0: Sustainability and cleanup
+## 8. Release 0.2.0: Release engineering and cleanup
 
-Character: donations, release engineering, repo finalization. FFI frozen.
+> **Scope change (2026-08-15, product decision): donations are removed from
+> the roadmap.** 0.2.0 is release engineering + repo finalization only.
 
-### 8.1 Donations (`SupportScreen.kt`, `values/donations.xml`)
+Character: release engineering, repo finalization. FFI frozen.
 
-- **Placement:** "Support MindChat" row in Settings About section, opening
-  a new `SupportScreen.kt` via the existing local-state dialog pattern; no
-  navigation library, no new dependencies.
-- **Data model:** all addresses/URLs/labels as string resources in
-  `values/donations.xml` + `values-ru/donations.xml` (1:1 parity), typed
-  via `SupportConfig.kt`.
-- **UX:** crypto rows are copy-only (BTC/ETH/XMR, truncated display, no
-  network); fiat and store rows are plain `https://` links opened only on
-  explicit tap; Apache-2.0 licensing note (donations are not Contributions
-  under Apache 2.0 §1; no CLA, no rights granted).
-- **Compliance:** donations are voluntary, give no content or feature
-  access, never use Play Billing; crypto is display-only (no exchange/
-  swap/trading, no in-app payment, no price data); Data safety form
-  unchanged (collects nothing, no network requests); F-Droid-safe (zero
-  new runtime deps).
-- **Tests:** pure-JUnit validators, Robolectric res-integrity test (both
-  locales, https-only, no query params), instrumented clipboard test.
-
-### 8.2 Release engineering (`scripts/release.sh`, `scripts/check-release-gates.sh`, `.github/workflows/release.yml`, `CHANGELOG.md`)
+### 8.1 Release engineering (`scripts/release.sh`, `scripts/check-release-gates.sh`, `.github/workflows/release.yml`, `CHANGELOG.md`)
 
 - **Version re-sync:** `crates/mindchat-core/Cargo.toml` → `0.2.0` (repairs
   the 0.1.4/0.1.6 drift); `app/build.gradle.kts` → versionCode 7,
@@ -759,14 +741,13 @@ Character: donations, release engineering, repo finalization. FFI frozen.
 
 ### 8.4 Non-goals for 0.2.0
 
-No new protocol features, no FFI changes, no new UI destinations beyond
-donations, no Play Billing, no payment processing, no ads.
+No new protocol features, no FFI changes, no new UI destinations, no
+payment processing, no ads, no donations/support flows.
 
 ### 8.5 DoD 0.2.0
 
 - Signed release reproduced by CI from secrets; `apksigner verify` passes;
   `SHA256SUMS` published; annotated tag; CHANGELOG 0.2.0 section.
-- Donations flow tested (validators, res-integrity, clipboard); EN/RU 1:1.
 - Repo layout move passes the entire unchanged test suite; feature freeze
   honored; README screenshots live; F-Droid listing live or explicitly
   scheduled.
@@ -841,7 +822,7 @@ This roadmap synthesizes 20 domain advisor reports produced 2026-08-14
 against commit `e3869f5`: appearance, qol-animations, m3e-audit,
 settings-ux, proxy-core, proxy-ui, network, build, zero-log, diagnostics,
 omemo, credentials, transport-security, privacy-controls,
-storage-encryption, donations, release-engineering, repo-layout,
-performance, architecture. Their full texts live outside the repository in
+storage-encryption, release-engineering, repo-layout, performance,
+architecture. Their full texts live outside the repository in
 the planning scratch directory; the roadmap above is the canonical,
 self-contained version.
