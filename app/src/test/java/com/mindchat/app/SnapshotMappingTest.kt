@@ -105,7 +105,7 @@ class SnapshotMappingTest {
         val later = map(
             accounts = listOf(connecting),
             connectingSince = first.connectingSince,
-            now = 100_000L + 35_001L,
+            now = 100_000L + STALL_THRESHOLD_MS + 1L,
         )
 
         assertTrue(later.state.accounts.single().connectionStalled)

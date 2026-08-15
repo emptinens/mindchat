@@ -4,10 +4,12 @@ package com.mindchat.app
  * Shared decision logic behind the [MindChatGateway] contract.
  *
  * Both implementations of the public interface (`NativeMindChatGateway` and
- * `PreviewMindChatGateway`) run exactly the same normalization and fallback
+ * `PreviewMindChatGateway`) run exactly the same normalization and validation
  * rules here, so the preview cannot drift from the native behavior: the same
  * validation that guards the FFI registration call also guards the
- * JVM-runnable preview used in debug builds and tests.
+ * JVM-runnable preview used in debug builds and tests. State-transition and
+ * fallback rules (account selection after deletion, stall thresholds) live in
+ * [GatewayPolicy] and snapshot-to-UI mapping in [GatewayMapping].
  */
 
 /** UI-safe refusal detail for an invalid XEP-0077 registration request. */
@@ -65,19 +67,3 @@ internal fun validateRegistration(
         ),
     )
 }
-
-/**
- * The account id that stays active after [deletedId] is removed: the previous
- * active id unless it was the deleted one, in which case the first remaining
- * account (or 0 when none is left).
- */
-internal fun nextActiveAccountId(
-    accounts: List<AccountUi>,
-    deletedId: Long,
-    activeAccountId: Long,
-): Long =
-    if (activeAccountId == deletedId) {
-        accounts.firstOrNull { it.id != deletedId }?.id ?: 0L
-    } else {
-        activeAccountId
-    }
