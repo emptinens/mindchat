@@ -1,8 +1,13 @@
 package com.mindchat.app.theme
 
+import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
+import com.mindchat.app.BubbleStyle
+import com.mindchat.app.ChatBackground
 
 /**
  * MindChat static color roles.
@@ -120,3 +125,81 @@ val DarkColorScheme = darkColorScheme(
     inverseSurface = Color(0xFFE4E1E6),
     inverseOnSurface = Color(0xFF303034),
 )
+
+// --- Semantic status colors (0.1.7, M3E P0 B2) ------------------------------
+
+/**
+ * Semantic presence/connection dot colors, replacing the duplicated hard-coded
+ * ARGB literals that used to live in MindChatApp.kt. Both schemes are audited
+ * against WCAG AA on their host surface families:
+ *
+ * Light (host `surfaceContainer` 0xFFF0EDF1):
+ *  - online 0xFF27732F  5.05:1
+ *  - away   0xFF7A5900  5.55:1
+ *  - failed 0xFFBA1A1A  (= light `colorScheme.error`) 5.56:1
+ *
+ * Dark (host `surface` 0xFF131316):
+ *  - online 0xFF81C784  9.22:1
+ *  - away   0xFFFFD54F  13.14:1
+ *  - failed 0xFFFFB4AB  (= dark `colorScheme.error`) 10.92:1
+ *
+ * The `on*` pairs are the content colors for anything rendered on top of a dot
+ * (>= 4.5:1 on their dot colors; White on the light dots, Black on the dark
+ * dots).
+ */
+data class MindChatStatusColors(
+    val online: Color,
+    val away: Color,
+    val failed: Color,
+    val onOnline: Color,
+    val onAway: Color,
+    val onFailed: Color,
+)
+
+val LightMindChatStatusColors = MindChatStatusColors(
+    online = Color(0xFF27732F),
+    away = Color(0xFF7A5900),
+    failed = Color(0xFFBA1A1A),
+    onOnline = Color.White,
+    onAway = Color.White,
+    onFailed = Color.White,
+)
+
+val DarkMindChatStatusColors = MindChatStatusColors(
+    online = Color(0xFF81C784),
+    away = Color(0xFFFFD54F),
+    failed = Color(0xFFFFB4AB),
+    onOnline = Color.Black,
+    onAway = Color.Black,
+    onFailed = Color.Black,
+)
+
+/** Theme-provided status colors; [MindChatTheme] installs the light/dark pair. */
+val LocalMindChatStatusColors = staticCompositionLocalOf { LightMindChatStatusColors }
+
+/**
+ * Message-bubble container color: OUTLINED bubbles use the lowest container
+ * with an `outlineVariant` border (see [bubbleOutlineColor]); filled styles
+ * keep today's `primaryContainer` (mine) / `surfaceContainerHigh` (theirs).
+ */
+fun bubbleContainerColor(style: BubbleStyle, mine: Boolean, scheme: ColorScheme): Color = when {
+    style == BubbleStyle.OUTLINED -> scheme.surfaceContainerLowest
+    mine -> scheme.primaryContainer
+    else -> scheme.surfaceContainerHigh
+}
+
+/** The 1 dp border color for OUTLINED bubbles; transparent otherwise. */
+fun bubbleOutlineColor(style: BubbleStyle, scheme: ColorScheme): Color =
+    if (style == BubbleStyle.OUTLINED) scheme.outlineVariant else Color.Transparent
+
+/**
+ * Message-list background: TINTED blends a faint `primaryContainer` tint into
+ * the surface (bubbles stay opaque so their on* contrast is preserved);
+ * DEFAULT keeps the plain surface/background.
+ */
+fun chatListBackground(background: ChatBackground, scheme: ColorScheme): Color =
+    if (background == ChatBackground.TINTED) {
+        lerp(scheme.surface, scheme.primaryContainer, 0.15f)
+    } else {
+        scheme.background
+    }

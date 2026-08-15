@@ -28,12 +28,13 @@ class MindChatAppTest {
         val firstGateway = PreviewMindChatGateway(preferences)
 
         firstGateway.toggleDynamicColor()
-        firstGateway.toggleComfortableLayout()
+        firstGateway.setAppearance(AppearanceProfile(density = Density.COMPACT, bubbleStyle = BubbleStyle.OUTLINED))
         firstGateway.toggleAppLock()
 
         val recreatedGateway = PreviewMindChatGateway(preferences)
         assertFalse(recreatedGateway.state.dynamicColor)
-        assertFalse(recreatedGateway.state.comfortableLayout)
+        assertEquals(Density.COMPACT, recreatedGateway.state.appearance.density)
+        assertEquals(BubbleStyle.OUTLINED, recreatedGateway.state.appearance.bubbleStyle)
         assertTrue(recreatedGateway.state.appLockEnabled)
     }
 

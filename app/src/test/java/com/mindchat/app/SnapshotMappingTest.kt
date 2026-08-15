@@ -42,6 +42,7 @@ class SnapshotMappingTest {
         connectingSince: Map<Long, Long> = emptyMap(),
         settings: SettingsSnapshot = SettingsSnapshot(),
         accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+        appearance: AppearanceProfile = AppearanceProfile(),
         now: Long = 100_000L,
     ) = mapSnapshotToUiState(
         snapshot = FfiCoreSnapshot(accounts, contacts, conversations, messages, reactions),
@@ -50,6 +51,7 @@ class SnapshotMappingTest {
         connectingSince = connectingSince,
         settings = settings,
         accountSettings = accountSettings,
+        appearance = appearance,
         now = now,
         timestampFormatter = formatter,
     )
@@ -255,20 +257,29 @@ class SnapshotMappingTest {
     // --- Profiles and settings --------------------------------------------------
 
     @Test
-    fun profilesAndSettingsFlowIntoTheState() {
+    fun profilesSettingsAndAppearanceFlowIntoTheState() {
         val settings = SettingsSnapshot(
             mapOf(
                 SettingsSchema.dynamicColor to false,
-                SettingsSchema.comfortableLayout to true,
                 SettingsSchema.appLockEnabled to true,
             ),
         )
-        val mapping = map(settings = settings)
+        val appearance = AppearanceProfile(
+            shapeScale = ShapeScale.COMPACT,
+            bubbleStyle = BubbleStyle.ROUNDED,
+        )
+        val mapping = map(settings = settings, appearance = appearance)
 
         assertEquals(AccountProfile(statusMessage = "busy"), mapping.state.profiles[1L])
         assertFalse(mapping.state.dynamicColor)
-        assertTrue(mapping.state.comfortableLayout)
         assertTrue(mapping.state.appLockEnabled)
+        assertEquals(appearance, mapping.state.appearance)
+    }
+
+    @Test
+    fun appearanceDefaultsFlowIntoTheState() {
+        val mapping = map()
+        assertEquals(AppearanceProfile(), mapping.state.appearance)
     }
 
     @Test

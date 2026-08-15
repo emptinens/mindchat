@@ -89,23 +89,26 @@ class GatewaySettingsContractTest {
         assertFalse("convenience accessor agrees", g.state.dynamicColor)
     }
 
-    // --- legacy toggles stay thin wrappers ------------------------------------
+    // --- appearance + legacy toggles stay thin wrappers -----------------------
 
     @Test
-    fun legacyTogglesRouteThroughTheSameStore() {
+    fun appearanceAndTogglesRouteThroughTheSameStore() {
         val prefs = preferences()
         val g = PreviewMindChatGateway(prefs)
 
         g.toggleDynamicColor()
-        g.toggleComfortableLayout()
+        g.setAppearance(AppearanceProfile(density = Density.COMPACT))
         g.toggleAppLock()
 
         val stored = prefs.readAll()
         assertFalse(stored[SettingsSchema.dynamicColor] as Boolean)
+        // The legacy comfortable_layout key stays derived from density (false
+        // here because COMPACT != COMFORTABLE), so the old catalog toggle
+        // never disagrees with the density engine.
         assertFalse(stored[SettingsSchema.comfortableLayout] as Boolean)
         assertTrue(stored[SettingsSchema.appLockEnabled] as Boolean)
         assertFalse(g.state.dynamicColor)
-        assertFalse(g.state.comfortableLayout)
+        assertEquals(Density.COMPACT, g.state.appearance.density)
         assertTrue(g.state.appLockEnabled)
     }
 

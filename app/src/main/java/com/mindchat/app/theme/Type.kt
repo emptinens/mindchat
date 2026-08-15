@@ -121,3 +121,72 @@ val MindChatTypography = Typography(
         letterSpacing = 0.5.sp,
     ),
 )
+
+/**
+ * Scales [base]'s `fontSize` and `lineHeight` by [factor] and nothing else.
+ * `letterSpacing` is intentionally untouched (tracking is an expressive
+ * flourish, not a size); factor 1.0 is the identity, so the DEFAULT text size
+ * is exactly [MindChatTypography].
+ */
+fun scaleTypography(base: Typography, factor: Float): Typography = Typography(
+    displayLarge = base.displayLarge.copy(
+        fontSize = base.displayLarge.fontSize * factor,
+        lineHeight = base.displayLarge.lineHeight * factor,
+    ),
+    displayMedium = base.displayMedium.copy(
+        fontSize = base.displayMedium.fontSize * factor,
+        lineHeight = base.displayMedium.lineHeight * factor,
+    ),
+    displaySmall = base.displaySmall.copy(
+        fontSize = base.displaySmall.fontSize * factor,
+        lineHeight = base.displaySmall.lineHeight * factor,
+    ),
+    headlineLarge = base.headlineLarge.copy(
+        fontSize = base.headlineLarge.fontSize * factor,
+        lineHeight = base.headlineLarge.lineHeight * factor,
+    ),
+    headlineMedium = base.headlineMedium.copy(
+        fontSize = base.headlineMedium.fontSize * factor,
+        lineHeight = base.headlineMedium.lineHeight * factor,
+    ),
+    headlineSmall = base.headlineSmall.copy(
+        fontSize = base.headlineSmall.fontSize * factor,
+        lineHeight = base.headlineSmall.lineHeight * factor,
+    ),
+    titleLarge = base.titleLarge.copy(
+        fontSize = base.titleLarge.fontSize * factor,
+        lineHeight = base.titleLarge.lineHeight * factor,
+    ),
+    titleMedium = base.titleMedium.copy(
+        fontSize = base.titleMedium.fontSize * factor,
+        lineHeight = base.titleMedium.lineHeight * factor,
+    ),
+    titleSmall = base.titleSmall.copy(
+        fontSize = base.titleSmall.fontSize * factor,
+        lineHeight = base.titleSmall.lineHeight * factor,
+    ),
+    bodyLarge = base.bodyLarge.copy(
+        fontSize = base.bodyLarge.fontSize * factor,
+        lineHeight = base.bodyLarge.lineHeight * factor,
+    ),
+    bodyMedium = base.bodyMedium.copy(
+        fontSize = base.bodyMedium.fontSize * factor,
+        lineHeight = base.bodyMedium.lineHeight * factor,
+    ),
+    bodySmall = base.bodySmall.copy(
+        fontSize = base.bodySmall.fontSize * factor,
+        lineHeight = base.bodySmall.lineHeight * factor,
+    ),
+    labelLarge = base.labelLarge.copy(
+        fontSize = base.labelLarge.fontSize * factor,
+        lineHeight = base.labelLarge.lineHeight * factor,
+    ),
+    labelMedium = base.labelMedium.copy(
+        fontSize = base.labelMedium.fontSize * factor,
+        lineHeight = base.labelMedium.lineHeight * factor,
+    ),
+    labelSmall = base.labelSmall.copy(
+        fontSize = base.labelSmall.fontSize * factor,
+        lineHeight = base.labelSmall.lineHeight * factor,
+    ),
+)

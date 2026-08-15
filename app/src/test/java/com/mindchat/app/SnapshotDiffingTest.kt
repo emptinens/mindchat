@@ -140,6 +140,30 @@ class SnapshotDiffingTest {
     }
 
     @Test
+    fun changedAppearanceForcesRebuild() {
+        assertFalse(
+            skipDecision(
+                snapshot(),
+                snapshot(),
+                appearance = AppearanceProfile(shapeScale = ShapeScale.COMPACT),
+                lastAppearance = AppearanceProfile(),
+            ),
+        )
+    }
+
+    @Test
+    fun identicalAppearanceSkipsRebuild() {
+        assertTrue(
+            skipDecision(
+                snapshot(),
+                snapshot(),
+                appearance = AppearanceProfile(bubbleStyle = BubbleStyle.ROUNDED),
+                lastAppearance = AppearanceProfile(bubbleStyle = BubbleStyle.ROUNDED),
+            ),
+        )
+    }
+
+    @Test
     fun connectingAccountAlwaysRebuildsForStallDetection() {
         // The snapshot is structurally identical to the previous one, but an
         // account stuck in CONNECTING needs periodic rebuilds so the wall-clock
@@ -224,6 +248,8 @@ class SnapshotDiffingTest {
         lastProfiles: Map<Long, AccountProfile> = emptyMap(),
         accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
         lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+        appearance: AppearanceProfile = AppearanceProfile(),
+        lastAppearance: AppearanceProfile = AppearanceProfile(),
     ): Boolean = shouldSkipUiRebuild(
         snapshot = snapshot,
         lastSnapshot = lastSnapshot,
@@ -235,5 +261,7 @@ class SnapshotDiffingTest {
         lastProfiles = lastProfiles,
         accountSettings = accountSettings,
         lastAccountSettings = lastAccountSettings,
+        appearance = appearance,
+        lastAppearance = lastAppearance,
     )
 }

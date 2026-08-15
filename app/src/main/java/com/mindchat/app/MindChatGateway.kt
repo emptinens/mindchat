@@ -76,11 +76,10 @@ data class MindChatUiState(
     val profiles: Map<Long, AccountProfile> = emptyMap(),
     val settings: SettingsSnapshot = SettingsSnapshot(),
     val accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+    val appearance: AppearanceProfile = AppearanceProfile(),
 ) {
     // Convenience accessors kept for theme code and 0.1.6 contract tests.
     val dynamicColor: Boolean get() = settings.dynamicColor
-
-    val comfortableLayout: Boolean get() = settings.comfortableLayout
 
     val appLockEnabled: Boolean get() = settings.appLockEnabled
 }
@@ -143,7 +142,13 @@ interface MindChatGateway {
     suspend fun pollTransport()
     suspend fun persistNow()
     fun toggleDynamicColor()
-    fun toggleComfortableLayout()
+    /**
+     * Replaces the global appearance profile (persists via
+     * `preferences.writeCustomization`, then refreshes). Per-account bubble /
+     * background overrides live on [AccountProfile] and flow through
+     * [updateProfile] instead.
+     */
+    fun setAppearance(appearance: AppearanceProfile)
     fun toggleAppLock()
 
     /**
@@ -189,6 +194,9 @@ class NativeMindChatGateway(
     /** Global settings backing the current UI state; [setSetting] is the only writer. */
     private var settingsCache = SettingsSnapshot(preferences.readAll())
 
+    /** Global appearance backing [MindChatUiState.appearance]; [setAppearance] is the only writer. */
+    private var appearanceCache: AppearanceProfile = preferences.readCustomization().appearance
+
     /**
      * Per-account settings backing [MindChatUiState.accountSettings]. 0.1.7 has
      * no PER_ACCOUNT keys yet, so this starts empty; 0.1.8 populates it when
@@ -213,6 +221,7 @@ class NativeMindChatGateway(
     private var lastProfiles: Map<Long, AccountProfile> = emptyMap()
     private var lastSettings: SettingsSnapshot = settingsCache
     private var lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap()
+    private var lastAppearance: AppearanceProfile = appearanceCache
 
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
@@ -513,8 +522,11 @@ class NativeMindChatGateway(
         setSetting(SettingsSchema.dynamicColor, !state.settings.dynamicColor)
     }
 
-    override fun toggleComfortableLayout() {
-        setSetting(SettingsSchema.comfortableLayout, !state.settings.comfortableLayout)
+    override fun setAppearance(appearance: AppearanceProfile) {
+        val current = preferences.readCustomization()
+        preferences.writeCustomization(current.copy(appearance = appearance))
+        appearanceCache = appearance
+        refresh()
     }
 
     override fun toggleAppLock() {
@@ -583,6 +595,8 @@ class NativeMindChatGateway(
                 lastProfiles = lastProfiles,
                 accountSettings = accountSettingsCache,
                 lastAccountSettings = lastAccountSettings,
+                appearance = appearanceCache,
+                lastAppearance = lastAppearance,
             )
         ) {
             return
@@ -592,6 +606,7 @@ class NativeMindChatGateway(
         lastProfiles = profilesCache
         lastSettings = settingsCache
         lastAccountSettings = accountSettingsCache
+        lastAppearance = appearanceCache
     }
 
     private fun markDirty() {
@@ -632,6 +647,7 @@ class NativeMindChatGateway(
             connectingSince = connectingSince,
             settings = settingsCache,
             accountSettings = accountSettingsCache,
+            appearance = appearanceCache,
             now = System.currentTimeMillis(),
             timestampFormatter = ::formatTimestamp,
         )
@@ -744,7 +760,13 @@ class PreviewMindChatGateway(
 
     override fun updateProfile(accountId: Long, profile: AccountProfile) {
         preferences.writeProfile(accountId, profile)
-        state = state.copy(profiles = state.profiles + (accountId to profile))
+        // Mirror InMemoryMindChatPreferences.writeProfile: an all-default
+        // profile removes the stored entry (and the state projection).
+        val emptyProfile = profile.avatarUri == null && profile.statusMessage == null &&
+            profile.accentKey == null && profile.bubbleStyle == null && profile.chatBackground == null
+        state = state.copy(
+            profiles = if (emptyProfile) state.profiles - accountId else state.profiles + (accountId to profile),
+        )
     }
 
     /** Preview-only in-memory implementation of the gateway contract. */
@@ -867,8 +889,10 @@ class PreviewMindChatGateway(
         setSetting(SettingsSchema.dynamicColor, !state.settings.dynamicColor)
     }
 
-    override fun toggleComfortableLayout() {
-        setSetting(SettingsSchema.comfortableLayout, !state.settings.comfortableLayout)
+    override fun setAppearance(appearance: AppearanceProfile) {
+        val current = preferences.readCustomization()
+        preferences.writeCustomization(current.copy(appearance = appearance))
+        state = state.copy(appearance = appearance)
     }
 
     override fun toggleAppLock() {
@@ -903,6 +927,7 @@ private fun seedPreviewState(preferences: MindChatPreferences): MindChatUiState 
     return seed.copy(
         settings = SettingsSnapshot(preferences.readAll()),
         profiles = preferences.readProfiles(),
+        appearance = preferences.readCustomization().appearance,
         accountSettings = seed.accounts.associate { account ->
             account.id to SettingsSnapshot(preferences.readAccountSettings(account.id))
         },

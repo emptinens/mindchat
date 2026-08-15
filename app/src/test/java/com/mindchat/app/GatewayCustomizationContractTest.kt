@@ -1,17 +1,18 @@
 package com.mindchat.app
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Acceptance tests for the 0.1.6 settings toggles driven through the public
- * [MindChatGateway] contract: each toggle flips its own customization flag in
- * both the UI state and the preferences, leaves the other flags untouched, and
- * survives a gateway restart (a new instance reading the same preferences).
- * `PreviewMindChatGateway` is the JVM-runnable contract implementation; the
- * native gateway runs the same toggle lambdas against the same preferences
- * storage.
+ * Acceptance tests for the 0.1.6/0.1.7 customization controls driven through
+ * the public [MindChatGateway] contract: each mutation flips its own
+ * customization field in both the UI state and the preferences, leaves the
+ * other fields untouched, and survives a gateway restart (a new instance
+ * reading the same preferences). `PreviewMindChatGateway` is the JVM-runnable
+ * contract implementation; the native gateway runs the same lambdas against
+ * the same preferences storage.
  */
 class GatewayCustomizationContractTest {
 
@@ -37,15 +38,16 @@ class GatewayCustomizationContractTest {
     }
 
     @Test
-    fun toggleComfortableLayoutFlipsStateAndPersists() {
+    fun setAppearanceReplacesStateAndPersists() {
         val prefs = preferences()
         val g = PreviewMindChatGateway(prefs)
-        assertTrue("comfortable layout defaults on", g.state.comfortableLayout)
+        assertEquals(AppearanceProfile(), g.state.appearance)
 
-        g.toggleComfortableLayout()
+        val dense = AppearanceProfile(shapeScale = ShapeScale.COMPACT, density = Density.COMPACT)
+        g.setAppearance(dense)
 
-        assertFalse(g.state.comfortableLayout)
-        assertFalse(prefs.readCustomization().comfortableLayout)
+        assertEquals(dense, g.state.appearance)
+        assertEquals(dense, prefs.readCustomization().appearance)
     }
 
     @Test
@@ -61,17 +63,34 @@ class GatewayCustomizationContractTest {
     }
 
     @Test
-    fun togglesAreIndependent() {
+    fun customizationsAreIndependent() {
         val prefs = preferences()
         val g = PreviewMindChatGateway(prefs)
 
         g.toggleDynamicColor()
-        g.toggleComfortableLayout()
+        g.setAppearance(AppearanceProfile(density = Density.COMPACT))
+        g.toggleAppLock()
 
         val stored = prefs.readCustomization()
         assertFalse(stored.dynamicColor)
-        assertFalse(stored.comfortableLayout)
-        assertFalse("app lock must not be touched", stored.appLockEnabled)
+        assertEquals(Density.COMPACT, stored.appearance.density)
+        assertTrue("app lock must be flipped", stored.appLockEnabled)
+    }
+
+    @Test
+    fun setAppearanceLeavesOtherCustomizationFieldsUntouched() {
+        val prefs = preferences()
+        val g = PreviewMindChatGateway(prefs)
+        g.toggleDynamicColor()
+        g.toggleAppLock()
+
+        g.setAppearance(AppearanceProfile(bubbleStyle = BubbleStyle.ROUNDED))
+
+        val stored = prefs.readCustomization()
+        assertFalse(stored.dynamicColor)
+        assertTrue(stored.appLockEnabled)
+        assertEquals(BubbleStyle.ROUNDED, stored.appearance.bubbleStyle)
+        assertEquals("shape scale untouched by a bubble change", ShapeScale.EXPRESSIVE, stored.appearance.shapeScale)
     }
 
     // --- Persistence across instances -----------------------------------------
@@ -82,24 +101,31 @@ class GatewayCustomizationContractTest {
         val first = PreviewMindChatGateway(prefs)
         first.toggleDynamicColor()
         first.toggleAppLock()
+        first.setAppearance(AppearanceProfile(textScale = TextScale.LARGE))
 
         val second = PreviewMindChatGateway(prefs)
 
         assertFalse(second.state.dynamicColor)
         assertTrue(second.state.appLockEnabled)
-        assertTrue("untouched flags keep their default", second.state.comfortableLayout)
+        assertEquals("appearance survives restart", TextScale.LARGE, second.state.appearance.textScale)
+        assertTrue("untouched fields keep their default", second.state.appearance.shapeScale == ShapeScale.EXPRESSIVE)
     }
 
     @Test
     fun gatewayInitializesFromNonDefaultPreferences() {
         val prefs = preferences(
-            MindChatCustomization(dynamicColor = false, comfortableLayout = false, appLockEnabled = true),
+            MindChatCustomization(
+                dynamicColor = false,
+                appearance = AppearanceProfile(density = Density.STANDARD, bubbleStyle = BubbleStyle.OUTLINED),
+                appLockEnabled = true,
+            ),
         )
 
         val g = PreviewMindChatGateway(prefs)
 
         assertFalse(g.state.dynamicColor)
-        assertFalse(g.state.comfortableLayout)
+        assertEquals(Density.STANDARD, g.state.appearance.density)
+        assertEquals(BubbleStyle.OUTLINED, g.state.appearance.bubbleStyle)
         assertTrue(g.state.appLockEnabled)
     }
 }

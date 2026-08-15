@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.annotation.StringRes
 import androidx.compose.animation.animateColorAsState
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -28,16 +29,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
@@ -50,6 +52,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FloatingActionButton
@@ -63,6 +66,9 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -98,13 +104,23 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.mindchat.app.theme.ACCENT_DEFAULT_KEY
 import com.mindchat.app.theme.AccentOptions
+import com.mindchat.app.theme.LocalMindChatMotionSpeed
+import com.mindchat.app.theme.LocalMindChatStatusColors
+import com.mindchat.app.theme.MindChatDockItemShape
+import com.mindchat.app.theme.MindChatDockShape
+import com.mindchat.app.theme.MindChatMotionScheme
 import com.mindchat.app.theme.MindChatTheme
+import com.mindchat.app.theme.bubbleContainerColor
+import com.mindchat.app.theme.bubbleOutlineColor
+import com.mindchat.app.theme.bubbleShape
+import com.mindchat.app.theme.chatListBackground
 import java.io.File
 import java.io.FileOutputStream
 import kotlinx.coroutines.Dispatchers
@@ -149,7 +165,15 @@ private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
     val activeAccent = state.profiles[state.activeAccountId]
         ?.accentKey
         ?.let { key -> AccentOptions.firstOrNull { it.key == key }?.color }
-    MindChatTheme(dynamicColor = state.dynamicColor, accentSeed = activeAccent) {
+    // Global appearance merged with the active account's bubble/background
+    // overrides; this resolved profile drives shapes, type, motion and the
+    // chat-screen personality.
+    val resolvedAppearance = resolveAppearance(state.appearance, state.profiles[state.activeAccountId])
+    MindChatTheme(
+        appearance = resolvedAppearance,
+        dynamicColor = state.dynamicColor,
+        accentSeed = activeAccent,
+    ) {
         Surface(modifier = Modifier.fillMaxSize()) {
             if (appLockHost?.appLockState?.blocksContent == true) {
                 AppLockedScreen(
@@ -228,6 +252,7 @@ private fun MindChatShell(
     var showAddAccount by rememberSaveable { mutableStateOf(false) }
     var showAddContact by rememberSaveable { mutableStateOf(false) }
     var showNewConversation by rememberSaveable { mutableStateOf(false) }
+    var showAppearance by rememberSaveable { mutableStateOf(false) }
     var reconnectAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
     var renameAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
     var deleteAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -242,6 +267,12 @@ private fun MindChatShell(
 
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    // Transient result feedback (B6): deletes and profile saves surface here.
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    val accountDeletedMessage = stringResource(R.string.account_deleted)
+    val conversationDeletedMessage = stringResource(R.string.conversation_deleted)
+    val profileSavedMessage = stringResource(R.string.profile_saved)
 
     if (showAddAccount) {
         AddAccountDialog(
@@ -310,9 +341,18 @@ private fun MindChatShell(
                 account = account,
                 onDismiss = { deleteAccountId = null },
                 onConfirm = {
-                    runCatching { gateway.deleteAccount(account.id) }
-                        .onSuccess { deleteAccountId = null }
-                        .isSuccess
+                    val deleted = runCatching { gateway.deleteAccount(account.id) }.isSuccess
+                    if (deleted) {
+                        deleteAccountId = null
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                message = accountDeletedMessage,
+                                withDismissAction = true,
+                                duration = SnackbarDuration.Short,
+                            )
+                        }
+                    }
+                    deleted
                 },
             )
         }
@@ -324,14 +364,21 @@ private fun MindChatShell(
                 conversation = conversation,
                 onDismiss = { deleteConversationId = null },
                 onConfirm = {
-                    runCatching { gateway.deleteConversation(conversation.id) }
-                        .onSuccess {
-                            if (selectedConversationId == conversation.id) {
-                                selectedConversationId = null
-                            }
-                            deleteConversationId = null
+                    val deleted = runCatching { gateway.deleteConversation(conversation.id) }.isSuccess
+                    if (deleted) {
+                        if (selectedConversationId == conversation.id) {
+                            selectedConversationId = null
                         }
-                        .isSuccess
+                        deleteConversationId = null
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                message = conversationDeletedMessage,
+                                withDismissAction = true,
+                                duration = SnackbarDuration.Short,
+                            )
+                        }
+                    }
+                    deleted
                 },
             )
         }
@@ -345,13 +392,23 @@ private fun MindChatShell(
                 onDismiss = { profileAccountId = null },
                 onSave = { updatedProfile, newDisplayName ->
                     val saved = saveProfile(gateway, account, updatedProfile, newDisplayName)
-                    if (saved) profileAccountId = null
+                    if (saved) {
+                        profileAccountId = null
+                        scope.launch {
+                            snackbarHostState.showSnackbar(
+                                message = profileSavedMessage,
+                                withDismissAction = true,
+                                duration = SnackbarDuration.Short,
+                            )
+                        }
+                    }
                     saved
                 },
             )
         }
     }
 
+    val resolved = resolveAppearance(state.appearance, state.profiles[state.activeAccountId])
     val selectedConversation = state.conversations.firstOrNull { it.id == selectedConversationId }
     if (selectedConversation != null) {
         // Clear the unread badge once the conversation becomes visible.
@@ -365,9 +422,25 @@ private fun MindChatShell(
         ChatScreen(
             conversation = selectedConversation,
             messages = state.messagesByConversation[selectedConversation.id].orEmpty(),
+            bubbleStyle = resolved.bubbleStyle,
+            chatBackground = resolved.chatBackground,
             onBack = { selectedConversationId = null },
             onSend = { gateway.sendText(selectedConversation.id, it) },
             onDeleteConversation = { deleteConversationId = selectedConversation.id },
+        )
+        return
+    }
+
+    if (showAppearance) {
+        // Full-screen appearance engine; system back leaves it like any other
+        // top-level destination.
+        BackHandler {
+            showAppearance = false
+        }
+        AppearanceScreen(
+            gateway = gateway,
+            state = state,
+            onBack = { showAppearance = false },
         )
         return
     }
@@ -401,6 +474,7 @@ private fun MindChatShell(
         },
     ) {
         Scaffold(
+            snackbarHost = { SnackbarHost(snackbarHostState) },
             topBar = {
                 MindChatTopBar(
                     state = state,
@@ -420,12 +494,16 @@ private fun MindChatShell(
                 if (state.activeAccountId != 0L) {
                     when (destination) {
                         Destination.Chats -> {
-                            FloatingActionButton(onClick = { showNewConversation = true }) {
-                                Icon(
-                                    imageVector = Icons.Filled.Add,
-                                    contentDescription = stringResource(R.string.new_chat),
-                                )
-                            }
+                            ExtendedFloatingActionButton(
+                                onClick = { showNewConversation = true },
+                                icon = {
+                                    Icon(
+                                        imageVector = Icons.Filled.Add,
+                                        contentDescription = null,
+                                    )
+                                },
+                                text = { Text(stringResource(R.string.new_chat)) },
+                            )
                         }
 
                         Destination.Contacts -> {
@@ -445,6 +523,7 @@ private fun MindChatShell(
             when (destination) {
                 Destination.Chats -> ConversationsScreen(
                     state = state,
+                    density = resolved.density,
                     contentPadding = padding,
                     onConversationClick = { selectedConversationId = it.id },
                     onMarkRead = { gateway.markConversationRead(it.id) },
@@ -480,6 +559,7 @@ private fun MindChatShell(
                             scope.launch { drawerState.open() }
                         },
                         onAddAccount = { showAddAccount = true },
+                        onOpenAppearance = { showAppearance = true },
                         appLockHostAvailable = appLockHost?.isAuthenticationAvailable ?: true,
                         onAppLockToggle = { enabled ->
                             if (!enabled || appLockHost?.isAuthenticationAvailable != false) {
@@ -618,11 +698,14 @@ private fun MindChatTopBar(
 }
 
 @Composable
-private fun connectionDotColor(state: AccountConnectionState): Color = when (state) {
-    AccountConnectionState.ONLINE -> Color(0xFF2E7D32)
-    AccountConnectionState.CONNECTING -> Color(0xFFF9A825)
-    AccountConnectionState.FAILED -> Color(0xFFC62828)
-    AccountConnectionState.OFFLINE -> MaterialTheme.colorScheme.outline
+private fun connectionDotColor(state: AccountConnectionState): Color {
+    val status = LocalMindChatStatusColors.current
+    return when (state) {
+        AccountConnectionState.ONLINE -> status.online
+        AccountConnectionState.CONNECTING -> status.away
+        AccountConnectionState.FAILED -> status.failed
+        AccountConnectionState.OFFLINE -> MaterialTheme.colorScheme.outline
+    }
 }
 
 private fun accountConnectionLabel(connectionState: AccountConnectionState): Int = when (connectionState) {
@@ -635,6 +718,7 @@ private fun accountConnectionLabel(connectionState: AccountConnectionState): Int
 @Composable
 private fun ConversationsScreen(
     state: MindChatUiState,
+    density: Density,
     contentPadding: PaddingValues,
     onConversationClick: (ConversationUi) -> Unit,
     onMarkRead: (ConversationUi) -> Unit,
@@ -654,7 +738,7 @@ private fun ConversationsScreen(
             end = 12.dp,
             bottom = 88.dp,
         ),
-        verticalArrangement = Arrangement.spacedBy(if (state.comfortableLayout) 8.dp else 2.dp),
+        verticalArrangement = Arrangement.spacedBy(density.listSpacing),
     ) {
         if (conversations.isEmpty()) {
             item {
@@ -664,6 +748,7 @@ private fun ConversationsScreen(
         items(conversations, key = { it.id }) { conversation ->
             ConversationRow(
                 conversation = conversation,
+                rowPadding = density.rowPadding,
                 onClick = { onConversationClick(conversation) },
                 onMarkRead = { onMarkRead(conversation) },
                 onOpenAsGroup = { onOpenAsGroup(conversation) },
@@ -682,6 +767,23 @@ private fun EmptyConversations() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // M3E empty state: a tonal medallion pairs display text with
+        // iconography instead of bare text (P1 B10).
+        Box(
+            modifier = Modifier
+                .size(64.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Email,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
         Text(
             text = stringResource(R.string.no_chats),
             style = MaterialTheme.typography.headlineSmall,
@@ -697,6 +799,7 @@ private fun EmptyConversations() {
 @Composable
 private fun ConversationRow(
     conversation: ConversationUi,
+    rowPadding: Dp,
     onClick: () -> Unit,
     onMarkRead: () -> Unit,
     onOpenAsGroup: () -> Unit,
@@ -712,7 +815,12 @@ private fun ConversationRow(
         ),
     ) {
         Row(
-            modifier = Modifier.padding(start = 14.dp, top = 14.dp, end = 6.dp, bottom = 14.dp),
+            modifier = Modifier.padding(
+                start = rowPadding,
+                top = rowPadding,
+                end = 6.dp,
+                bottom = rowPadding,
+            ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Avatar(conversation.title, conversation.isGroup)
@@ -736,10 +844,13 @@ private fun ConversationRow(
                 Spacer(Modifier.height(3.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (conversation.encrypted) {
-                        Text(
-                            text = "🔒",
+                        // Encrypted marker is a tintable, describable icon
+                        // (M3E P0 B3), not a font-dependent emoji glyph.
+                        Icon(
+                            imageVector = Icons.Filled.Lock,
+                            contentDescription = stringResource(R.string.encrypted),
                             modifier = Modifier.size(15.dp),
-                            style = MaterialTheme.typography.labelSmall,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.width(4.dp))
                     }
@@ -812,12 +923,17 @@ private fun ConversationRow(
 private fun ChatScreen(
     conversation: ConversationUi,
     messages: List<MessageUi>,
+    bubbleStyle: BubbleStyle,
+    chatBackground: ChatBackground,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onDeleteConversation: () -> Unit,
 ) {
     var draft by rememberSaveable(conversation.id) { mutableStateOf("") }
+    val snackbarHostState = remember { SnackbarHostState() }
     Scaffold(
+        containerColor = chatListBackground(chatBackground, MaterialTheme.colorScheme),
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             CenterAlignedTopAppBar(
                 title = {
@@ -899,7 +1015,7 @@ private fun ChatScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             items(messages, key = { it.id }) { message ->
-                MessageBubble(message)
+                MessageBubble(message, bubbleStyle)
             }
         }
     }
@@ -923,9 +1039,10 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, onSend: () 
             )
             Spacer(Modifier.width(8.dp))
             FilledIconButton(onClick = onSend, enabled = value.isNotBlank()) {
-                Text(
-                    text = "↑",
-                    style = MaterialTheme.typography.titleLarge,
+                Icon(
+                    imageVector = Icons.Filled.Send,
+                    contentDescription = stringResource(R.string.send),
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
                 )
             }
         }
@@ -933,26 +1050,27 @@ private fun Composer(value: String, onValueChange: (String) -> Unit, onSend: () 
 }
 
 @Composable
-private fun MessageBubble(message: MessageUi) {
+private fun MessageBubble(message: MessageUi, style: BubbleStyle) {
     val deliveryText = if (message.delivery != null) deliveryLabel(message.delivery) else null
-    val colors = if (message.mine) {
-        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-    } else {
-        CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh)
-    }
+    val scheme = MaterialTheme.colorScheme
+    val containerColor = bubbleContainerColor(style, message.mine, scheme)
+    val borderColor = bubbleOutlineColor(style, scheme)
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (message.mine) Arrangement.End else Arrangement.Start,
     ) {
         Card(
-            modifier = Modifier.fillMaxWidth(0.82f),
-            shape = RoundedCornerShape(
-                topStart = 20.dp,
-                topEnd = 20.dp,
-                bottomStart = if (message.mine) 20.dp else 4.dp,
-                bottomEnd = if (message.mine) 4.dp else 20.dp,
-            ),
-            colors = colors,
+            modifier = Modifier
+                .fillMaxWidth(0.82f)
+                .then(
+                    if (borderColor != Color.Transparent) {
+                        Modifier.border(1.dp, borderColor, bubbleShape(style, message.mine))
+                    } else {
+                        Modifier
+                    },
+                ),
+            shape = bubbleShape(style, message.mine),
+            colors = CardDefaults.cardColors(containerColor = containerColor),
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 if (!message.mine) {
@@ -1063,6 +1181,22 @@ private fun EmptyContacts() {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        // M3E empty state: tonal medallion with iconography (P1 B10).
+        Box(
+            modifier = Modifier
+                .size(64.dp)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Person,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.height(4.dp))
         Text(
             text = stringResource(R.string.no_contacts),
             style = MaterialTheme.typography.headlineSmall,
@@ -1096,7 +1230,7 @@ private fun FloatingDock(
         contentAlignment = Alignment.BottomCenter,
     ) {
         Surface(
-            shape = FloatingDockShape,
+            shape = MindChatDockShape,
             color = MaterialTheme.colorScheme.surfaceContainerHighest,
             tonalElevation = 3.dp,
             shadowElevation = 8.dp,
@@ -1124,12 +1258,16 @@ private fun FloatingDockItem(
     selected: Boolean,
     onClick: () -> Unit,
 ) {
+    // The selection pill animates through the app motion scheme, scaled by
+    // the appearance engine's animation speed (B1): no bare tween literals.
+    val effectsSpec = MindChatMotionScheme.effectsSpecFor<Color>(LocalMindChatMotionSpeed.current)
     val containerColor by animateColorAsState(
         targetValue = if (selected) {
             MaterialTheme.colorScheme.secondaryContainer
         } else {
             Color.Transparent
         },
+        animationSpec = effectsSpec,
         label = "floatingDockContainer",
     )
     val contentColor by animateColorAsState(
@@ -1138,12 +1276,13 @@ private fun FloatingDockItem(
         } else {
             MaterialTheme.colorScheme.onSurfaceVariant
         },
+        animationSpec = effectsSpec,
         label = "floatingDockContent",
     )
     Row(
         modifier = Modifier
             .height(52.dp)
-            .clip(FloatingDockItemShape)
+            .clip(MindChatDockItemShape)
             .background(containerColor)
             .clickable(onClick = onClick)
             .padding(horizontal = 14.dp),
@@ -1163,9 +1302,6 @@ private fun FloatingDockItem(
         )
     }
 }
-
-private val FloatingDockShape = RoundedCornerShape(28.dp)
-private val FloatingDockItemShape = RoundedCornerShape(20.dp)
 
 @Composable
 private fun destinationLabel(destination: Destination): String = stringResource(
@@ -1201,14 +1337,15 @@ private fun Avatar(label: String, isGroup: Boolean) {
 
 @Composable
 private fun PresenceDot(presence: Presence) {
+    val status = LocalMindChatStatusColors.current
     Box(
         modifier = Modifier
             .size(8.dp)
             .clip(CircleShape)
             .background(
                 when (presence) {
-                    Presence.ONLINE -> Color(0xFF2E7D32)
-                    Presence.AWAY -> Color(0xFFF9A825)
+                    Presence.ONLINE -> status.online
+                    Presence.AWAY -> status.away
                     Presence.DO_NOT_DISTURB -> MaterialTheme.colorScheme.error
                     Presence.OFFLINE -> MaterialTheme.colorScheme.outline
                 },
@@ -1441,6 +1578,7 @@ private fun AddContactDialog(
     var displayName by rememberSaveable { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
         title = { Text(stringResource(R.string.add_contact)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1876,6 +2014,8 @@ internal fun ProfileEditorContent(
     var displayName by rememberSaveable(account.id) { mutableStateOf(account.displayName) }
     var statusMessage by rememberSaveable(account.id) { mutableStateOf(profile?.statusMessage.orEmpty()) }
     var accentKey by rememberSaveable(account.id) { mutableStateOf(profile?.accentKey) }
+    var bubbleStyle by rememberSaveable(account.id) { mutableStateOf(profile?.bubbleStyle) }
+    var chatBackground by rememberSaveable(account.id) { mutableStateOf(profile?.chatBackground) }
     var avatarUri by rememberSaveable(account.id) { mutableStateOf(profile?.avatarUri) }
     var saving by remember { mutableStateOf(false) }
     var failed by remember { mutableStateOf(false) }
@@ -1948,6 +2088,30 @@ internal fun ProfileEditorContent(
         )
         Spacer(Modifier.height(8.dp))
         AccentSelector(selectedKey = accentKey, onSelect = { accentKey = it })
+        Spacer(Modifier.height(20.dp))
+        // Chat personality overrides (0.1.7): null = follow the global
+        // appearance profile; saved through the same onSave(AccountProfile).
+        ProfileEnumSelectorRow(
+            title = stringResource(R.string.chat_bubbles),
+            options = BubbleStyle.entries.map { style ->
+                style.key to stringResource(bubbleStyleLabelRes(style))
+            },
+            selectedKey = bubbleStyle?.key,
+            onSelect = { key ->
+                bubbleStyle = BubbleStyle.entries.firstOrNull { it.key == key }
+            },
+        )
+        Spacer(Modifier.height(16.dp))
+        ProfileEnumSelectorRow(
+            title = stringResource(R.string.chat_background),
+            options = ChatBackground.entries.map { background ->
+                background.key to stringResource(chatBackgroundLabelRes(background))
+            },
+            selectedKey = chatBackground?.key,
+            onSelect = { key ->
+                chatBackground = ChatBackground.entries.firstOrNull { it.key == key }
+            },
+        )
         if (failed) {
             Spacer(Modifier.height(12.dp))
             Text(
@@ -1981,6 +2145,8 @@ internal fun ProfileEditorContent(
                                 avatarUri = persistedAvatar,
                                 statusMessage = statusMessage.trim().ifBlank { null },
                                 accentKey = accentKey?.takeIf { it != ACCENT_DEFAULT_KEY },
+                                bubbleStyle = bubbleStyle,
+                                chatBackground = chatBackground,
                             ),
                             displayName.trim(),
                         )
@@ -2111,6 +2277,84 @@ private fun AccentSelector(
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
                         },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@StringRes
+private fun bubbleStyleLabelRes(style: BubbleStyle): Int = when (style) {
+    BubbleStyle.DEFAULT -> R.string.bubble_default
+    BubbleStyle.ROUNDED -> R.string.bubble_rounded
+    BubbleStyle.OUTLINED -> R.string.bubble_outlined
+}
+
+@StringRes
+private fun chatBackgroundLabelRes(background: ChatBackground): Int = when (background) {
+    ChatBackground.DEFAULT -> R.string.background_default
+    ChatBackground.TINTED -> R.string.background_tinted
+}
+
+/**
+ * Per-account appearance override row: "Follow global" (null) plus the enum
+ * options, mirroring [AccentSelector]'s check-mark pattern. The value is
+ * saved through the enclosing profile editor's Save, never applied locally.
+ */
+@Composable
+private fun ProfileEnumSelectorRow(
+    title: String,
+    options: List<Pair<String, String>>,
+    selectedKey: String?,
+    onSelect: (String?) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(bottom = 2.dp),
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(MaterialTheme.shapes.medium)
+                .clickable { onSelect(null) }
+                .padding(vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = stringResource(R.string.follow_global),
+                style = MaterialTheme.typography.bodyLarge,
+                modifier = Modifier.weight(1f),
+            )
+            if (selectedKey == null) {
+                Icon(
+                    imageVector = Icons.Filled.Check,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        options.forEach { (key, label) ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(MaterialTheme.shapes.medium)
+                    .clickable { onSelect(key) }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.weight(1f),
+                )
+                if (selectedKey == key) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
                     )
                 }
             }

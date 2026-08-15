@@ -44,6 +44,7 @@ internal fun mapSnapshotToUiState(
     connectingSince: Map<Long, Long>,
     settings: SettingsSnapshot,
     accountSettings: Map<Long, SettingsSnapshot>,
+    appearance: AppearanceProfile = AppearanceProfile(),
     now: Long,
     timestampFormatter: (Long) -> String,
 ): SnapshotMapping {
@@ -152,6 +153,7 @@ internal fun mapSnapshotToUiState(
             profiles = profiles,
             settings = settings,
             accountSettings = accountSettings,
+            appearance = appearance,
         ),
         connectingSince = tracking,
         activeAccountId = resolvedActiveAccountId,
@@ -187,11 +189,14 @@ internal fun formatTimestamp(epochMs: Long): String = DateFormat
  *
  * A poll cycle can skip rebuilding the UI state only when every input that
  * feeds the mapping is unchanged: the raw snapshot, the active account, the
- * settings snapshot, the per-account settings, and the stored profiles.
- * Snapshots with an account in CONNECTING always rebuild so the wall-clock
- * stall detection keeps working. The structural snapshot comparison is a
- * serialize-free, allocation-free field-by-field compare (same lengths, then
- * per-record equals).
+ * settings snapshot, the per-account settings, the stored profiles and the
+ * global appearance profile. The appearance keys live outside the keyed
+ * [SettingsSnapshot] (they are stored directly by [MindChatPreferences]), so
+ * the appearance is compared here explicitly: an appearance-only change must
+ * rebuild the UI (R7 in ROADMAP §5.1). Snapshots with an account in CONNECTING
+ * always rebuild so the wall-clock stall detection keeps working. The
+ * structural snapshot comparison is a serialize-free, allocation-free
+ * field-by-field compare (same lengths, then per-record equals).
  */
 internal fun shouldSkipUiRebuild(
     snapshot: FfiCoreSnapshot,
@@ -204,6 +209,8 @@ internal fun shouldSkipUiRebuild(
     lastProfiles: Map<Long, AccountProfile>,
     accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
+    appearance: AppearanceProfile = AppearanceProfile(),
+    lastAppearance: AppearanceProfile = AppearanceProfile(),
 ): Boolean {
     if (snapshot !== lastSnapshot) {
         if (lastSnapshot == null || snapshot != lastSnapshot) return false
@@ -212,5 +219,6 @@ internal fun shouldSkipUiRebuild(
     if (settings != lastSettings) return false
     if (profiles != lastProfiles) return false
     if (accountSettings != lastAccountSettings) return false
+    if (appearance != lastAppearance) return false
     return snapshot.accounts.none { it.connectionState == FfiConnectionState.CONNECTING }
 }

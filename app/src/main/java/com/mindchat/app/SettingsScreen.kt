@@ -97,6 +97,7 @@ fun SettingsScreen(
     contentPadding: PaddingValues,
     onOpenAccountDrawer: () -> Unit,
     onAddAccount: () -> Unit,
+    onOpenAppearance: () -> Unit,
     appLockHostAvailable: Boolean,
     onAppLockToggle: (Boolean) -> Unit,
 ) {
@@ -143,11 +144,21 @@ fun SettingsScreen(
                 rows = catalogRows(route.category, state.settings, state.activeAccountId, appLockHostAvailable),
                 contentPadding = contentPadding,
                 onBack = { navState.back() },
+                onOpenAppearance = onOpenAppearance,
                 onToggle = { key, checked ->
-                    if (key == SettingsSchema.appLockEnabled) {
-                        onAppLockToggle(checked)
-                    } else {
-                        gateway.setSetting(key, checked)
+                    when {
+                        key == SettingsSchema.appLockEnabled -> onAppLockToggle(checked)
+                        // The legacy 0.1.6 comfortable-layout toggle stays a
+                        // real control: it maps onto the 0.1.7 density engine
+                        // (COMFORTABLE vs STANDARD), exactly like
+                        // densityFromLegacy did.
+                        key == SettingsSchema.comfortableLayout -> gateway.setAppearance(
+                            state.appearance.copy(
+                                density = if (checked) Density.COMFORTABLE else Density.STANDARD,
+                            ),
+                        )
+
+                        else -> gateway.setSetting(key, checked)
                     }
                 },
                 onAction = { action ->
@@ -225,6 +236,7 @@ private fun SettingsCategoryScreen(
     rows: List<SettingRowSpec>,
     contentPadding: PaddingValues,
     onBack: () -> Unit,
+    onOpenAppearance: () -> Unit,
     onToggle: (BooleanKey, Boolean) -> Unit,
     onAction: (SettingRowAction) -> Unit,
 ) {
@@ -245,6 +257,19 @@ private fun SettingsCategoryScreen(
                 title = stringResource(categoryLabelRes(category)),
                 onBack = onBack,
             )
+        }
+        if (category == SettingCategory.APPEARANCE) {
+            // 0.1.7: the full appearance engine (shape/density/text/motion/
+            // bubbles/background) lives in its own screen; the catalog rows
+            // below keep the quick toggles (dynamic color, comfortable
+            // layout) plus the per-account accent link.
+            item {
+                SettingsLinkRow(
+                    title = stringResource(R.string.appearance),
+                    supportingText = stringResource(R.string.appearance_engine_summary),
+                    onClick = onOpenAppearance,
+                )
+            }
         }
         rows.forEach { row ->
             item {
