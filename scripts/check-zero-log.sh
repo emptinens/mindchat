@@ -28,23 +28,28 @@ STRICT_SO=0
 CARGO_TREE=0
 SO_DIRS=(app/src/main/jniLibs app/build)
 
-for arg in "$@"; do
-    case "$arg" in
-        --strict-so) STRICT_SO=1 ;;
-        --cargo-tree) CARGO_TREE=1 ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --strict-so) STRICT_SO=1; shift ;;
+        --cargo-tree) CARGO_TREE=1; shift ;;
         --so-dir)
-            echo "check-zero-log.sh: --so-dir requires a directory argument" >&2
-            exit 2
+            if [ $# -lt 2 ]; then
+                echo "check-zero-log.sh: --so-dir requires a directory argument" >&2
+                exit 2
+            fi
+            SO_DIRS+=("$2")
+            shift 2
             ;;
         --so-dir=*)
-            SO_DIRS+=("${arg#--so-dir=}")
+            SO_DIRS+=("${1#--so-dir=}")
+            shift
             ;;
         -h|--help)
             sed -n '2,24p' "$0"
             exit 0
             ;;
         *)
-            echo "check-zero-log.sh: unknown argument: $arg" >&2
+            echo "check-zero-log.sh: unknown argument: $1" >&2
             echo "usage: scripts/check-zero-log.sh [--strict-so] [--so-dir DIR] [--cargo-tree]" >&2
             exit 2
             ;;
