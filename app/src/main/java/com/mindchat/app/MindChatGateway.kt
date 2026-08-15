@@ -423,6 +423,11 @@ class NativeMindChatGateway(
     /**
      * Polls Rust-owned transport events without blocking the Compose main dispatcher.
      * Snapshot state is only assigned after the coroutine resumes on that dispatcher.
+     *
+     * P0-4: a changed poll captures exactly one core snapshot, after event
+     * processing and the outbox flush, and reuses it for both the durable save
+     * and the UI refresh. The unchanged poll (no events, no queued outgoing
+     * traffic) captures zero snapshots.
      */
     override suspend fun pollTransport() {
         try {
@@ -435,43 +440,36 @@ class NativeMindChatGateway(
             val result = withContext(Dispatchers.IO) {
                 try {
                     val processedEvents = core.pollTransportEvents(32U)
+                    val pendingWork = pendingAccounts.any { it in onlineBefore }
+                    if (processedEvents == 0U && !pendingWork) {
+                        // Unchanged poll: nothing to apply and nothing queued.
+                        // No snapshot, no save, no UI rebuild.
+                        return@withContext null
+                    }
 
-                    // Flush the outbox before persisting so delivery transitions are
-                    // captured in the saved snapshot.
-                    val hasTransportWork = processedEvents > 0U || pendingAccounts.any { it in onlineBefore }
-                    val flushedAccounts = if (hasTransportWork) {
-                        val beforeFlush = core.snapshot()
-                        val onlineNow = beforeFlush.accounts
-                            .asSequence()
-                            .filter { it.connectionState == FfiConnectionState.ONLINE }
-                            .map { it.id.toLong() }
-                            .toSet()
-                        val accountsToFlush = (pendingAccounts + (onlineNow - onlineBefore))
-                            .intersect(onlineNow)
-                        accountsToFlush.forEach { accountId ->
-                            try {
-                                core.flushOutbox(accountId.toULong())
-                            } catch (_: MindChatBindingException) {
-                                // The core has already projected a failed delivery state when applicable.
-                            }
+                    // Flush the outbox before persisting so delivery transitions
+                    // are captured in the saved snapshot. Candidates are the
+                    // Kotlin-tracked pending accounts; flushOutbox is a safe no-op
+                    // for an account that dropped offline mid-batch, so no
+                    // pre-flush snapshot is needed to decide who to flush.
+                    val flushedAccounts = pendingAccounts
+                    flushedAccounts.forEach { accountId ->
+                        try {
+                            core.flushOutbox(accountId.toULong())
+                        } catch (_: MindChatBindingException) {
+                            // The core has already projected a failed delivery state when applicable.
                         }
-                        accountsToFlush
-                    } else {
-                        emptySet()
                     }
 
                     if (processedEvents > 0U || flushedAccounts.isNotEmpty()) {
                         markDirty()
                     }
-                    val stateChanged = persistenceTracker.requiresSave()
-                    if (stateChanged) {
-                        saveSnapshot()
+                    // The single snapshot of this poll: post-events, post-flush.
+                    val snapshot = core.snapshot()
+                    if (persistenceTracker.requiresSave()) {
+                        saveSnapshot(snapshot)
                     }
-
-                    if (processedEvents == 0U && pendingAccounts.none { it in onlineBefore }) {
-                        return@withContext null
-                    }
-                    TransportPollResult(core.snapshot(), flushedAccounts)
+                    TransportPollResult(snapshot, flushedAccounts)
                 } catch (_: MindChatBindingException) {
                     // A transport batch can apply Connected/Disconnected before a
                     // later malformed roster or presence stanza makes the native
@@ -483,7 +481,7 @@ class NativeMindChatGateway(
                         // Events applied before the failed batch are visible but
                         // would be lost on process death; make them durable now.
                         markDirty()
-                        saveSnapshot()
+                        saveSnapshot(fallbackSnapshot)
                         TransportPollResult(fallbackSnapshot, emptySet())
                     } else {
                         null
@@ -492,6 +490,16 @@ class NativeMindChatGateway(
             }
             result?.let { pollResult ->
                 pendingOutboxAccounts.removeAll(pollResult.flushedAccounts)
+                // Accounts that connected during this batch may carry restored
+                // queued messages that are not in pendingOutboxAccounts (they
+                // were never sent from this process); schedule them so the next
+                // poll flushes their queue.
+                val onlineNow = pollResult.snapshot.accounts
+                    .asSequence()
+                    .filter { it.connectionState == FfiConnectionState.ONLINE }
+                    .map { it.id.toLong() }
+                    .toSet()
+                pendingOutboxAccounts += onlineNow - onlineBefore
                 refresh(pollResult.snapshot)
             }
         } catch (throwable: Throwable) {
@@ -623,11 +631,18 @@ class NativeMindChatGateway(
     }
 
     /**
-     * Saves one ordered snapshot. A mutation concurrent with native I/O keeps
-     * `dirty` set because its epoch differs from the snapshot's captured
-     * epoch.
+     * Saves one ordered snapshot. [snapshot] is the core state being persisted:
+     * the poll path hands over the single snapshot it already captured so the
+     * save never triggers an extra capture, while [persistNow] and lifecycle
+     * saves keep their own capture (null). The native save re-serializes the
+     * core under the session lock; because no mutation can run between the
+     * capture and this call (the persistence mutex serializes writers), the
+     * written state equals [snapshot] when one is provided.
+     *
+     * A mutation concurrent with native I/O keeps `dirty` set because its epoch
+     * differs from the snapshot's captured epoch.
      */
-    private suspend fun saveSnapshot(): Boolean = persistenceMutex.withLock {
+    private suspend fun saveSnapshot(snapshot: FfiCoreSnapshot? = null): Boolean = persistenceMutex.withLock {
         val epochAtSave = persistenceTracker.captureSaveEpoch()
         val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
         if (saved) {

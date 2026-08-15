@@ -7,9 +7,12 @@ import com.mindchat.core.FfiCoreSnapshot
 import com.mindchat.core.FfiDeliveryState
 import com.mindchat.core.FfiMessageDirection
 import com.mindchat.core.FfiProtocolCapability
-import java.text.DateFormat
-import java.util.Date
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.format.FormatStyle
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Shared snapshot-to-UI mapping behind the [MindChatGateway] contract.
@@ -179,10 +182,23 @@ private fun FfiDeliveryState.toUiModel(): MessageDelivery = when (this) {
  * Default timestamp formatter used by the native gateway. Locale formatting is
  * a JVM concern (no Android APIs), so it lives with the pure mapping and stays
  * injectable for tests.
+ *
+ * P0-2: one [DateTimeFormatter] is cached per locale instead of rebuilding a
+ * `DateFormat` (synchronized factory call) and a `Date` per message on every
+ * full remap. `DateTimeFormatter.ofLocalizedTime(SHORT)` renders the same
+ * locale-specific short time as `DateFormat.getTimeInstance(SHORT)` on both
+ * the JVM (CLDR) and Android (ICU), so output is unchanged; the golden tests
+ * in SnapshotMappingTest pin that equality.
  */
-internal fun formatTimestamp(epochMs: Long): String = DateFormat
-    .getTimeInstance(DateFormat.SHORT, Locale.getDefault())
-    .format(Date(epochMs))
+private val timestampFormatters = ConcurrentHashMap<Locale, DateTimeFormatter>()
+
+internal fun formatTimestamp(epochMs: Long): String {
+    val locale = Locale.getDefault()
+    val formatter = timestampFormatters.getOrPut(locale) {
+        DateTimeFormatter.ofLocalizedTime(FormatStyle.SHORT).withLocale(locale)
+    }
+    return Instant.ofEpochMilli(epochMs).atZone(ZoneId.systemDefault()).format(formatter)
+}
 
 /**
  * Pure decision behind [NativeMindChatGateway.refresh]'s no-op fast path.

@@ -14,6 +14,10 @@ import com.mindchat.core.FfiMessageKind
 import com.mindchat.core.FfiProtocolCapability
 import com.mindchat.core.FfiReaction
 import com.mindchat.core.FfiRosterSubscription
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -291,6 +295,50 @@ class SnapshotMappingTest {
         )
 
         assertEquals(true, mapping.state.accountSettings[1L]?.get(SettingsSchema.appLockEnabled))
+    }
+
+    // --- Timestamp formatting (P0-2) -----------------------------------------
+
+    @Test
+    fun cachedTimestampFormatterMatchesLegacyDateFormatOutput() {
+        // P0-2: the cached java.time formatter must render exactly what the
+        // legacy per-call DateFormat factory produced, across representative
+        // locales and times of day (AM/PM vs 24-hour layouts).
+        val originalLocale = Locale.getDefault()
+        val originalZone = TimeZone.getDefault()
+        try {
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            val locales = listOf(Locale.US, Locale.UK, Locale.GERMANY, Locale.FRANCE, Locale.JAPAN, Locale.forLanguageTag("ru-RU"))
+            val epochs = longArrayOf(0L, 45_240_000L, 1_700_000_000_000L, 86_400_000L + 45_234_000L)
+            for (locale in locales) {
+                Locale.setDefault(locale)
+                val legacy = DateFormat.getTimeInstance(DateFormat.SHORT, locale)
+                for (epoch in epochs) {
+                    assertEquals(legacy.format(Date(epoch)), formatTimestamp(epoch))
+                }
+            }
+        } finally {
+            Locale.setDefault(originalLocale)
+            TimeZone.setDefault(originalZone)
+        }
+    }
+
+    @Test
+    fun cachedTimestampFormatterRendersGoldenLocaleOutput() {
+        // Golden strings for Locale.US in UTC: the exact output the mapping
+        // contract must keep producing after the P0-2 formatter cache.
+        val originalLocale = Locale.getDefault()
+        val originalZone = TimeZone.getDefault()
+        try {
+            Locale.setDefault(Locale.US)
+            TimeZone.setDefault(TimeZone.getTimeZone("UTC"))
+            assertEquals("12:00 AM", formatTimestamp(0L))
+            assertEquals("12:34 PM", formatTimestamp(45_240_000L))
+            assertEquals("10:13 PM", formatTimestamp(1_700_000_000_000L))
+        } finally {
+            Locale.setDefault(originalLocale)
+            TimeZone.setDefault(originalZone)
+        }
     }
 
     // --- fixtures -------------------------------------------------------------

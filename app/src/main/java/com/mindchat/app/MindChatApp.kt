@@ -129,6 +129,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.mindchat.app.theme.ACCENT_DEFAULT_KEY
 import com.mindchat.app.theme.AccentOptions
 import com.mindchat.app.theme.EmphasizedDecelerate
@@ -168,7 +169,7 @@ fun MindChatApp(appLockHost: AppLockHost? = null) {
 }
 
 @Composable
-private fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
+internal fun MindChatApp(gateway: MindChatGateway, appLockHost: AppLockHost?) {
     // T1: the system reduce-motion contract (Settings.Global animator +
     // transition scales, live via ContentObserver) feeds every micro-animation
     // through LocalMotion. Tests override LocalMotion directly.
@@ -192,10 +193,16 @@ private fun MindChatAppThemed(gateway: MindChatGateway, appLockHost: AppLockHost
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    LaunchedEffect(gateway) {
-        while (true) {
-            gateway.pollTransport()
-            delay(750)
+    // P0-1: the poll loop runs only while the app is on screen. repeatOnLifecycle
+    // cancels the loop below ON_START (the composition survives backgrounding, so
+    // the loop would otherwise keep waking the CPU), and restarts it with one
+    // immediate poll when the app returns to STARTED so the resumed UI catches up.
+    LaunchedEffect(gateway, lifecycleOwner) {
+        lifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) {
+                gateway.pollTransport()
+                delay(750)
+            }
         }
     }
     // Per-account accent override: the active account's profile accent seeds
