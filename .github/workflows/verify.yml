@@ -40,3 +40,17 @@ jobs:
       - run: cargo install cargo-ndk --version 4.1.2 --locked && cargo install uniffi --version 0.32.0 --features cli --locked
       - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh
       - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug --no-daemon --max-workers=2
+
+  ffi-stability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      # uniffi-bindgen 0.32.x is required by scripts/generate-uniffi-kotlin.sh.
+      - run: cargo install uniffi --version 0.32.0 --features cli --locked
+      # Warm the cargo registry from Cargo.lock so the --offline regeneration
+      # build below is deterministic on a fresh runner.
+      - run: cargo fetch --locked
+      - run: sh scripts/check-ffi-stability.sh --offline
