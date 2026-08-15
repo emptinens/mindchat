@@ -1,11 +1,16 @@
 //! `ServerConnector` provides streams for XMPP clients
 
-use sasl::common::ChannelBinding;
 use tokio::io::{AsyncBufRead, AsyncWrite};
 use xmpp_parsers::jid::Jid;
 
 use crate::xmlstream::{PendingFeaturesRecv, Timeouts};
 use crate::Error;
+
+// MindChat patch (0.1.8, ROADMAP 6.3): re-export the SASL channel-binding
+// type so an out-of-crate `ServerConnector` implementation (the proxy
+// connector in crates/mindchat-core) can name the trait's return type
+// without adding a direct `sasl` dependency.
+pub use sasl::common::ChannelBinding;
 
 #[cfg(feature = "starttls")]
 pub mod starttls;

@@ -15,6 +15,7 @@ DIRECT
 DO_NOT_DISTURB
 FAILED
 FAILED
+HTTP_CONNECT
 HTTP_FILE_UPLOAD
 INBOUND
 INCOMING
@@ -40,6 +41,7 @@ READ
 RECEIPTS
 SENT
 SHARED_PINS
+SOCKS5
 STREAM_MANAGEMENT
 TEXT
 VOICE
@@ -57,6 +59,8 @@ data class FfiContact(
 data class FfiConversation(
 data class FfiCoreSnapshot(
 data class FfiMessage(
+data class FfiProxyConfig(
+data class FfiProxyProbe(
 data class FfiReaction(
 data class MessageAdded(
 data class MessageChanged(
@@ -68,10 +72,13 @@ enum class FfiDeliveryState {
 enum class FfiMessageDirection {
 enum class FfiMessageKind {
 enum class FfiProtocolCapability {
+enum class FfiProxyKind {
 enum class FfiRosterSubscription {
+fun accountProxies(accountId: kotlin.ULong): List<FfiProxyConfig>
 fun addAccount(jid: kotlin.String, server: kotlin.String, displayName: kotlin.String): kotlin.ULong
 fun addReaction(messageId: kotlin.ULong, actor: kotlin.String, emoji: kotlin.String): kotlin.ULong
 fun connectAccount(accountId: kotlin.ULong, password: kotlin.String)
+fun connectAccountWithProxy(accountId: kotlin.ULong, password: kotlin.String, proxy: FfiProxyConfig?, proxyPassword: kotlin.String?)
 fun deleteAccount(accountId: kotlin.ULong)
 fun deleteConversation(conversationId: kotlin.ULong)
 fun disconnectAccount(accountId: kotlin.ULong)
@@ -85,9 +92,11 @@ fun receiveText(conversationId: kotlin.ULong, sender: kotlin.String, body: kotli
 fun registerAccount(username: kotlin.String, server: kotlin.String, displayName: kotlin.String, password: kotlin.String): kotlin.ULong
 fun saveState(path: kotlin.String)
 fun sendText(conversationId: kotlin.ULong, sender: kotlin.String, body: kotlin.String, inReplyTo: kotlin.ULong?, nowEpochMs: kotlin.ULong): kotlin.ULong
+fun setAccountProxies(accountId: kotlin.ULong, proxies: List<FfiProxyConfig>?)
 fun setCapabilities(accountId: kotlin.ULong, capabilities: List<FfiProtocolCapability>)
 fun setConnectionState(accountId: kotlin.ULong, state: FfiConnectionState)
 fun snapshot(): FfiCoreSnapshot
+fun testProxy(config: FfiProxyConfig, proxyPassword: kotlin.String?): FfiProxyProbe
 fun updateAccountDisplayName(accountId: kotlin.ULong, displayName: kotlin.String)
 fun upsertContact(accountId: kotlin.ULong, jid: kotlin.String, displayName: kotlin.String, presence: FfiContactPresence, status: kotlin.String?)
 open class MindChatCoreHandle: Disposable, AutoCloseable, MindChatCoreHandleInterface
@@ -121,7 +130,9 @@ val direction: FfiMessageDirection
 val displayName: kotlin.String
 val displayName: kotlin.String
 val emoji: kotlin.String
+val error: kotlin.String?
 val filename: kotlin.String
+val host: kotlin.String
 val id: kotlin.String
 val id: kotlin.ULong
 val id: kotlin.ULong
@@ -132,12 +143,16 @@ val jid: kotlin.String
 val jid: kotlin.String
 val kind: FfiConversationKind
 val kind: FfiMessageKind
+val kind: FfiProxyKind
 val lastActivityEpochMs: kotlin.ULong
+val latencyMs: kotlin.ULong
 val messageId: kotlin.ULong
 val messageId: kotlin.ULong
 val messageId: kotlin.ULong
 val messages: List<FfiMessage>
 val mimeType: kotlin.String
+val ok: kotlin.Boolean
+val port: kotlin.UShort
 val presence: FfiContactPresence
 val reactions: List<FfiReaction>
 val remoteUrl: kotlin.String?

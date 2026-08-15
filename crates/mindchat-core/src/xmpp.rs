@@ -7,7 +7,8 @@
 use crate::{
     AccountId, ConnectionRequest, ContactPresence, ConversationKind, OutgoingMessage,
     ProtocolCapability, RosterSubscription, SecretString, TransportError, TransportEvent,
-    XmppTransport, proxy::ConnectStrategy,
+    XmppTransport,
+    proxy::{ConnectStrategy, ProxyConfig, ProxyTarget},
 };
 use futures::{SinkExt, StreamExt};
 use hickory_resolver::{TokioResolver, config::LookupIpStrategy, proto::rr::RData};
@@ -23,8 +24,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio_xmpp::{
     Client, Event as TokioXmppEvent, Stanza,
     connect::{
-        AsyncReadAndWrite, DirectTlsServerConnector, DnsConfig, ServerConnector,
-        StartTlsServerConnector,
+        AsyncReadAndWrite, ChannelBinding, DirectTlsServerConnector, DnsConfig,
+        PreconnectedServerConnector, ServerConnector, StartTlsServerConnector,
     },
     parsers::{
         disco::{DiscoInfoQuery, DiscoInfoResult},
@@ -39,7 +40,9 @@ use tokio_xmpp::{
         roster::{Ask, Item as RosterItem, Roster, Subscription},
         stanza_error::{DefinedCondition, StanzaError},
     },
-    xmlstream::{FallibleStreamElement, Timeouts, XmppStream, XmppStreamElement},
+    xmlstream::{
+        FallibleStreamElement, PendingFeaturesRecv, Timeouts, XmppStream, XmppStreamElement,
+    },
 };
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -379,10 +382,15 @@ struct WorkerConnection {
     password: String,
     server: String,
     auto_reconnect: bool,
-    /// Connect strategy for this session (ROADMAP 6.2 P2-2). Only
-    /// [`ConnectStrategy::Direct`] is reachable in 0.1.8; the proxy variants
-    /// are reserved and rejected recoverably by [`strategy_connect_failure`].
+    /// Connect strategy for this session (ROADMAP 6.2 P2-2). Direct keeps the
+    /// resolution-and-dial path; the proxy variants tunnel through
+    /// [`Self::proxy`] with TLS against the real hostname (6.3).
     connect_strategy: ConnectStrategy,
+    /// Non-secret tunnel configuration; `None` for a direct connection.
+    proxy: Option<ProxyConfig>,
+    /// Runtime-only proxy credentials (single secret, username empty),
+    /// consumed by the proxy handshake and never persisted.
+    proxy_password: Option<String>,
 }
 
 impl WorkerConnection {
@@ -397,15 +405,20 @@ impl WorkerConnection {
             return Err(TransportError::ProtocolViolation("XMPP server is empty".to_owned()));
         }
         validate_endpoint_syntax(&server)?;
+        let proxy = request.proxy;
+        let connect_strategy = match &proxy {
+            None => ConnectStrategy::Direct,
+            Some(config) => ConnectStrategy::from(config.kind),
+        };
         Ok(Self {
             account_id: request.account_id,
             jid,
             password: request.password.into_inner(),
             server,
             auto_reconnect: request.auto_reconnect,
-            // The FFI cannot select a strategy in 0.1.8, so every session
-            // starts direct; 6.3 plumbs the persisted setting here.
-            connect_strategy: ConnectStrategy::Direct,
+            connect_strategy,
+            proxy,
+            proxy_password: request.proxy_password.map(SecretString::into_inner),
         })
     }
 }
@@ -427,10 +440,21 @@ async fn run_worker(
     // CONNECT_PHASE_TIMEOUT, and it is selectable against the command channel
     // so a user disconnect during "connecting" is honored immediately.
     let phase = async {
-        let attempts = resolve_endpoints_with(&connection.server, &mut srv_resolver)
-            .await
-            .map_err(|detail| ConnectFailure { detail, recoverable: true })?;
-        connect_attempt(&connection, attempts).await
+        // Proxy strategies skip local resolution entirely (DNS-leak
+        // protection): the XMPP hostname travels verbatim inside the tunnel
+        // and SRV is never consulted. Only the configured proxy hostname is
+        // resolved, to open the TCP connection.
+        match connection.connect_strategy {
+            ConnectStrategy::Direct => {
+                let attempts = resolve_endpoints_with(&connection.server, &mut srv_resolver)
+                    .await
+                    .map_err(|detail| ConnectFailure { detail, recoverable: true })?;
+                connect_attempt(&connection, attempts).await
+            }
+            ConnectStrategy::HttpConnect | ConnectStrategy::Socks5 => {
+                connect_attempt_proxy(&connection).await
+            }
+        }
     };
     let outcome = tokio::select! {
         command = command_receiver.recv() => {
@@ -665,11 +689,13 @@ async fn connect_attempt(
     connection: &WorkerConnection,
     attempts: Vec<(SocketAddr, bool)>,
 ) -> Result<ReadyClient, ConnectFailure> {
-    // ROADMAP 6.2 P2-2: a reserved proxy strategy fails recoverably before
-    // any candidate handshake instead of silently connecting directly. The
-    // failure runs under the same connect budget as every other candidate
-    // failure; 6.3 replaces it with the real handshake.
-    if let Some(failure) = strategy_connect_failure(connection.connect_strategy) {
+    // ROADMAP 6.2 P2-2: a proxy strategy without a tunnel configuration fails
+    // recoverably before any candidate handshake instead of silently
+    // connecting directly. Direct always passes. The failure runs under the
+    // same connect budget as every other candidate failure.
+    if let Some(failure) =
+        strategy_connect_failure(connection.connect_strategy, connection.proxy.is_some())
+    {
         return Err(failure);
     }
     let mut last_failure =
@@ -700,21 +726,114 @@ fn terminal_if_auth(failure: ConnectFailure) -> Option<ConnectFailure> {
     (!failure.recoverable).then_some(failure)
 }
 
-/// Maps a connect strategy to the failure it produces in this release.
+/// Maps a connect strategy to the failure it produces for a worker without
+/// usable proxy configuration.
 ///
-/// [`ConnectStrategy::Direct`] connects normally. The reserved proxy
-/// strategies (ROADMAP 6.2 P2-2, handshakes land in 6.3) produce a
-/// recoverable connection failure so a strategy selected by a future FFI can
-/// never silently fall back to a direct connection; the failure is billed to
-/// the same connect budget as any other candidate failure.
+/// [`ConnectStrategy::Direct`] connects normally. A proxy strategy whose
+/// worker carries no tunnel configuration produces a recoverable connection
+/// failure so a misconfigured account can never silently fall back to a
+/// direct connection; the failure is billed to the same connect budget as any
+/// other candidate failure.
 #[must_use]
-fn strategy_connect_failure(strategy: ConnectStrategy) -> Option<ConnectFailure> {
-    match strategy {
-        ConnectStrategy::Direct => None,
-        ConnectStrategy::HttpConnect | ConnectStrategy::Socks5 => Some(ConnectFailure {
-            detail: format!("{strategy} connect strategy is not implemented yet"),
+fn strategy_connect_failure(
+    strategy: ConnectStrategy,
+    proxy_configured: bool,
+) -> Option<ConnectFailure> {
+    match (strategy, proxy_configured) {
+        (ConnectStrategy::Direct, _)
+        | (ConnectStrategy::HttpConnect | ConnectStrategy::Socks5, true) => None,
+        (strategy @ (ConnectStrategy::HttpConnect | ConnectStrategy::Socks5), false) => {
+            Some(ConnectFailure {
+                detail: format!("{strategy} connect strategy has no proxy configuration"),
+                recoverable: true,
+            })
+        }
+    }
+}
+
+/// Establishes an XMPP session through the worker's proxy tunnel.
+///
+/// The proxy handshake (SOCKS5 or HTTP CONNECT) runs first; DNS for the XMPP
+/// domain happens only at the proxy. The tunneled stream is then wrapped in a
+/// fresh [`PreconnectedServerConnector`] so direct TLS runs against the real
+/// hostname, and the resulting client is polled for its first event exactly
+/// like the direct path. The whole attempt is bounded by
+/// [`CONNECT_ATTEMPT_TIMEOUT`].
+async fn connect_attempt_proxy(
+    connection: &WorkerConnection,
+) -> Result<ReadyClient, ConnectFailure> {
+    if let Some(failure) =
+        strategy_connect_failure(connection.connect_strategy, connection.proxy.is_some())
+    {
+        return Err(failure);
+    }
+    let proxy = connection.proxy.as_ref().expect("strategy_connect_failure guarantees a proxy");
+    let target = ProxyTarget::from_server(&connection.server)
+        .map_err(|error| ConnectFailure { detail: error.to_string(), recoverable: true })?;
+    let connector =
+        ProxyServerConnector::new(proxy.clone(), connection.proxy_password.clone(), target);
+    let mut client = Client::new_with_connector(
+        connection.jid.clone(),
+        connection.password.clone(),
+        connector,
+        STREAM_TIMEOUTS,
+    );
+    match tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, client.next()).await {
+        Ok(Some(event)) => first_event_to_ready(client, event),
+        Ok(None) => Err(ConnectFailure {
+            detail: "the proxy tunnel closed during the XMPP handshake".to_owned(),
             recoverable: true,
         }),
+        Err(_) => Err(ConnectFailure {
+            detail: format!(
+                "the proxy connection timed out after {} seconds",
+                CONNECT_ATTEMPT_TIMEOUT.as_secs()
+            ),
+            recoverable: true,
+        }),
+    }
+}
+
+/// ServerConnector that opens a proxy tunnel and hands the stream to the
+/// vendored `PreconnectedServerConnector` for TLS + stream initiation.
+///
+/// Each `connect` call (including the vendored reconnect path) runs a fresh
+/// proxy handshake and builds a fresh preconnected connector, so mid-session
+/// reconnects re-establish the tunnel instead of reusing a consumed stream.
+#[derive(Clone, Debug)]
+struct ProxyServerConnector {
+    proxy: ProxyConfig,
+    proxy_password: Option<String>,
+    target: ProxyTarget,
+}
+
+impl ProxyServerConnector {
+    fn new(proxy: ProxyConfig, proxy_password: Option<String>, target: ProxyTarget) -> Self {
+        Self { proxy, proxy_password, target }
+    }
+}
+
+impl ServerConnector for ProxyServerConnector {
+    type Stream = <PreconnectedServerConnector<
+        tokio::io::BufReader<tokio::net::TcpStream>,
+    > as ServerConnector>::Stream;
+
+    async fn connect(
+        &self,
+        jid: &Jid,
+        ns: &'static str,
+        timeouts: Timeouts,
+    ) -> Result<(PendingFeaturesRecv<Self::Stream>, ChannelBinding), tokio_xmpp::Error> {
+        let stream = crate::proxy::connect_via_proxy(
+            &self.proxy,
+            self.proxy_password.as_deref(),
+            &self.target,
+        )
+        .await
+        .map_err(|error| tokio_xmpp::Error::Io(std::io::Error::other(error.to_string())))?;
+        PreconnectedServerConnector::new(stream, self.target.host.clone())
+            .connect(jid, ns, timeouts)
+            .await
     }
 }
 
@@ -1765,26 +1884,60 @@ mod tests {
     #[test]
     fn direct_strategy_has_no_connect_failure() {
         // ROADMAP 6.2 P2-2: Direct is the shipped behavior and must not be
-        // rejected anywhere in the connect path.
-        assert_eq!(strategy_connect_failure(ConnectStrategy::Direct), None);
+        // rejected anywhere in the connect path, with or without a proxy
+        // configured for the worker.
+        assert_eq!(strategy_connect_failure(ConnectStrategy::Direct, false), None);
+        assert_eq!(strategy_connect_failure(ConnectStrategy::Direct, true), None);
     }
 
     #[test]
-    fn reserved_proxy_strategies_fail_recoverably() {
-        // A reserved strategy must fail recoverably (never silently connect
-        // directly, never surface as a credential failure), with a UI-safe
-        // detail naming the strategy, until 6.3 implements the handshake.
+    fn proxy_strategies_require_tunnel_configuration() {
+        // A proxy strategy with a tunnel configuration passes the guard (the
+        // handshake is implemented in 6.3). Without one it must fail
+        // recoverably (never silently connect directly, never surface as a
+        // credential failure), with a UI-safe detail naming the strategy.
         for strategy in [ConnectStrategy::HttpConnect, ConnectStrategy::Socks5] {
-            let failure = strategy_connect_failure(strategy)
-                .expect("reserved proxy strategy fails in the connect path");
+            assert_eq!(
+                strategy_connect_failure(strategy, true),
+                None,
+                "a configured {strategy:?} tunnel must pass the guard"
+            );
+            let failure = strategy_connect_failure(strategy, false)
+                .expect("a proxy strategy without configuration fails in the connect path");
             assert!(failure.recoverable, "{strategy:?} must be recoverable");
             assert!(
-                failure.detail.contains("not implemented yet"),
-                "detail should name the unimplemented strategy: {}",
+                failure.detail.contains("proxy configuration"),
+                "detail should name the missing configuration: {}",
                 failure.detail
             );
             assert!(failure.detail.contains(strategy.as_str()));
         }
+    }
+
+    #[test]
+    fn connect_attempt_proxy_without_configuration_fails_recoverably_offline() {
+        // The seam guard must reject a proxy strategy without a tunnel before
+        // any network I/O, so the proxy connect path is testable fully
+        // offline (no TCP, no DNS, no proxy).
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let connection = WorkerConnection {
+            account_id: 7,
+            jid: "alice@example.org".parse().expect("valid jid"),
+            password: "s3cret".to_owned(),
+            server: "example.org".to_owned(),
+            auto_reconnect: true,
+            connect_strategy: ConnectStrategy::Socks5,
+            proxy: None,
+            proxy_password: None,
+        };
+        let Err(failure) = runtime.block_on(connect_attempt_proxy(&connection)) else {
+            panic!("a proxy strategy without configuration must fail");
+        };
+        assert!(failure.recoverable, "the missing-configuration failure must stay recoverable");
+        assert!(failure.detail.contains("socks5"));
     }
 
     #[test]

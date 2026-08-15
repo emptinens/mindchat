@@ -15,10 +15,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod extension;
 pub mod persistence;
+pub mod proxy;
 pub mod transport;
 
-#[cfg(feature = "xmpp-transport")]
-pub mod proxy;
 #[cfg(feature = "xmpp-transport")]
 pub mod xmpp;
 
@@ -39,6 +38,8 @@ pub use transport::{
 
 #[cfg(feature = "xmpp-transport")]
 pub use xmpp::{RegisterRequest, TokioXmppTransport, resolve_endpoint};
+
+pub use proxy::{ConnectStrategy, ProxyConfig, ProxyError, ProxyKind, ProxyTarget};
 
 /// Stable identifier for an XMPP account configured in the client.
 pub type AccountId = u64;
@@ -199,6 +200,12 @@ pub struct Account {
     /// to `true`: a user-requested disconnect is immediate either way.
     #[serde(default = "default_auto_reconnect")]
     pub auto_reconnect: bool,
+    /// Proxy library assigned to this account (ROADMAP 6.3). Non-secret:
+    /// host/port/kind only, never a password. Persisted so a restore keeps
+    /// the assignment; credentials are handed over per connect and never
+    /// stored.
+    #[serde(default)]
+    pub proxies: Vec<ProxyConfig>,
 }
 
 /// Accounts default to automatic reconnection; 0.1.8 made mid-session network
@@ -481,6 +488,7 @@ impl MindChatCore {
                 capabilities: BTreeSet::new(),
                 connection_error: None,
                 auto_reconnect: true,
+                proxies: Vec::new(),
             },
         );
         self.events.push(CoreEvent::AccountChanged(id));
@@ -1100,6 +1108,31 @@ impl MindChatCore {
         Ok(())
     }
 
+    /// Replaces the proxy library assigned to an account (ROADMAP 6.3).
+    ///
+    /// The library is non-secret (host/port/kind) and survives a restore;
+    /// proxy passwords are never stored on the account, so they cannot be
+    /// replaced here.
+    pub fn set_account_proxies(
+        &mut self,
+        account_id: AccountId,
+        proxies: Vec<ProxyConfig>,
+    ) -> Result<(), CoreError> {
+        let account =
+            self.accounts.get_mut(&account_id).ok_or(CoreError::UnknownAccount(account_id))?;
+        account.proxies = proxies;
+        self.events.push(CoreEvent::AccountChanged(account_id));
+        Ok(())
+    }
+
+    /// Returns the proxy library assigned to an account, password-free.
+    pub fn account_proxies(&self, account_id: AccountId) -> Result<Vec<ProxyConfig>, CoreError> {
+        self.accounts
+            .get(&account_id)
+            .map(|account| account.proxies.clone())
+            .ok_or(CoreError::UnknownAccount(account_id))
+    }
+
     /// Drains events in mutation order for a UI event loop.
     pub fn drain_events(&mut self) -> Vec<CoreEvent> {
         std::mem::take(&mut self.events)
@@ -1355,11 +1388,30 @@ impl<T> TransportCoordinator<T> {
 }
 
 impl<T: XmppTransport> TransportCoordinator<T> {
-    /// Starts an account connection without storing the supplied password in the core.
+    /// Starts an account connection without storing the supplied password in
+    /// the core. The account connects directly (no proxy), exactly like the
+    /// pre-0.1.8 path.
     pub fn connect(
         &mut self,
         account_id: AccountId,
         password: SecretString,
+    ) -> Result<(), TransportCoordinatorError> {
+        self.connect_with_proxy(account_id, password, None, None)
+    }
+
+    /// Starts an account connection through an optional proxy tunnel
+    /// (ROADMAP 6.3).
+    ///
+    /// `proxy` is the non-secret tunnel configuration; `proxy_password` is
+    /// the runtime-only credential handed to the worker like the account
+    /// password. Neither the proxy password nor the account password is ever
+    /// stored in the core, snapshots, or event stream.
+    pub fn connect_with_proxy(
+        &mut self,
+        account_id: AccountId,
+        password: SecretString,
+        proxy: Option<ProxyConfig>,
+        proxy_password: Option<SecretString>,
     ) -> Result<(), TransportCoordinatorError> {
         let account =
             self.core.accounts.get(&account_id).ok_or(CoreError::UnknownAccount(account_id))?;
@@ -1369,6 +1421,8 @@ impl<T: XmppTransport> TransportCoordinator<T> {
             server: account.server.clone(),
             password,
             auto_reconnect: account.auto_reconnect,
+            proxy,
+            proxy_password,
         };
         self.core.set_connection_state(account_id, ConnectionState::Connecting)?;
         if let Err(error) = self.transport.connect(request) {

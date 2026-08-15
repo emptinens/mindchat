@@ -32,9 +32,15 @@ log = { version = "0.4", features = ["max_level_off", "release_max_level_off"] }
 tracing = { version = "0.1", default-features = false, features = ["max_level_off", "release_max_level_off"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RFC 7617 Basic scheme for HTTP CONNECT proxy authentication (ROADMAP 6.3).
+# Cached 0.22.1.
+base64 = "0.22.1"
 futures = { version = "0.3.31", optional = true }
 hickory-resolver = { version = "0.26.1", optional = true }
-tokio = { version = "1.48.0", features = ["net", "rt", "sync", "time"], optional = true }
+# io-util provides AsyncReadExt/AsyncWriteExt/AsyncBufReadExt for the proxy
+# handshakes (read_exact/read_until/write_all) and tokio::io::BufReader for
+# buffering the tunneled stream.
+tokio = { version = "1.48.0", features = ["io-util", "net", "rt", "sync", "time"], optional = true }
 tokio-xmpp = { version = "6.0.0", default-features = false, features = ["direct-tls", "preconnected", "ring", "starttls", "webpki-roots"], optional = true }
 uniffi = { version = "0.32.0", default-features = false, optional = true }
 xmpp-parsers = { version = "0.23.0", optional = true }

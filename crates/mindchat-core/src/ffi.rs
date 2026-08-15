@@ -19,6 +19,10 @@
 //! add_reaction
 //! mark_conversation_read
 //! connect_account
+//! connect_account_with_proxy
+//! set_account_proxies
+//! account_proxies
+//! test_proxy
 //! register_account
 //! disconnect_account
 //! delete_account
@@ -34,10 +38,13 @@
 //!
 //! [`mindchat_binding_version`] is the free binding contract probe. All session
 //! methods take UI-safe values and return typed errors; passwords are accepted
-//! only by [`MindChatCoreHandle::connect_account`] and
-//! [`MindChatCoreHandle::register_account`], never stored or returned.
+//! only by [`MindChatCoreHandle::connect_account`],
+//! [`MindChatCoreHandle::connect_account_with_proxy`], and
+//! [`MindChatCoreHandle::register_account`], never stored or returned. Proxy
+//! credentials follow the same hand-off pattern and are never persisted.
 
 use crate::persistence::{PersistenceError, load_state, save_state};
+use crate::proxy::{ProxyConfig, ProxyKind, ProxyProbe};
 use crate::{
     AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
     DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
@@ -283,6 +290,70 @@ impl From<FfiProtocolCapability> for ProtocolCapability {
             FfiProtocolCapability::SharedPins => Self::SharedPins,
         }
     }
+}
+
+/// How a proxy tunnel is established. The inverse of the domain
+/// [`ConnectStrategy`] proxy variants, exposed without the `Direct` case.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum FfiProxyKind {
+    Socks5,
+    HttpConnect,
+}
+
+impl From<FfiProxyKind> for ProxyKind {
+    fn from(value: FfiProxyKind) -> Self {
+        match value {
+            FfiProxyKind::Socks5 => ProxyKind::Socks5,
+            FfiProxyKind::HttpConnect => ProxyKind::HttpConnect,
+        }
+    }
+}
+
+impl From<ProxyKind> for FfiProxyKind {
+    fn from(value: ProxyKind) -> Self {
+        match value {
+            ProxyKind::Socks5 => Self::Socks5,
+            ProxyKind::HttpConnect => Self::HttpConnect,
+        }
+    }
+}
+
+/// Non-secret proxy configuration safe for display and persistence.
+///
+/// Deliberately has no password field: proxy credentials are runtime-only
+/// and are handed to [`MindChatCoreHandle::test_proxy`] or
+/// [`MindChatCoreHandle::connect_account_with_proxy`] at the call site.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct FfiProxyConfig {
+    pub host: String,
+    pub port: u16,
+    pub kind: FfiProxyKind,
+}
+
+/// Outcome of a proxy probe, safe to show in the UI.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct FfiProxyProbe {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub error: Option<String>,
+}
+
+impl From<ProxyProbe> for FfiProxyProbe {
+    fn from(value: ProxyProbe) -> Self {
+        Self { ok: value.ok, latency_ms: value.latency_ms, error: value.error }
+    }
+}
+
+impl From<ProxyConfig> for FfiProxyConfig {
+    fn from(value: ProxyConfig) -> Self {
+        Self { host: value.host, port: value.port, kind: value.kind.into() }
+    }
+}
+
+/// Validates an FFI proxy configuration into the domain value.
+fn to_proxy_config(config: &FfiProxyConfig) -> Result<ProxyConfig, MindChatBindingError> {
+    ProxyConfig::new(config.host.clone(), config.port, config.kind.into())
+        .map_err(|error| MindChatBindingError::InvalidInput { detail: error.to_string() })
 }
 
 /// An account record safe for display in the Android UI.
@@ -625,6 +696,92 @@ impl MindChatCoreHandle {
             });
         }
         self.lock()?.connect(account_id, SecretString::new(password)).map_err(Into::into)
+    }
+
+    /// Starts a concrete XMPP session for an existing account, optionally
+    /// through a proxy tunnel (ROADMAP 6.3).
+    ///
+    /// With `proxy` set to `None` this behaves exactly like
+    /// [`Self::connect_account`]. With a tunnel, the SOCKS5 or HTTP CONNECT
+    /// handshake runs first and DNS for the XMPP server happens only at the
+    /// proxy (SRV is skipped, preventing DNS leaks). The account password and
+    /// `proxy_password` are handed to the worker and are never stored by the
+    /// core, snapshots, or event stream.
+    pub fn connect_account_with_proxy(
+        &self,
+        account_id: u64,
+        password: String,
+        proxy: Option<FfiProxyConfig>,
+        proxy_password: Option<String>,
+    ) -> Result<(), MindChatBindingError> {
+        if password.is_empty() {
+            return Err(MindChatBindingError::InvalidInput {
+                detail: "a password is required".to_owned(),
+            });
+        }
+        let proxy = proxy.map(|config| to_proxy_config(&config)).transpose()?;
+        self.lock()?
+            .connect_with_proxy(
+                account_id,
+                SecretString::new(password),
+                proxy,
+                proxy_password.map(SecretString::new),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Replaces the proxy library assigned to an account.
+    ///
+    /// The library is non-secret (host/port/kind) and survives a restore;
+    /// proxy passwords are never stored by the core and are supplied per
+    /// connect. `None` clears the library.
+    pub fn set_account_proxies(
+        &self,
+        account_id: u64,
+        proxies: Option<Vec<FfiProxyConfig>>,
+    ) -> Result<(), MindChatBindingError> {
+        let proxies = proxies
+            .unwrap_or_default()
+            .iter()
+            .map(to_proxy_config)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.lock()?.core_mut().set_account_proxies(account_id, proxies).map_err(Into::into)
+    }
+
+    /// Returns the proxy library assigned to an account.
+    ///
+    /// Configs always come back password-free: the core never stores proxy
+    /// credentials, so there is nothing to return.
+    pub fn account_proxies(
+        &self,
+        account_id: u64,
+    ) -> Result<Vec<FfiProxyConfig>, MindChatBindingError> {
+        self.lock()?
+            .core()
+            .account_proxies(account_id)
+            .map(|proxies| proxies.into_iter().map(Into::into).collect())
+            .map_err(Into::into)
+    }
+
+    /// Pings a proxy configuration through a bounded tunnel handshake.
+    ///
+    /// The probe opens the tunnel to the proxy's own address, so it needs no
+    /// external target and resolves no XMPP hostname. `proxy_password` is
+    /// runtime-only. `latency_ms` is the wall-clock time from TCP open through
+    /// handshake completion; the whole probe is capped at 15 seconds, so this
+    /// method must be invoked off the UI thread.
+    pub fn test_proxy(
+        &self,
+        config: FfiProxyConfig,
+        proxy_password: Option<String>,
+    ) -> FfiProxyProbe {
+        let proxy = match to_proxy_config(&config) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                return FfiProxyProbe { ok: false, latency_ms: 0, error: Some(error.to_string()) };
+            }
+        };
+        crate::proxy::proxy_probe(&proxy, proxy_password.as_deref()).into()
     }
 
     /// Registers a new account with XEP-0077 in-band registration and starts
@@ -1355,5 +1512,157 @@ mod tests {
                 detail: "this server does not support in-band registration".to_owned(),
             }
         );
+    }
+
+    fn ffi_proxy(host: &str, port: u16, kind: FfiProxyKind) -> FfiProxyConfig {
+        FfiProxyConfig { host: host.to_owned(), port, kind }
+    }
+
+    #[test]
+    fn bridge_proxy_library_round_trips_without_passwords() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        core.set_account_proxies(
+            account_id,
+            Some(vec![
+                ffi_proxy("proxy.example.org", 1080, FfiProxyKind::Socks5),
+                ffi_proxy("proxy.example.org", 8080, FfiProxyKind::HttpConnect),
+            ]),
+        )
+        .expect("proxy library set");
+
+        let proxies = core.account_proxies(account_id).expect("proxy library read");
+        assert_eq!(proxies.len(), 2);
+        assert_eq!(proxies[0].kind, FfiProxyKind::Socks5);
+        assert_eq!(proxies[0].port, 1080);
+        assert_eq!(proxies[0].host, "proxy.example.org");
+        assert_eq!(proxies[1].kind, FfiProxyKind::HttpConnect);
+        assert_eq!(proxies[1].port, 8080);
+        // The config type has no password field at all, so nothing secret can
+        // cross this boundary.
+        assert_eq!(
+            core.drain_events().expect("events"),
+            vec![FfiCoreEvent::AccountChanged { account_id }]
+        );
+    }
+
+    #[test]
+    fn bridge_proxy_library_clears_and_validates() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        core.set_account_proxies(account_id, None).expect("clearing the library succeeds");
+        assert!(core.account_proxies(account_id).expect("empty library reads").is_empty());
+
+        assert_eq!(
+            core.set_account_proxies(
+                account_id,
+                Some(vec![ffi_proxy("", 1080, FfiProxyKind::Socks5)]),
+            ),
+            Err(MindChatBindingError::InvalidInput {
+                detail: "invalid proxy configuration: a proxy or tunnel host is required"
+                    .to_owned(),
+            })
+        );
+        assert_eq!(
+            core.set_account_proxies(
+                account_id,
+                Some(vec![ffi_proxy("proxy.example.org", 0, FfiProxyKind::Socks5)]),
+            ),
+            Err(MindChatBindingError::InvalidInput {
+                detail: "invalid proxy configuration: a proxy port must not be zero".to_owned(),
+            })
+        );
+        assert_eq!(
+            core.set_account_proxies(999, None),
+            Err(MindChatBindingError::NotFound { detail: "unknown account 999".to_owned() })
+        );
+    }
+
+    #[test]
+    fn bridge_proxy_library_survives_state_restore() {
+        let first = MindChatCoreHandle::new();
+        let account_id = first
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        first
+            .set_account_proxies(
+                account_id,
+                Some(vec![ffi_proxy("proxy.example.org", 1080, FfiProxyKind::Socks5)]),
+            )
+            .expect("proxy library set");
+        let temp = TempState::new("proxy-restore");
+
+        first.save_state(temp.path().to_string_lossy().into_owned()).expect("save succeeds");
+
+        let second = MindChatCoreHandle::new();
+        assert!(
+            second.load_state(temp.path().to_string_lossy().into_owned()).expect("load succeeds")
+        );
+        let restored = second.account_proxies(account_id).expect("restored library reads");
+        assert_eq!(restored, vec![ffi_proxy("proxy.example.org", 1080, FfiProxyKind::Socks5)]);
+    }
+
+    #[test]
+    fn bridge_connect_account_with_proxy_validates_without_network() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        core.drain_events().expect("initial events");
+
+        assert_eq!(
+            core.connect_account_with_proxy(account_id, String::new(), None, None),
+            Err(MindChatBindingError::InvalidInput { detail: "a password is required".to_owned() })
+        );
+        assert_eq!(
+            core.connect_account_with_proxy(
+                account_id,
+                "s3cret".to_owned(),
+                Some(ffi_proxy("", 1080, FfiProxyKind::Socks5)),
+                None,
+            ),
+            Err(MindChatBindingError::InvalidInput {
+                detail: "invalid proxy configuration: a proxy or tunnel host is required"
+                    .to_owned(),
+            })
+        );
+        // Neither validation failure may start a worker.
+        assert_eq!(core.poll_transport_events(0).expect("zero poll"), 0);
+        assert_eq!(
+            core.snapshot().expect("snapshot").accounts[0].connection_state,
+            FfiConnectionState::Offline
+        );
+    }
+
+    #[test]
+    fn bridge_test_proxy_reports_invalid_config_without_network() {
+        let core = MindChatCoreHandle::new();
+        let probe = core.test_proxy(ffi_proxy("", 1080, FfiProxyKind::Socks5), None);
+        assert!(!probe.ok);
+        assert!(probe.error.as_deref().is_some_and(|detail| detail.contains("host is required")));
     }
 }

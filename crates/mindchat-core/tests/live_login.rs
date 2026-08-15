@@ -177,6 +177,8 @@ fn live_login_chain_reaches_sasl_on_jabber_ru() {
             server,
             password: SecretString::new("definitely-wrong-password"),
             auto_reconnect: true,
+            proxy: None,
+            proxy_password: None,
         })
         .expect("worker must start");
 
@@ -228,6 +230,8 @@ fn live_blackhole_connect_terminates_within_30_seconds() {
             server: "10.255.255.1".to_owned(),
             password: SecretString::new("irrelevant"),
             auto_reconnect: true,
+            proxy: None,
+            proxy_password: None,
         })
         .expect("worker must start");
 
@@ -282,6 +286,8 @@ fn live_wrong_password_fails_fast_without_preflight() {
             server,
             password: SecretString::new("definitely-wrong-password"),
             auto_reconnect: true,
+            proxy: None,
+            proxy_password: None,
         })
         .expect("worker must start");
 
@@ -370,6 +376,8 @@ fn live_reconnect_after_tcp_forwarder_drop() {
             server: format!("127.0.0.1:{}", forwarder.port),
             password: SecretString::new(password),
             auto_reconnect: true,
+            proxy: None,
+            proxy_password: None,
         })
         .expect("worker must start");
 

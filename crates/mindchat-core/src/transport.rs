@@ -47,6 +47,12 @@ pub struct ConnectionRequest {
     /// disconnect, exactly like the 0.1.7 behavior; a user-requested
     /// disconnect is immediate either way.
     pub auto_reconnect: bool,
+    /// Proxy tunnel configuration (ROADMAP 6.3). `None` connects directly.
+    /// Non-secret: host/port/kind only, never a password.
+    pub proxy: Option<crate::ProxyConfig>,
+    /// Proxy credentials for the handshake, handed over at connect time like
+    /// the account password and never persisted or rendered.
+    pub proxy_password: Option<SecretString>,
 }
 
 /// Outgoing message data after the domain core has validated it.

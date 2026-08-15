@@ -357,6 +357,46 @@ mod tests {
             loaded.accounts[0].auto_reconnect,
             "pre-0.1.8 snapshots must restore with auto-reconnect enabled"
         );
+        assert!(
+            loaded.accounts[0].proxies.is_empty(),
+            "pre-0.1.8 snapshots have no proxy library and must restore empty"
+        );
+    }
+
+    #[test]
+    fn proxy_library_survives_restore_without_any_secret() {
+        use crate::{ProxyConfig, ProxyKind};
+        let mut core = MindChatCore::default();
+        let account_id = core
+            .add_account(AccountSetup::new("alice@example.org", "example.org", "Alice"))
+            .expect("account");
+        core.set_account_proxies(
+            account_id,
+            vec![
+                ProxyConfig::new("proxy.example.org", 1080, ProxyKind::Socks5).expect("socks5"),
+                ProxyConfig::new("proxy.example.org", 8080, ProxyKind::HttpConnect)
+                    .expect("http connect"),
+            ],
+        )
+        .expect("proxies stored");
+        let temp = TempState::new("proxy-library");
+
+        save_state(&core.snapshot(), temp.path()).expect("save succeeds");
+        let loaded = load_state(temp.path()).expect("load succeeds").expect("file exists");
+
+        assert_eq!(
+            loaded.accounts[0].proxies,
+            vec![
+                ProxyConfig::new("proxy.example.org", 1080, ProxyKind::Socks5).expect("socks5"),
+                ProxyConfig::new("proxy.example.org", 8080, ProxyKind::HttpConnect)
+                    .expect("http connect"),
+            ]
+        );
+        let content = std::fs::read_to_string(temp.path()).expect("read saved file");
+        assert!(
+            !content.contains("password"),
+            "the persisted proxy library must never contain credentials"
+        );
     }
 
     #[test]
@@ -415,6 +455,7 @@ mod tests {
                     capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
                     connection_error: Some("not authorized".to_owned()),
                     auto_reconnect: true,
+                    proxies: Vec::new(),
                 },
                 Account {
                     id: 8,
@@ -425,6 +466,7 @@ mod tests {
                     capabilities: BTreeSet::new(),
                     connection_error: None,
                     auto_reconnect: true,
+                    proxies: Vec::new(),
                 },
             ],
             contacts: vec![Contact {
