@@ -48,6 +48,8 @@ internal fun mapSnapshotToUiState(
     settings: SettingsSnapshot,
     accountSettings: Map<Long, SettingsSnapshot>,
     appearance: AppearanceProfile = AppearanceProfile(),
+    proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
+    proxyAssignments: Map<Long, String> = emptyMap(),
     now: Long,
     timestampFormatter: (Long) -> String,
 ): SnapshotMapping {
@@ -157,6 +159,8 @@ internal fun mapSnapshotToUiState(
             settings = settings,
             accountSettings = accountSettings,
             appearance = appearance,
+            proxyLibrary = proxyLibrary,
+            proxyAssignments = proxyAssignments,
         ),
         connectingSince = tracking,
         activeAccountId = resolvedActiveAccountId,
@@ -205,8 +209,9 @@ internal fun formatTimestamp(epochMs: Long): String {
  *
  * A poll cycle can skip rebuilding the UI state only when every input that
  * feeds the mapping is unchanged: the raw snapshot, the active account, the
- * settings snapshot, the per-account settings, the stored profiles and the
- * global appearance profile. The appearance keys live outside the keyed
+ * settings snapshot, the per-account settings, the stored profiles, the
+ * global appearance profile and the proxy library/assignments (ROADMAP 6.3).
+ * The appearance keys live outside the keyed
  * [SettingsSnapshot] (they are stored directly by [MindChatPreferences]), so
  * the appearance is compared here explicitly: an appearance-only change must
  * rebuild the UI (R7 in ROADMAP §5.1). Snapshots with an account in CONNECTING
@@ -227,6 +232,10 @@ internal fun shouldSkipUiRebuild(
     lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     appearance: AppearanceProfile = AppearanceProfile(),
     lastAppearance: AppearanceProfile = AppearanceProfile(),
+    proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
+    lastProxyLibrary: List<ProxyLibraryEntry> = emptyList(),
+    proxyAssignments: Map<Long, String> = emptyMap(),
+    lastProxyAssignments: Map<Long, String> = emptyMap(),
 ): Boolean {
     if (snapshot !== lastSnapshot) {
         if (lastSnapshot == null || snapshot != lastSnapshot) return false
@@ -236,5 +245,7 @@ internal fun shouldSkipUiRebuild(
     if (profiles != lastProfiles) return false
     if (accountSettings != lastAccountSettings) return false
     if (appearance != lastAppearance) return false
+    if (proxyLibrary != lastProxyLibrary) return false
+    if (proxyAssignments != lastProxyAssignments) return false
     return snapshot.accounts.none { it.connectionState == FfiConnectionState.CONNECTING }
 }

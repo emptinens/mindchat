@@ -170,4 +170,33 @@
     <string name="account_deleted">Аккаунт удалён</string>
     <string name="conversation_deleted">Переписка удалена</string>
     <string name="profile_saved">Профиль сохранён</string>
+    <!-- Прокси / подключение 0.1.8 -->
+    <string name="connection">Подключение</string>
+    <string name="settings_category_connection_summary">Прокси-серверы для ваших аккаунтов</string>
+    <string name="proxy_library">Прокси-серверы</string>
+    <string name="add_proxy">Добавить прокси</string>
+    <string name="edit_proxy">Изменить прокси</string>
+    <string name="delete_proxy">Удалить прокси</string>
+    <string name="delete_proxy_confirm">Удалить %1$s и сохранённый пароль?</string>
+    <string name="ping">Проверить</string>
+    <string name="proxy_pinging">Проверка…</string>
+    <string name="proxy_actions">Действия с прокси</string>
+    <string name="proxy_host">Хост</string>
+    <string name="proxy_port">Порт</string>
+    <string name="proxy_kind">Тип</string>
+    <string name="proxy_kind_socks5">SOCKS5</string>
+    <string name="proxy_kind_http">HTTP CONNECT</string>
+    <string name="proxy_password_optional">Пароль (необязательно)</string>
+    <string name="proxy_invalid_host">Введите хост без пробелов</string>
+    <string name="proxy_invalid_port">Введите порт от 1 до 65535</string>
+    <string name="proxy_latency_fast">Быстро</string>
+    <string name="proxy_latency_medium">Средне</string>
+    <string name="proxy_latency_slow">Медленно</string>
+    <string name="proxy_latency_unknown">Не проверено</string>
+    <string name="proxy_test_failed">Проверка не удалась</string>
+    <string name="proxy_latency_ms">%1$d мс</string>
+    <string name="assign_proxy">Назначить прокси</string>
+    <string name="proxy_assignment_title">Прокси для %1$s</string>
+    <string name="proxy_none">Без прокси</string>
+    <string name="proxy_no_library">Прокси пока нет. Добавьте их в настройках.</string>
 </resources>

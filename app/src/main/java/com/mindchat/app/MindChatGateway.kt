@@ -77,11 +77,23 @@ data class MindChatUiState(
     val settings: SettingsSnapshot = SettingsSnapshot(),
     val accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     val appearance: AppearanceProfile = AppearanceProfile(),
+    val proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
+    val proxyAssignments: Map<Long, String> = emptyMap(),
 ) {
     // Convenience accessors kept for theme code and 0.1.6 contract tests.
     val dynamicColor: Boolean get() = settings.dynamicColor
 
     val appLockEnabled: Boolean get() = settings.appLockEnabled
+
+    /**
+     * The library entry assigned to [accountId], or null when the account
+     * connects directly. Resolves the persisted per-account assignment id
+     * against the live library; a deleted entry resolves to null.
+     */
+    fun assignedProxy(accountId: Long): ProxyLibraryEntry? {
+        val id = proxyAssignments[accountId] ?: return null
+        return proxyLibrary.firstOrNull { it.id == id }
+    }
 }
 
 private data class TransportPollResult(
@@ -161,6 +173,63 @@ interface MindChatGateway {
 
     /** Writes one account-scoped setting; persisted and reflected in state. */
     fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any)
+
+    // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
+
+    /**
+     * Adds a proxy to the device-local library. [password] is optional and is
+     * stored encrypted in the Android Keystore keyed by the new entry id;
+     * `null` means the proxy needs no stored password. Returns false when the
+     * config fails [GatewayInput.validateProxyConfig]; nothing is persisted.
+     */
+    fun addProxy(config: ProxyConfig, password: String? = null): Boolean
+
+    /**
+     * Replaces a library entry's non-secret config. [password] (when non-null)
+     * replaces the stored credential; the previous probe status is cleared
+     * because the old latency no longer describes the new config. Returns
+     * false for an unknown id or an invalid config.
+     */
+    fun updateProxy(proxyId: String, config: ProxyConfig, password: String? = null): Boolean
+
+    /**
+     * Removes a library entry, its stored credential, and any account
+     * assignment pointing at it (assigned accounts fall back to direct
+     * connections in the core).
+     */
+    fun deleteProxy(proxyId: String)
+
+    /**
+     * Probes the library entry (real [com.mindchat.core.FfiProxyProbe], no
+     * fake latency) and persists the measured status for the latency chip.
+     * [password] (when non-null) is stored first, so a first ping can supply
+     * a credential that later pings reuse. Must be called off the UI thread.
+     */
+    fun pingProxy(proxyId: String, password: String? = null): ProxyProbeResult
+
+    /**
+     * Assigns a library proxy to an account (config must match a library
+     * entry) or clears the assignment with `config = null`. The non-secret
+     * config is pushed to the core (`setAccountProxies`) so connections route
+     * through it; [password] (when non-null) is stored encrypted and is never
+     * exposed through the gateway. Returns false for an invalid or unknown
+     * config.
+     */
+    fun setAccountProxy(accountId: Long, config: ProxyConfig?, password: String? = null): Boolean
+
+    /**
+     * The config currently assigned to [accountId], or null for a direct
+     * connection. Read-only; the password is never returned.
+     */
+    fun accountProxy(accountId: Long): ProxyConfig?
+
+    /**
+     * Runs a real probe for an arbitrary config (used by the contract tests
+     * and the ping path). Validation failures return a failed result with a
+     * UI-safe error instead of reaching the core. Must be called off the UI
+     * thread; the probe is capped at 15 seconds.
+     */
+    fun testProxy(config: ProxyConfig, password: String? = null): ProxyProbeResult
 }
 
 /**
@@ -171,13 +240,21 @@ interface MindChatGateway {
 object MindChatGatewayFactory {
     fun create(context: Context): MindChatGateway {
         val preferences = SharedPreferencesMindChatPreferences(context)
+        val proxyLibraryStore = SharedPreferencesProxyLibraryStore(context)
+        val credentialStore = KeystoreProxyCredentialStore(context)
         return try {
             NativeMindChatGateway(
                 stateFile = File(context.filesDir, "mindchat_state.json"),
                 preferences = preferences,
+                proxyLibraryStore = proxyLibraryStore,
+                credentialStore = credentialStore,
             )
         } catch (error: LinkageError) {
-            if (BuildConfig.DEBUG) PreviewMindChatGateway(preferences) else throw error
+            if (BuildConfig.DEBUG) {
+                PreviewMindChatGateway(preferences, proxyLibraryStore, credentialStore)
+            } else {
+                throw error
+            }
         }
     }
 }
@@ -188,6 +265,8 @@ class NativeMindChatGateway(
     private val core: MindChatCoreHandle = MindChatCoreHandle(),
     private val stateFile: File,
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
+    private val proxyLibraryStore: ProxyLibraryStore = InMemoryProxyLibraryStore(),
+    private val credentialStore: ProxyCredentialStore = InMemoryProxyCredentialStore(),
 ) : MindChatGateway {
     private var activeAccountId = 0L
 
@@ -203,6 +282,16 @@ class NativeMindChatGateway(
      * accounts load and [setAccountSetting] updates it.
      */
     private var accountSettingsCache: Map<Long, SettingsSnapshot> = emptyMap()
+
+    /**
+     * The non-secret proxy library backing [MindChatUiState.proxyLibrary] and
+     * the per-account assignment ids backing [MindChatUiState.proxyAssignments]
+     * (ROADMAP 6.3). [setAccountProxy] is the only writer of the assignments;
+     * the connect-time configs are mirrored into the core via
+     * `setAccountProxies` so restored state stays consistent.
+     */
+    private var proxyLibraryCache: List<ProxyLibraryEntry> = proxyLibraryStore.readEntries()
+    private var proxyAssignmentsCache: Map<Long, String> = proxyLibraryStore.readAssignments()
 
     private val pendingOutboxAccounts = mutableSetOf<Long>()
 
@@ -222,6 +311,8 @@ class NativeMindChatGateway(
     private var lastSettings: SettingsSnapshot = settingsCache
     private var lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap()
     private var lastAppearance: AppearanceProfile = appearanceCache
+    private var lastProxyLibrary: List<ProxyLibraryEntry> = proxyLibraryCache
+    private var lastProxyAssignments: Map<Long, String> = proxyAssignmentsCache
 
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
@@ -307,7 +398,20 @@ class NativeMindChatGateway(
     override fun reconnectAccount(accountId: Long, password: String): Boolean {
         if (password.isEmpty()) return false
         return try {
-            core.connectAccount(accountId.toULong(), password)
+            val proxy = assignedProxyEntry(accountId)
+            if (proxy == null) {
+                core.connectAccount(accountId.toULong(), password)
+            } else {
+                // The proxy password comes from the keystore (per proxy id) and
+                // is handed to the worker at the call site; it never crosses
+                // the gateway contract or the UI state.
+                core.connectAccountWithProxy(
+                    accountId.toULong(),
+                    password,
+                    proxy.toConfig().toFfi(),
+                    credentialStore.load(proxy.id),
+                )
+            }
             markDirty()
             refresh()
             true
@@ -352,6 +456,10 @@ class NativeMindChatGateway(
             preferences.removeAccountSettings(accountId)
             profilesCache = preferences.readProfiles()
             accountSettingsCache = accountSettingsCache - accountId
+            // The account's proxy assignment dies with it; the library entry
+            // and its stored password stay (they belong to the proxy).
+            proxyAssignmentsCache = proxyAssignmentsCache - accountId
+            proxyLibraryStore.writeAssignments(proxyAssignmentsCache)
             markDirty()
             refresh()
             activeAccountId = nextActiveAccountId(state.accounts, accountId, activeAccountId)
@@ -582,6 +690,126 @@ class NativeMindChatGateway(
         refresh()
     }
 
+    // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
+
+    override fun addProxy(config: ProxyConfig, password: String?): Boolean {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        val id = nextProxyId(proxyLibraryCache)
+        if (password != null) credentialStore.store(id, password)
+        proxyLibraryCache = proxyLibraryCache +
+            ProxyLibraryEntry(id = id, host = config.host, port = config.port, kind = config.kind)
+        proxyLibraryStore.writeEntries(proxyLibraryCache)
+        refresh()
+        return true
+    }
+
+    override fun updateProxy(proxyId: String, config: ProxyConfig, password: String?): Boolean {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        if (proxyLibraryCache.none { it.id == proxyId }) return false
+        if (password != null) credentialStore.store(proxyId, password)
+        // The config changed, so the previously measured latency is stale.
+        proxyLibraryCache = proxyLibraryCache.map {
+            if (it.id == proxyId) {
+                ProxyLibraryEntry(id = proxyId, host = config.host, port = config.port, kind = config.kind)
+            } else {
+                it
+            }
+        }
+        proxyLibraryStore.writeEntries(proxyLibraryCache)
+        refresh()
+        return true
+    }
+
+    override fun deleteProxy(proxyId: String) {
+        if (proxyLibraryCache.none { it.id == proxyId }) return
+        proxyLibraryCache = proxyLibraryCache.filterNot { it.id == proxyId }
+        proxyLibraryStore.writeEntries(proxyLibraryCache)
+        credentialStore.delete(proxyId)
+        val affectedAccounts = proxyAssignmentsCache.filterValues { it == proxyId }.keys
+        proxyAssignmentsCache = proxyAssignmentsCache - affectedAccounts
+        proxyLibraryStore.writeAssignments(proxyAssignmentsCache)
+        affectedAccounts.forEach { accountId ->
+            // Assigned accounts fall back to direct connections in the core.
+            runCatching { core.setAccountProxies(accountId.toULong(), null) }.onSuccess { markDirty() }
+        }
+        refresh()
+    }
+
+    override fun pingProxy(proxyId: String, password: String?): ProxyProbeResult {
+        val entry = proxyLibraryCache.firstOrNull { it.id == proxyId }
+            ?: return ProxyProbeResult(ok = false, latencyMs = null, error = "unknown proxy")
+        if (password != null) credentialStore.store(proxyId, password)
+        val result = testProxy(entry.toConfig(), credentialStore.load(proxyId))
+        proxyLibraryCache = proxyLibraryCache.map {
+            if (it.id == proxyId) {
+                it.copy(
+                    status = ProxyStatus(
+                        latencyMs = if (result.ok) result.latencyMs else null,
+                        error = result.error,
+                    ),
+                )
+            } else {
+                it
+            }
+        }
+        proxyLibraryStore.writeEntries(proxyLibraryCache)
+        refresh()
+        return result
+    }
+
+    override fun setAccountProxy(accountId: Long, config: ProxyConfig?, password: String?): Boolean {
+        if (config == null) {
+            proxyAssignmentsCache = proxyAssignmentsCache - accountId
+            proxyLibraryStore.writeAssignments(proxyAssignmentsCache)
+            runCatching { core.setAccountProxies(accountId.toULong(), null) }.onSuccess { markDirty() }
+            refresh()
+            return true
+        }
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        val entry = proxyLibraryCache.findByConfig(config) ?: return false
+        if (password != null) credentialStore.store(entry.id, password)
+        val previousAssignments = proxyAssignmentsCache
+        proxyAssignmentsCache = proxyAssignmentsCache + (accountId to entry.id)
+        proxyLibraryStore.writeAssignments(proxyAssignmentsCache)
+        try {
+            core.setAccountProxies(accountId.toULong(), listOf(config.toFfi()))
+            markDirty()
+        } catch (_: MindChatBindingException) {
+            // The core rejected the assignment (unknown account); keep the
+            // local projection honest by rolling the assignment back.
+            proxyAssignmentsCache = previousAssignments
+            proxyLibraryStore.writeAssignments(previousAssignments)
+            refresh()
+            return false
+        }
+        refresh()
+        return true
+    }
+
+    override fun accountProxy(accountId: Long): ProxyConfig? =
+        assignedProxyEntry(accountId)?.toConfig()
+
+    override fun testProxy(config: ProxyConfig, password: String?): ProxyProbeResult {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) {
+            return ProxyProbeResult(ok = false, latencyMs = null, error = "invalid proxy configuration")
+        }
+        return try {
+            val probe = core.testProxy(config.toFfi(), password)
+            ProxyProbeResult(
+                ok = probe.ok,
+                latencyMs = if (probe.ok) probe.latencyMs.toLong() else null,
+                error = probe.error,
+            )
+        } catch (_: MindChatBindingException) {
+            ProxyProbeResult(ok = false, latencyMs = null, error = "proxy probe failed")
+        }
+    }
+
+    private fun assignedProxyEntry(accountId: Long): ProxyLibraryEntry? {
+        val id = proxyAssignmentsCache[accountId] ?: return null
+        return proxyLibraryCache.firstOrNull { it.id == id }
+    }
+
     /** Test and development utility until server-backed contact search lands. */
     fun openLocalConversation(
         accountId: Long,
@@ -630,6 +858,10 @@ class NativeMindChatGateway(
                 lastAccountSettings = lastAccountSettings,
                 appearance = appearanceCache,
                 lastAppearance = lastAppearance,
+                proxyLibrary = proxyLibraryCache,
+                lastProxyLibrary = lastProxyLibrary,
+                proxyAssignments = proxyAssignmentsCache,
+                lastProxyAssignments = lastProxyAssignments,
             )
         ) {
             return
@@ -640,6 +872,8 @@ class NativeMindChatGateway(
         lastSettings = settingsCache
         lastAccountSettings = accountSettingsCache
         lastAppearance = appearanceCache
+        lastProxyLibrary = proxyLibraryCache
+        lastProxyAssignments = proxyAssignmentsCache
     }
 
     private fun markDirty() {
@@ -688,6 +922,8 @@ class NativeMindChatGateway(
             settings = settingsCache,
             accountSettings = accountSettingsCache,
             appearance = appearanceCache,
+            proxyLibrary = proxyLibraryCache,
+            proxyAssignments = proxyAssignmentsCache,
             now = System.currentTimeMillis(),
             timestampFormatter = ::formatTimestamp,
         )
@@ -702,8 +938,16 @@ class NativeMindChatGateway(
 @Stable
 class PreviewMindChatGateway(
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
+    private val proxyLibraryStore: ProxyLibraryStore = InMemoryProxyLibraryStore(),
+    private val credentialStore: ProxyCredentialStore = InMemoryProxyCredentialStore(),
 ) : MindChatGateway {
-    override var state by mutableStateOf(seedPreviewState(preferences))
+    override var state by mutableStateOf(
+        seedPreviewState(
+            preferences,
+            proxyLibraryStore.readEntries(),
+            proxyLibraryStore.readAssignments(),
+        ),
+    )
         private set
 
     override fun selectAccount(accountId: Long) {
@@ -955,14 +1199,112 @@ class PreviewMindChatGateway(
                 (accountId to SettingsSnapshot(preferences.readAccountSettings(accountId))),
         )
     }
+
+    // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
+    // The preview mirrors the native behavior over the same stores without a
+    // core: the library and assignment map are the same device-local state,
+    // and probes honestly fail (there is no tunnel to ping in a JVM preview),
+    // so the preview never fabricates latency.
+
+    override fun addProxy(config: ProxyConfig, password: String?): Boolean {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        val id = nextProxyId(state.proxyLibrary)
+        if (password != null) credentialStore.store(id, password)
+        proxyLibraryStore.writeEntries(
+            state.proxyLibrary + ProxyLibraryEntry(id = id, host = config.host, port = config.port, kind = config.kind),
+        )
+        state = state.copy(proxyLibrary = proxyLibraryStore.readEntries())
+        return true
+    }
+
+    override fun updateProxy(proxyId: String, config: ProxyConfig, password: String?): Boolean {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        if (state.proxyLibrary.none { it.id == proxyId }) return false
+        if (password != null) credentialStore.store(proxyId, password)
+        val updated = state.proxyLibrary.map {
+            if (it.id == proxyId) {
+                ProxyLibraryEntry(id = proxyId, host = config.host, port = config.port, kind = config.kind)
+            } else {
+                it
+            }
+        }
+        proxyLibraryStore.writeEntries(updated)
+        state = state.copy(proxyLibrary = proxyLibraryStore.readEntries())
+        return true
+    }
+
+    override fun deleteProxy(proxyId: String) {
+        if (state.proxyLibrary.none { it.id == proxyId }) return
+        val remaining = state.proxyLibrary.filterNot { it.id == proxyId }
+        proxyLibraryStore.writeEntries(remaining)
+        credentialStore.delete(proxyId)
+        val assignments = state.proxyAssignments.filterValues { it != proxyId }
+        proxyLibraryStore.writeAssignments(assignments)
+        state = state.copy(proxyLibrary = remaining, proxyAssignments = assignments)
+    }
+
+    override fun pingProxy(proxyId: String, password: String?): ProxyProbeResult {
+        val entry = state.proxyLibrary.firstOrNull { it.id == proxyId }
+            ?: return ProxyProbeResult(ok = false, latencyMs = null, error = "unknown proxy")
+        if (password != null) credentialStore.store(proxyId, password)
+        val result = testProxy(entry.toConfig(), credentialStore.load(proxyId))
+        val updated = state.proxyLibrary.map {
+            if (it.id == proxyId) {
+                it.copy(
+                    status = ProxyStatus(
+                        latencyMs = if (result.ok) result.latencyMs else null,
+                        error = result.error,
+                    ),
+                )
+            } else {
+                it
+            }
+        }
+        proxyLibraryStore.writeEntries(updated)
+        state = state.copy(proxyLibrary = updated)
+        return result
+    }
+
+    override fun setAccountProxy(accountId: Long, config: ProxyConfig?, password: String?): Boolean {
+        if (config == null) {
+            val assignments = state.proxyAssignments - accountId
+            proxyLibraryStore.writeAssignments(assignments)
+            state = state.copy(proxyAssignments = assignments)
+            return true
+        }
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
+        val entry = state.proxyLibrary.findByConfig(config) ?: return false
+        if (password != null) credentialStore.store(entry.id, password)
+        val assignments = state.proxyAssignments + (accountId to entry.id)
+        proxyLibraryStore.writeAssignments(assignments)
+        state = state.copy(proxyAssignments = assignments)
+        return true
+    }
+
+    override fun accountProxy(accountId: Long): ProxyConfig? =
+        state.assignedProxy(accountId)?.toConfig()
+
+    override fun testProxy(config: ProxyConfig, password: String?): ProxyProbeResult {
+        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) {
+            return ProxyProbeResult(ok = false, latencyMs = null, error = "invalid proxy configuration")
+        }
+        // No native core in the preview: a probe cannot open a tunnel, and a
+        // fake latency is forbidden, so the honest result is a failure.
+        return ProxyProbeResult(ok = false, latencyMs = null, error = "proxy probes require the native core")
+    }
 }
 
 /**
  * Seeds the preview state: the demo accounts plus any persisted settings,
- * profiles and account settings, so a gateway instance created over the same
- * preferences restores everything the previous instance wrote.
+ * profiles, account settings, proxy library and proxy assignments, so a
+ * gateway instance created over the same stores restores everything the
+ * previous instance wrote.
  */
-private fun seedPreviewState(preferences: MindChatPreferences): MindChatUiState {
+private fun seedPreviewState(
+    preferences: MindChatPreferences,
+    proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
+    proxyAssignments: Map<Long, String> = emptyMap(),
+): MindChatUiState {
     val seed = seedState()
     return seed.copy(
         settings = SettingsSnapshot(preferences.readAll()),
@@ -971,6 +1313,8 @@ private fun seedPreviewState(preferences: MindChatPreferences): MindChatUiState 
         accountSettings = seed.accounts.associate { account ->
             account.id to SettingsSnapshot(preferences.readAccountSettings(account.id))
         },
+        proxyLibrary = proxyLibrary,
+        proxyAssignments = proxyAssignments,
     )
 }
 

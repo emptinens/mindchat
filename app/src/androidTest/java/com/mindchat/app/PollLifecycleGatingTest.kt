@@ -71,6 +71,15 @@ class PollLifecycleGatingTest {
         override fun toggleAppLock() = Unit
         override fun <T> setSetting(key: SettingKey<T>, value: T) = Unit
         override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) = Unit
+        override fun addProxy(config: ProxyConfig, password: String?): Boolean = false
+        override fun updateProxy(proxyId: String, config: ProxyConfig, password: String?): Boolean = false
+        override fun deleteProxy(proxyId: String) = Unit
+        override fun pingProxy(proxyId: String, password: String?): ProxyProbeResult =
+            ProxyProbeResult(ok = false, latencyMs = null, error = "not supported")
+        override fun setAccountProxy(accountId: Long, config: ProxyConfig?, password: String?): Boolean = false
+        override fun accountProxy(accountId: Long): ProxyConfig? = null
+        override fun testProxy(config: ProxyConfig, password: String?): ProxyProbeResult =
+            ProxyProbeResult(ok = false, latencyMs = null, error = "not supported")
     }
 
     @Test

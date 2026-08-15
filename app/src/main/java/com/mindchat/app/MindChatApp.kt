@@ -79,6 +79,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -306,6 +307,7 @@ private fun MindChatShell(
     var deleteAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
     var deleteConversationId by rememberSaveable { mutableStateOf<Long?>(null) }
     var profileAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
+    var assignProxyAccountId by rememberSaveable { mutableStateOf<Long?>(null) }
 
     // Settings sub-navigation (root -> category -> account settings). The
     // stack is saver-backed so rotation restores where the user was.
@@ -456,6 +458,25 @@ private fun MindChatShell(
         }
     }
 
+    assignProxyAccountId?.let { id ->
+        state.accounts.firstOrNull { it.id == id }?.let { account ->
+            ProxyAssignmentDialog(
+                account = account,
+                library = state.proxyLibrary,
+                current = state.assignedProxy(id),
+                onDismiss = { assignProxyAccountId = null },
+                onAssign = { config, password ->
+                    if (gateway.setAccountProxy(account.id, config, password)) {
+                        assignProxyAccountId = null
+                        true
+                    } else {
+                        false
+                    }
+                },
+            )
+        }
+    }
+
     val resolved = resolveAppearance(state.appearance, state.profiles[state.activeAccountId])
     val selectedConversation = state.conversations.firstOrNull { it.id == selectedConversationId }
     if (selectedConversation != null) {
@@ -517,6 +538,7 @@ private fun MindChatShell(
                     onRename = { renameAccountId = it },
                     onDelete = { deleteAccountId = it },
                     onEditProfile = { profileAccountId = it },
+                    onAssignProxy = { assignProxyAccountId = it },
                 )
             }
         },
@@ -1887,6 +1909,107 @@ internal fun ReconnectDialog(
     )
 }
 
+/**
+ * 0.1.8 per-account proxy assignment (ROADMAP 6.3): pick a library proxy
+ * (or none) for [account] and optionally type a masked password. The stored
+ * password is never displayed; an empty field keeps the previously stored
+ * credential. Everything the dialog shows comes from [library]/[current],
+ * which the gateway owns.
+ */
+@Composable
+private fun ProxyAssignmentDialog(
+    account: AccountUi,
+    library: List<ProxyLibraryEntry>,
+    current: ProxyLibraryEntry?,
+    onDismiss: () -> Unit,
+    onAssign: (config: ProxyConfig?, password: String?) -> Boolean,
+) {
+    var selectedId by remember { mutableStateOf(current?.id) }
+    var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
+    val selected = selectedId?.let { id -> library.firstOrNull { it.id == id } }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = MaterialTheme.shapes.extraLarge,
+        title = { Text(stringResource(R.string.proxy_assignment_title, account.displayName)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = account.jid,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (library.isEmpty()) {
+                    Text(
+                        text = stringResource(R.string.proxy_no_library),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                } else {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedId = null },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = selectedId == null, onClick = { selectedId = null })
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.proxy_none))
+                    }
+                    library.forEach { entry ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedId = entry.id },
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = selectedId == entry.id, onClick = { selectedId = entry.id })
+                            Spacer(Modifier.width(8.dp))
+                            Text("${entry.host}:${entry.port} · ${stringResource(proxyKindLabelRes(entry.kind))}")
+                        }
+                    }
+                }
+                if (selected != null) {
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        label = { Text(stringResource(R.string.proxy_password_optional)) },
+                        visualTransformation = if (passwordVisible) {
+                            VisualTransformation.None
+                        } else {
+                            PasswordVisualTransformation()
+                        },
+                        trailingIcon = {
+                            TextButton(onClick = { passwordVisible = !passwordVisible }) {
+                                Text(
+                                    text = stringResource(
+                                        if (passwordVisible) R.string.password_hide else R.string.password_show,
+                                    ),
+                                    style = MaterialTheme.typography.labelLarge,
+                                )
+                            }
+                        },
+                        singleLine = true,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    if (onAssign(selected?.toConfig(), password.ifEmpty { null })) {
+                        onDismiss()
+                    }
+                },
+                enabled = library.isNotEmpty(),
+            ) { Text(stringResource(R.string.save)) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
+        },
+    )
+}
+
 @Composable
 private fun AddContactDialog(
     onDismiss: () -> Unit,
@@ -2016,6 +2139,7 @@ private fun AccountDrawer(
     onRename: (Long) -> Unit,
     onDelete: (Long) -> Unit,
     onEditProfile: (Long) -> Unit,
+    onAssignProxy: (Long) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Text(
@@ -2036,6 +2160,7 @@ private fun AccountDrawer(
                     onRename = { onRename(account.id) },
                     onDelete = { onDelete(account.id) },
                     onEditProfile = { onEditProfile(account.id) },
+                    onAssignProxy = { onAssignProxy(account.id) },
                 )
             }
         }
@@ -2065,6 +2190,7 @@ private fun AccountDrawerRow(
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onEditProfile: () -> Unit,
+    onAssignProxy: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
     val haptics = LocalHapticFeedback.current
@@ -2136,6 +2262,13 @@ private fun AccountDrawerRow(
                     onClick = {
                         menuExpanded = false
                         onReconnect()
+                    },
+                )
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.assign_proxy)) },
+                    onClick = {
+                        menuExpanded = false
+                        onAssignProxy()
                     },
                 )
                 DropdownMenuItem(

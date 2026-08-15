@@ -26,6 +26,7 @@ package com.mindchat.app
 enum class SettingCategory {
     APPEARANCE,
     ACCOUNTS,
+    CONNECTION,
     PRIVACY_SECURITY,
     NOTIFICATIONS,
     STORAGE,

@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.List
@@ -135,6 +136,13 @@ fun SettingsScreen(
             )
 
             SettingCategory.ABOUT -> SettingsAboutScreen(
+                contentPadding = contentPadding,
+                onBack = { navState.back() },
+            )
+
+            SettingCategory.CONNECTION -> SettingsConnectionScreen(
+                gateway = gateway,
+                state = state,
                 contentPadding = contentPadding,
                 onBack = { navState.back() },
             )
@@ -729,6 +737,7 @@ private fun SettingsAccountRow(
 private fun categoryLabelRes(category: SettingCategory): Int = when (category) {
     SettingCategory.APPEARANCE -> R.string.appearance
     SettingCategory.ACCOUNTS -> R.string.manage_accounts
+    SettingCategory.CONNECTION -> R.string.connection
     SettingCategory.PRIVACY_SECURITY -> R.string.privacy
     SettingCategory.NOTIFICATIONS -> R.string.notifications
     SettingCategory.STORAGE -> R.string.storage
@@ -738,6 +747,7 @@ private fun categoryLabelRes(category: SettingCategory): Int = when (category) {
 private fun categorySummaryRes(category: SettingCategory): Int = when (category) {
     SettingCategory.APPEARANCE -> R.string.settings_category_appearance_summary
     SettingCategory.ACCOUNTS -> R.string.manage_accounts_summary
+    SettingCategory.CONNECTION -> R.string.settings_category_connection_summary
     SettingCategory.PRIVACY_SECURITY -> R.string.settings_category_privacy_summary
     SettingCategory.NOTIFICATIONS -> R.string.settings_category_notifications_summary
     SettingCategory.STORAGE -> R.string.settings_category_storage_summary
@@ -747,6 +757,7 @@ private fun categorySummaryRes(category: SettingCategory): Int = when (category)
 private fun categoryIcon(category: SettingCategory): ImageVector = when (category) {
     SettingCategory.APPEARANCE -> Icons.Filled.Star
     SettingCategory.ACCOUNTS -> Icons.Filled.Person
+    SettingCategory.CONNECTION -> Icons.Filled.Build
     SettingCategory.PRIVACY_SECURITY -> Icons.Filled.Lock
     SettingCategory.NOTIFICATIONS -> Icons.Filled.Notifications
     SettingCategory.STORAGE -> Icons.AutoMirrored.Filled.List
@@ -754,7 +765,7 @@ private fun categoryIcon(category: SettingCategory): ImageVector = when (categor
 }
 
 @Composable
-private fun SettingsSubHeader(title: String, onBack: () -> Unit) {
+internal fun SettingsSubHeader(title: String, onBack: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -776,7 +787,7 @@ private fun SettingsSubHeader(title: String, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SettingsSectionTitle(title: String) {
+internal fun SettingsSectionTitle(title: String) {
     Text(
         text = title,
         modifier = Modifier.padding(top = 20.dp, start = 16.dp, bottom = 4.dp),
@@ -823,7 +834,7 @@ private fun SettingsSwitch(
 }
 
 @Composable
-private fun SettingsLinkRow(
+internal fun SettingsLinkRow(
     title: String,
     onClick: () -> Unit,
     supportingText: String? = null,
@@ -846,7 +857,7 @@ private fun SettingsLinkRow(
 }
 
 @Composable
-private fun SettingsStaticRow(
+internal fun SettingsStaticRow(
     title: String,
     supportingText: String? = null,
 ) {

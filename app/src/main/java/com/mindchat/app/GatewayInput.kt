@@ -214,6 +214,61 @@ private fun supportingResFor(key: BooleanKey, appLockAvailable: Boolean): Int? =
     else -> null
 }
 
+// --- Proxy decision logic (ROADMAP 6.3) --------------------------------------
+
+/** UI-safe refusal detail for an invalid proxy configuration. */
+internal enum class ProxyRefusal {
+    EMPTY_HOST,
+    HOST_HAS_WHITESPACE,
+    PORT_OUT_OF_RANGE,
+}
+
+/** Outcome of validating raw proxy fields; shared by both gateway implementations. */
+internal sealed interface ProxyValidation {
+    data object Valid : ProxyValidation
+
+    data class Refused(val reason: ProxyRefusal) : ProxyValidation
+}
+
+/**
+ * Validates raw proxy fields. [host] must be non-empty and free of
+ * whitespace (a hostname never contains spaces); [port] must be in
+ * 1..65535. Both gateway implementations run this before touching the
+ * credential store or the FFI, so the preview cannot drift from the native
+ * behavior.
+ */
+internal fun validateProxyConfig(host: String, port: Int, kind: ProxyKind): ProxyValidation = when {
+    host.isBlank() -> ProxyValidation.Refused(ProxyRefusal.EMPTY_HOST)
+    host.any { it.isWhitespace() } -> ProxyValidation.Refused(ProxyRefusal.HOST_HAS_WHITESPACE)
+    port !in 1..65535 -> ProxyValidation.Refused(ProxyRefusal.PORT_OUT_OF_RANGE)
+    else -> ProxyValidation.Valid
+}
+
+/**
+ * Latency buckets shown on the proxy latency chip, derived purely from a
+ * measured probe result. There is no fake latency anywhere in the system:
+ * a null (never probed or failed) measurement maps to [UNKNOWN].
+ */
+enum class ProxyLatencyBucket {
+    FAST,
+    MEDIUM,
+    SLOW,
+    UNKNOWN,
+}
+
+/**
+ * Pure classifier behind [ProxyLatencyBucket]: fast is under 200 ms, medium
+ * under 800 ms, everything else is slow; `null` (never probed or failed
+ * probe) maps to [ProxyLatencyBucket.UNKNOWN]. The preview and the native
+ * gateway share the exact same thresholds.
+ */
+internal fun proxyLatencyBucket(latencyMs: Long?): ProxyLatencyBucket = when {
+    latencyMs == null || latencyMs < 0 -> ProxyLatencyBucket.UNKNOWN
+    latencyMs < 200 -> ProxyLatencyBucket.FAST
+    latencyMs < 800 -> ProxyLatencyBucket.MEDIUM
+    else -> ProxyLatencyBucket.SLOW
+}
+
 /**
  * Pure settings search (0.1.7 ships the logic; the search UI lands in 0.1.8).
  * Matches the resolved label and keyword resource text, case-insensitively,
