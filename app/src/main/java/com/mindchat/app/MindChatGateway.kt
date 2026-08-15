@@ -9,6 +9,8 @@ import com.mindchat.core.FfiConnectionState
 import com.mindchat.core.FfiContactPresence
 import com.mindchat.core.FfiConversationKind
 import com.mindchat.core.FfiCoreSnapshot
+import com.mindchat.core.FfiDiagnosticsReport
+import com.mindchat.core.FfiDisconnectKind
 import com.mindchat.core.MindChatBindingException
 import com.mindchat.core.MindChatCoreHandle
 import java.io.File
@@ -34,6 +36,13 @@ data class AccountUi(
     val supportsGroupChats: Boolean = false,
     val connectionError: String? = null,
     val connectionStalled: Boolean = false,
+    /**
+     * Typed disconnect classification (ROADMAP 6.5) from the core snapshot,
+     * rendered as the bucket label above [connectionError]. Null while the
+     * account is connected or has not disconnected yet. Prose stays
+     * display-only; [Diagnostics.disconnectBucket] owns the classification.
+     */
+    val disconnectKind: FfiDisconnectKind? = null,
 )
 
 data class ContactUi(
@@ -79,6 +88,15 @@ data class MindChatUiState(
     val appearance: AppearanceProfile = AppearanceProfile(),
     val proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     val proxyAssignments: Map<Long, String> = emptyMap(),
+    /**
+     * Whether the core quarantined the local state file because it could not
+     * be restored (ROADMAP 6.5 internal/persistence bucket). Set from
+     * [MindChatGateway.diagnosticsReport] after the startup restore; drives
+     * the one-time dismissible quarantine notice.
+     */
+    val diagnosticsQuarantined: Boolean = false,
+    /** Whether the user dismissed the quarantine notice on this device. */
+    val diagnosticsNoticeDismissed: Boolean = false,
 ) {
     // Convenience accessors kept for theme code and 0.1.6 contract tests.
     val dynamicColor: Boolean get() = settings.dynamicColor
@@ -230,6 +248,24 @@ interface MindChatGateway {
      * thread; the probe is capped at 15 seconds.
      */
     fun testProxy(config: ProxyConfig, password: String? = null): ProxyProbeResult
+
+    // --- Diagnostics (ROADMAP 6.5) ------------------------------------------
+
+    /**
+     * The opt-in diagnostics report: snapshot record counts plus persistence
+     * metadata. Structurally excludes passwords, message bodies, avatars and
+     * JIDs (redacted on the Rust side; the Kotlin serializer adds nothing).
+     * The user triggers export; nothing here ever leaves the device on its
+     * own.
+     */
+    fun diagnosticsReport(): FfiDiagnosticsReport
+
+    /**
+     * Dismisses the one-time quarantine notice. The dismissal is device-local
+     * and remembered across restarts; the notice reappears only when the core
+     * reports a newly quarantined state and the user has not dismissed it.
+     */
+    fun dismissDiagnosticsNotice()
 }
 
 /**
@@ -293,6 +329,16 @@ class NativeMindChatGateway(
     private var proxyLibraryCache: List<ProxyLibraryEntry> = proxyLibraryStore.readEntries()
     private var proxyAssignmentsCache: Map<Long, String> = proxyLibraryStore.readAssignments()
 
+    /**
+     * Diagnostics state (ROADMAP 6.5). [diagnosticsQuarantined] is set once
+     * after the startup restore from `core.diagnosticsReport()`;
+     * [quarantineNoticeDismissed] is device-local and remembered via
+     * [MindChatPreferences], so the one-time notice stays dismissed across
+     * restarts while a fresh quarantine re-shows it.
+     */
+    private var diagnosticsQuarantined = false
+    private var quarantineNoticeDismissed = preferences.readQuarantineNoticeDismissed()
+
     private val pendingOutboxAccounts = mutableSetOf<Long>()
 
     /** When each account entered CONNECTING (epoch ms), used for stall detection. */
@@ -313,6 +359,8 @@ class NativeMindChatGateway(
     private var lastAppearance: AppearanceProfile = appearanceCache
     private var lastProxyLibrary: List<ProxyLibraryEntry> = proxyLibraryCache
     private var lastProxyAssignments: Map<Long, String> = proxyAssignmentsCache
+    private var lastDiagnosticsQuarantined = diagnosticsQuarantined
+    private var lastDiagnosticsNoticeDismissed = quarantineNoticeDismissed
 
     /** Serializes snapshots written by polling and lifecycle shutdown. */
     private val persistenceMutex = Mutex()
@@ -326,6 +374,11 @@ class NativeMindChatGateway(
         // parsed by the native core before Compose starts rendering. A failure
         // is quarantined so a future successful save can start a clean state.
         restoreState()
+        // Surface the quarantine outcome through the same report the export
+        // path uses; the one-time notice reads this flag from UI state.
+        diagnosticsQuarantined = runCatching { core.diagnosticsReport() }
+            .getOrNull()
+            ?.stateQuarantined == true
         refresh()
     }
 
@@ -805,6 +858,17 @@ class NativeMindChatGateway(
         }
     }
 
+    // --- Diagnostics (ROADMAP 6.5) ------------------------------------------
+
+    override fun diagnosticsReport(): FfiDiagnosticsReport = core.diagnosticsReport()
+
+    override fun dismissDiagnosticsNotice() {
+        if (quarantineNoticeDismissed) return
+        quarantineNoticeDismissed = true
+        preferences.writeQuarantineNoticeDismissed(true)
+        refresh()
+    }
+
     private fun assignedProxyEntry(accountId: Long): ProxyLibraryEntry? {
         val id = proxyAssignmentsCache[accountId] ?: return null
         return proxyLibraryCache.firstOrNull { it.id == id }
@@ -862,6 +926,10 @@ class NativeMindChatGateway(
                 lastProxyLibrary = lastProxyLibrary,
                 proxyAssignments = proxyAssignmentsCache,
                 lastProxyAssignments = lastProxyAssignments,
+                diagnosticsQuarantined = diagnosticsQuarantined,
+                lastDiagnosticsQuarantined = lastDiagnosticsQuarantined,
+                diagnosticsNoticeDismissed = quarantineNoticeDismissed,
+                lastDiagnosticsNoticeDismissed = lastDiagnosticsNoticeDismissed,
             )
         ) {
             return
@@ -874,6 +942,8 @@ class NativeMindChatGateway(
         lastAppearance = appearanceCache
         lastProxyLibrary = proxyLibraryCache
         lastProxyAssignments = proxyAssignmentsCache
+        lastDiagnosticsQuarantined = diagnosticsQuarantined
+        lastDiagnosticsNoticeDismissed = quarantineNoticeDismissed
     }
 
     private fun markDirty() {
@@ -924,6 +994,8 @@ class NativeMindChatGateway(
             appearance = appearanceCache,
             proxyLibrary = proxyLibraryCache,
             proxyAssignments = proxyAssignmentsCache,
+            diagnosticsQuarantined = diagnosticsQuarantined,
+            diagnosticsNoticeDismissed = quarantineNoticeDismissed,
             now = System.currentTimeMillis(),
             timestampFormatter = ::formatTimestamp,
         )
@@ -940,15 +1012,27 @@ class PreviewMindChatGateway(
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
     private val proxyLibraryStore: ProxyLibraryStore = InMemoryProxyLibraryStore(),
     private val credentialStore: ProxyCredentialStore = InMemoryProxyCredentialStore(),
+    /**
+     * Honest diagnostics seed: the preview has no native core, so its report
+     * is an all-default (zero counts, not quarantined) report unless a test or
+     * preview seeds one. Never contains secrets; the contract test uses this
+     * to drive the quarantine notice state.
+     */
+    seedDiagnosticsReport: FfiDiagnosticsReport? = null,
 ) : MindChatGateway {
     override var state by mutableStateOf(
         seedPreviewState(
             preferences,
             proxyLibraryStore.readEntries(),
             proxyLibraryStore.readAssignments(),
+            seedDiagnosticsReport,
         ),
     )
         private set
+
+    /** The report [diagnosticsReport] returns; fixed at construction (no native core to re-read). */
+    private val previewDiagnosticsReport: FfiDiagnosticsReport =
+        seedDiagnosticsReport ?: zeroDiagnosticsReport()
 
     override fun selectAccount(accountId: Long) {
         if (state.accounts.any { it.id == accountId }) {
@@ -1292,7 +1376,37 @@ class PreviewMindChatGateway(
         // fake latency is forbidden, so the honest result is a failure.
         return ProxyProbeResult(ok = false, latencyMs = null, error = "proxy probes require the native core")
     }
+
+    // --- Diagnostics (ROADMAP 6.5) ------------------------------------------
+
+    override fun diagnosticsReport(): FfiDiagnosticsReport = previewDiagnosticsReport
+
+    override fun dismissDiagnosticsNotice() {
+        if (state.diagnosticsNoticeDismissed) return
+        preferences.writeQuarantineNoticeDismissed(true)
+        state = state.copy(diagnosticsNoticeDismissed = true)
+    }
 }
+
+/**
+ * The honest preview report: all counts zero, no persistence metadata, never
+ * quarantined. The preview has no native core and no state file, so any other
+ * value would be fabricated; secrets are structurally impossible (the report
+ * type carries none).
+ */
+private fun zeroDiagnosticsReport(): FfiDiagnosticsReport = FfiDiagnosticsReport(
+    accountCount = 0uL,
+    contactCount = 0uL,
+    conversationCount = 0uL,
+    messageCount = 0uL,
+    reactionCount = 0uL,
+    statePath = null,
+    stateSizeBytes = null,
+    stateSchemaVersion = null,
+    stateQuarantined = false,
+    stateLastSavedAtEpochMs = null,
+    stateLastLoadedAtEpochMs = null,
+)
 
 /**
  * Seeds the preview state: the demo accounts plus any persisted settings,
@@ -1304,6 +1418,7 @@ private fun seedPreviewState(
     preferences: MindChatPreferences,
     proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     proxyAssignments: Map<Long, String> = emptyMap(),
+    seedDiagnosticsReport: FfiDiagnosticsReport? = null,
 ): MindChatUiState {
     val seed = seedState()
     return seed.copy(
@@ -1315,6 +1430,8 @@ private fun seedPreviewState(
         },
         proxyLibrary = proxyLibrary,
         proxyAssignments = proxyAssignments,
+        diagnosticsQuarantined = seedDiagnosticsReport?.stateQuarantined ?: false,
+        diagnosticsNoticeDismissed = preferences.readQuarantineNoticeDismissed(),
     )
 }
 

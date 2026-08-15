@@ -199,4 +199,15 @@
     <string name="proxy_assignment_title">Proxy for %1$s</string>
     <string name="proxy_none">No proxy</string>
     <string name="proxy_no_library">No proxies yet. Add one in Settings.</string>
+    <!-- 0.1.8 diagnostics (ROADMAP 6.5) -->
+    <string name="disconnect_kind_authentication_failed">Authentication failed</string>
+    <string name="disconnect_kind_server_refused">Server refused the connection</string>
+    <string name="disconnect_kind_network_lost">Connection lost</string>
+    <string name="disconnect_kind_unknown">Internal problem</string>
+    <string name="quarantine_notice">Your local data could not be restored and was set aside to protect your account.</string>
+    <string name="quarantine_notice_dismiss">Got it</string>
+    <string name="export_diagnostics">Export diagnostics</string>
+    <string name="export_diagnostics_summary">Save a local report about your accounts and connections</string>
+    <string name="export_diagnostics_failed">Could not export diagnostics</string>
+    <string name="export_diagnostics_saved">Diagnostics exported</string>
 </resources>

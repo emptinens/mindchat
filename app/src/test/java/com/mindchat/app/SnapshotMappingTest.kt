@@ -356,6 +356,7 @@ class SnapshotMappingTest {
         connectionState = state,
         capabilities = capabilities,
         connectionError = error,
+        disconnectKind = null,
     )
 
     private fun contact(

@@ -182,6 +182,7 @@ class SnapshotDiffingTest {
         connectionState = state,
         capabilities = listOf(FfiProtocolCapability.MULTI_USER_CHAT),
         connectionError = null,
+        disconnectKind = null,
     )
 
     private fun contact(id: Long, presence: FfiContactPresence = FfiContactPresence.ONLINE) = FfiContact(

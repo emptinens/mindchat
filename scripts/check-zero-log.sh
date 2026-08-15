@@ -59,10 +59,14 @@ FAILED=0
 # ---------------------------------------------------------------------------
 # Patterns are the emission points the product contract forbids: Rust macros,
 # the log/tracing facade call syntax, Kotlin Log/Timber/System.* emission, and
-# the vestigial diagnostics-zip name (no producer exists; a reintroduction is
-# a regression). Only source extensions are scanned so ROADMAP/CONTRIBUTING
-# prose that quotes these strings stays documentation, not a tripwire.
-PATTERNS='log::|tracing::|println!|eprintln!|dbg!|android\.util\.Log|Timber\.|System\.(out|err)\.|mindchat-diagnostics'
+# the vestigial diagnostics-zip producer (no such producer exists; a
+# reintroduction is a regression). The literal `mindchat-diagnostics.json`
+# suggested name of the ROADMAP 6.5 opt-in SAF export is NOT banned: that
+# export is user-triggered, writes a JSON document the user picks, and never
+# leaves the device on its own. Only source extensions are scanned so
+# ROADMAP/CONTRIBUTING prose that quotes these strings stays documentation,
+# not a tripwire.
+PATTERNS='log::|tracing::|println!|eprintln!|dbg!|android\.util\.Log|Timber\.|System\.(out|err)\.|mindchat-diagnostics-.*\.zip'
 
 check_file() {
     local file="$1"

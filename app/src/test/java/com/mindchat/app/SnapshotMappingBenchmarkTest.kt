@@ -114,6 +114,7 @@ class SnapshotMappingBenchmarkTest {
         connectionState = FfiConnectionState.ONLINE,
         capabilities = listOf(FfiProtocolCapability.MULTI_USER_CHAT),
         connectionError = null,
+        disconnectKind = null,
     )
 
     private fun contact() = FfiContact(

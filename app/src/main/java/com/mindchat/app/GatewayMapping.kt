@@ -50,6 +50,8 @@ internal fun mapSnapshotToUiState(
     appearance: AppearanceProfile = AppearanceProfile(),
     proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     proxyAssignments: Map<Long, String> = emptyMap(),
+    diagnosticsQuarantined: Boolean = false,
+    diagnosticsNoticeDismissed: Boolean = false,
     now: Long,
     timestampFormatter: (Long) -> String,
 ): SnapshotMapping {
@@ -83,6 +85,7 @@ internal fun mapSnapshotToUiState(
             connectionStalled = connectionState == AccountConnectionState.CONNECTING &&
                 connectingStart != null &&
                 now - connectingStart > STALL_THRESHOLD_MS,
+            disconnectKind = account.disconnectKind,
         )
     }
     val resolvedActiveAccountId =
@@ -161,6 +164,8 @@ internal fun mapSnapshotToUiState(
             appearance = appearance,
             proxyLibrary = proxyLibrary,
             proxyAssignments = proxyAssignments,
+            diagnosticsQuarantined = diagnosticsQuarantined,
+            diagnosticsNoticeDismissed = diagnosticsNoticeDismissed,
         ),
         connectingSince = tracking,
         activeAccountId = resolvedActiveAccountId,
@@ -236,6 +241,10 @@ internal fun shouldSkipUiRebuild(
     lastProxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     proxyAssignments: Map<Long, String> = emptyMap(),
     lastProxyAssignments: Map<Long, String> = emptyMap(),
+    diagnosticsQuarantined: Boolean = false,
+    lastDiagnosticsQuarantined: Boolean = false,
+    diagnosticsNoticeDismissed: Boolean = false,
+    lastDiagnosticsNoticeDismissed: Boolean = false,
 ): Boolean {
     if (snapshot !== lastSnapshot) {
         if (lastSnapshot == null || snapshot != lastSnapshot) return false
@@ -247,5 +256,7 @@ internal fun shouldSkipUiRebuild(
     if (appearance != lastAppearance) return false
     if (proxyLibrary != lastProxyLibrary) return false
     if (proxyAssignments != lastProxyAssignments) return false
+    if (diagnosticsQuarantined != lastDiagnosticsQuarantined) return false
+    if (diagnosticsNoticeDismissed != lastDiagnosticsNoticeDismissed) return false
     return snapshot.accounts.none { it.connectionState == FfiConnectionState.CONNECTING }
 }

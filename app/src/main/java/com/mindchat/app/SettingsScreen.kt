@@ -3,6 +3,8 @@ package com.mindchat.app
 import android.content.Intent
 import android.net.Uri
 import android.text.format.Formatter
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -30,6 +32,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -55,6 +58,7 @@ import kotlinx.coroutines.withContext
 
 private const val AVATARS_DIR = "avatars"
 private const val STATE_FILE_NAME = "mindchat_state.json"
+private const val DIAGNOSTICS_EXPORT_FILE_NAME = "mindchat-diagnostics.json"
 private const val REPOSITORY_URL = "https://github.com/emptinens/mindchat"
 
 /**
@@ -96,6 +100,7 @@ fun SettingsScreen(
     state: MindChatUiState,
     navState: SettingsNavState,
     contentPadding: PaddingValues,
+    snackbarHostState: SnackbarHostState,
     onOpenAccountDrawer: () -> Unit,
     onAddAccount: () -> Unit,
     onOpenAppearance: () -> Unit,
@@ -132,6 +137,7 @@ fun SettingsScreen(
                 state = state,
                 gateway = gateway,
                 contentPadding = contentPadding,
+                snackbarHostState = snackbarHostState,
                 onBack = { navState.back() },
             )
 
@@ -512,6 +518,7 @@ private fun SettingsStorageScreen(
     state: MindChatUiState,
     gateway: MindChatGateway,
     contentPadding: PaddingValues,
+    snackbarHostState: SnackbarHostState,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -520,10 +527,40 @@ private fun SettingsStorageScreen(
     var localDataBytes by remember { mutableLongStateOf(-1L) }
     var refreshNonce by remember { mutableIntStateOf(0) }
     var showClearImagesDialog by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
+
+    val exportSavedMessage = stringResource(R.string.export_diagnostics_saved)
+    val exportFailedMessage = stringResource(R.string.export_diagnostics_failed)
 
     LaunchedEffect(refreshNonce) {
         localDataBytes = withContext(Dispatchers.IO) {
             estimateLocalDataBytes(context.filesDir)
+        }
+    }
+
+    // Opt-in, user-triggered export (ROADMAP 6.5): the report is collected
+    // from the gateway, serialized without adding any fields of its own, and
+    // written to the SAF-picked document. Nothing is shared or logged.
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            exporting = true
+            val exported = withContext(Dispatchers.IO) {
+                runCatching {
+                    val report = gateway.diagnosticsReport()
+                    val json = serializeDiagnosticsReport(report)
+                    context.contentResolver.openOutputStream(uri)?.use { output ->
+                        output.write(json.toByteArray(Charsets.UTF_8))
+                        true
+                    } ?: false
+                }.getOrDefault(false)
+            }
+            exporting = false
+            snackbarHostState.showSnackbar(
+                if (exported) exportSavedMessage else exportFailedMessage,
+            )
         }
     }
 
@@ -595,6 +632,14 @@ private fun SettingsStorageScreen(
                 title = stringResource(R.string.clear_profile_images),
                 supportingText = stringResource(R.string.clear_profile_images_summary),
                 onClick = { showClearImagesDialog = true },
+            )
+        }
+        item {
+            SettingsLinkRow(
+                title = stringResource(R.string.export_diagnostics),
+                supportingText = stringResource(R.string.export_diagnostics_summary),
+                enabled = !exporting,
+                onClick = { exportLauncher.launch(DIAGNOSTICS_EXPORT_FILE_NAME) },
             )
         }
     }

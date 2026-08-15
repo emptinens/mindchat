@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
@@ -124,6 +125,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -131,6 +133,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
+import com.mindchat.core.FfiDisconnectKind
 import com.mindchat.app.theme.ACCENT_DEFAULT_KEY
 import com.mindchat.app.theme.AccentOptions
 import com.mindchat.app.theme.EmphasizedDecelerate
@@ -598,10 +601,21 @@ private fun MindChatShell(
                 }
             },
         ) { padding ->
-            // T6: destination switches crossfade (fade+slide when the system
-            // permits excessive motion; fade-only under reduce-motion).
-            AnimatedContent(
-                targetState = destination,
+            Column(Modifier.fillMaxSize()) {
+                // ROADMAP 6.5: one-time dismissible notice for a quarantined
+                // local state; visibility is derived from gateway state.
+                QuarantineNotice(
+                    visible = shouldShowQuarantineNotice(
+                        state.diagnosticsQuarantined,
+                        state.diagnosticsNoticeDismissed,
+                    ),
+                    onDismiss = gateway::dismissDiagnosticsNotice,
+                )
+                // T6: destination switches crossfade (fade+slide when the system
+                // permits excessive motion; fade-only under reduce-motion).
+                AnimatedContent(
+                    modifier = Modifier.weight(1f),
+                    targetState = destination,
                 transitionSpec = {
                     if (motion.excessiveMotionAllowed) {
                         fadeIn(motion.tween(220)) +
@@ -648,6 +662,7 @@ private fun MindChatShell(
                             state = state,
                             navState = settingsNavState,
                             contentPadding = padding,
+                            snackbarHostState = snackbarHostState,
                             onOpenAccountDrawer = {
                                 scope.launch { drawerState.open() }
                             },
@@ -665,6 +680,7 @@ private fun MindChatShell(
                 }
             }
         }
+    }
     }
 }
 
@@ -746,6 +762,17 @@ private fun MindChatTopBar(
                             strokeWidth = 2.dp,
                         )
                     }
+                }
+                if (active != null &&
+                    (active.connectionState == AccountConnectionState.FAILED || active.connectionError != null)
+                ) {
+                    // ROADMAP 6.5: the typed bucket label renders above the
+                    // detail prose; the prose itself stays display-only.
+                    DisconnectKindLabel(
+                        kind = active.disconnectKind,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.error,
+                    )
                 }
                 active?.connectionError?.let { detail ->
                     Text(
@@ -1852,6 +1879,13 @@ internal fun ReconnectDialog(
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // ROADMAP 6.5: the typed bucket label renders above the
+                // reconnect error prose; the prose stays display-only.
+                DisconnectKindLabel(
+                    kind = account.disconnectKind,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
                 OutlinedTextField(
                     value = password,
                     onValueChange = {
@@ -2233,11 +2267,29 @@ private fun AccountDrawerRow(
             )
         },
         supportingContent = {
-            Text(
-                text = "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}",
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Column {
+                Text(
+                    text = "${account.jid} · ${stringResource(accountConnectionLabel(account.connectionState))}",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                // ROADMAP 6.5: bucket label above the detail prose in the
+                // drawer rows too; the prose stays display-only.
+                DisconnectKindLabel(
+                    kind = account.disconnectKind,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                account.connectionError?.let { detail ->
+                    Text(
+                        text = detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
         },
         trailingContent = {
             IconButton(onClick = { menuExpanded = true }) {
@@ -2424,6 +2476,70 @@ internal fun ConnectionStatusIndicator(
                 .clip(CircleShape)
                 .background(animatedDotColor(connectionDotColor(state), "connectionStatusDot")),
         )
+    }
+}
+
+/**
+ * ROADMAP 6.5 kind-aware label: renders the distinct bucket label for a typed
+ * disconnect reason above the detail prose, or nothing for a neutral kind
+ * (user-initiated disconnect) or when no classification exists.
+ */
+@Composable
+internal fun DisconnectKindLabel(
+    kind: FfiDisconnectKind?,
+    style: TextStyle,
+    color: Color,
+    modifier: Modifier = Modifier,
+) {
+    val labelRes = kind?.let { disconnectLabelRes(it) } ?: return
+    Text(
+        text = stringResource(labelRes),
+        style = style,
+        color = color,
+        modifier = modifier,
+    )
+}
+
+/**
+ * ROADMAP 6.5 one-time quarantine notice. Shown as an ordinary dismissible
+ * notice (never a crash) when the core could not restore the local state and
+ * quarantined it; visibility comes from gateway state via
+ * [shouldShowQuarantineNotice], and dismissal is remembered by the gateway.
+ */
+@Composable
+private fun QuarantineNotice(
+    visible: Boolean,
+    onDismiss: () -> Unit,
+) {
+    if (!visible) return
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        ),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, top = 8.dp, end = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Info,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(12.dp))
+            Text(
+                text = stringResource(R.string.quarantine_notice),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.quarantine_notice_dismiss))
+            }
+        }
     }
 }
 

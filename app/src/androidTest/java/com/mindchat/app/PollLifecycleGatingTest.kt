@@ -80,6 +80,21 @@ class PollLifecycleGatingTest {
         override fun accountProxy(accountId: Long): ProxyConfig? = null
         override fun testProxy(config: ProxyConfig, password: String?): ProxyProbeResult =
             ProxyProbeResult(ok = false, latencyMs = null, error = "not supported")
+        override fun diagnosticsReport(): com.mindchat.core.FfiDiagnosticsReport =
+            com.mindchat.core.FfiDiagnosticsReport(
+                accountCount = 0uL,
+                contactCount = 0uL,
+                conversationCount = 0uL,
+                messageCount = 0uL,
+                reactionCount = 0uL,
+                statePath = null,
+                stateSizeBytes = null,
+                stateSchemaVersion = null,
+                stateQuarantined = false,
+                stateLastSavedAtEpochMs = null,
+                stateLastLoadedAtEpochMs = null,
+            )
+        override fun dismissDiagnosticsNotice() = Unit
     }
 
     @Test

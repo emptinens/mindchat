@@ -70,6 +70,15 @@ interface MindChatPreferences {
     /** Removes every per-account setting for [accountId]; a no-op when none. */
     fun removeAccountSettings(accountId: Long)
 
+    /**
+     * Whether the user dismissed the one-time diagnostics quarantine notice
+     * (ROADMAP 6.5). Device-local, non-secret; remembered across restarts.
+     */
+    fun readQuarantineNoticeDismissed(): Boolean
+
+    /** Remembers that the user dismissed the quarantine notice. */
+    fun writeQuarantineNoticeDismissed(dismissed: Boolean)
+
     /** Schema version written to disk for future migrations (starts at 1). */
     fun settingsSchemaVersion(): Int
 
@@ -242,6 +251,13 @@ class SharedPreferencesMindChatPreferences(context: Context) : MindChatPreferenc
         }
     }
 
+    override fun readQuarantineNoticeDismissed(): Boolean =
+        preferences.getBoolean(KEY_QUARANTINE_NOTICE_DISMISSED, false)
+
+    override fun writeQuarantineNoticeDismissed(dismissed: Boolean) {
+        preferences.edit { putBoolean(KEY_QUARANTINE_NOTICE_DISMISSED, dismissed) }
+    }
+
     override fun settingsSchemaVersion(): Int =
         preferences.getInt(MindChatPreferences.KEY_SCHEMA_VERSION, 1)
 
@@ -328,6 +344,7 @@ class SharedPreferencesMindChatPreferences(context: Context) : MindChatPreferenc
         const val PREFERENCES_FILE = "mindchat_customization"
         const val KEY_PROFILE_ACCOUNT_IDS = "profile_account_ids"
         const val KEY_ACCOUNT_SETTINGS_ACCOUNT_IDS = "account_settings_account_ids"
+        const val KEY_QUARANTINE_NOTICE_DISMISSED = "quarantine_notice_dismissed"
         const val KEY_AVATAR = "avatar"
         const val KEY_STATUS = "status"
         const val KEY_ACCENT = "accent"
@@ -353,6 +370,7 @@ class InMemoryMindChatPreferences(
     private val global: MutableMap<SettingKey<*>, Any> = mutableMapOf()
     private val perAccount: MutableMap<Long, MutableMap<SettingKey<*>, Any>> = mutableMapOf()
     private val appearanceStore: MutableMap<String, String> = mutableMapOf()
+    private var quarantineNoticeDismissed = false
 
     init {
         appearanceStore.putAll(rawAppearanceKeys)
@@ -423,6 +441,12 @@ class InMemoryMindChatPreferences(
 
     override fun removeAccountSettings(accountId: Long) {
         perAccount.remove(accountId)
+    }
+
+    override fun readQuarantineNoticeDismissed(): Boolean = quarantineNoticeDismissed
+
+    override fun writeQuarantineNoticeDismissed(dismissed: Boolean) {
+        quarantineNoticeDismissed = dismissed
     }
 
     override fun settingsSchemaVersion(): Int = MindChatPreferences.SCHEMA_VERSION

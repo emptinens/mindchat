@@ -44,6 +44,7 @@ class PollSnapshotCountTest {
                 connectionState = FfiConnectionState.ONLINE,
                 capabilities = listOf(FfiProtocolCapability.MULTI_USER_CHAT),
                 connectionError = null,
+                disconnectKind = null,
             ),
         ),
         contacts = listOf(
