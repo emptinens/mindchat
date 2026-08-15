@@ -221,6 +221,71 @@ contract and are enforced by tests where possible:
 - Build outputs, generated bindings, APKs, `local.properties`, keystores,
   logs, and IDE state stay untracked (see `.gitignore`).
 
+## Release build (0.1.8+, ROADMAP 6.4)
+
+The release variant runs R8 (full mode) with resource shrinking and emits
+per-ABI APKs plus a universal one. `ndk.abiFilters` restricts every variant
+to `arm64-v8a`, `armeabi-v7a`, `x86_64`, which drops JNA's legacy mips/x86
+libraries from the APK. Keep rules live in `app/proguard-rules.pro` and pin
+only the reflection-driven surfaces (the generated `com.mindchat.core.`
+bindings and the JNA runtime); there are no blanket androidx keeps and no
+`-dontwarn` rules.
+
+Build locally (debug-signed when no keystore is configured, R8 still runs):
+
+```sh
+./gradlew :app:testReleaseUnitTest :app:lintVitalRelease :app:assembleRelease
+```
+
+### Signing
+
+Release signing is secret-driven and v2-only (`enableV1Signing = false`).
+Values come from `MINDSIGN_STORE_FILE`, `MINDSIGN_STORE_PASSWORD`,
+`MINDSIGN_KEY_ALIAS`, `MINDSIGN_KEY_PASSWORD` in the environment (CI
+secrets) or from the same keys in `~/.gradle/gradle.properties`. When any
+value is missing the release buildType falls back to the debug certificate,
+so local builds stay unblocked; CI release builds fail fast instead (see
+below). The keystore itself is never committed and never echoed; CI can
+provision it from an optional `MINDSIGN_KEYSTORE_BASE64` secret into
+`$MINDSIGN_STORE_FILE`.
+
+### Verification
+
+```sh
+bash scripts/verify-release.sh          # local: .so gates SKIPPED without an NDK
+bash scripts/verify-release.sh --strict # CI-style: missing inputs fail
+```
+
+Checks (ROADMAP 6.4 hard gates): universal ≤ 33MB, arm64-v8a ≤ 16.5MB,
+x86_64 ≤ 16.5MB, armeabi-v7a ≤ 13.5MB; `apksigner verify` with v2 verified
+on every APK; keep-rule audit (`mapping.txt`/`seeds.txt`/`usage.txt` exist,
+`Structure`/`FieldOrder`/`RustBuffer` present in the dex via `dexdump`);
+exported-symbol count after `llvm-strip --strip-all` (`readelf --dyn-syms`
+on the staged `libmindchat_core.so`, `ffi_mindchat_core_*` +
+`uniffi_mindchat_core_*` must survive); writes `sha256sums.txt` next to the
+APKs.
+
+### Local limitations
+
+`scripts/build-rust-android.sh` strips only the staged jniLibs copy
+(`target/` stays unstripped for bindgen); it needs the NDK's `llvm-strip`.
+A host without an NDK skips native assembly, so the local release APK has no
+`.so` and the `.so`/symbol gates report `SKIPPED` — CI is the authoritative
+native build. Everything else (R8, keep rules, resource shrinking, sizes,
+signature, dex audit) is exercised locally for real.
+
+### CI
+
+`verify.yml` runs the debug and release Gradle paths plus
+`verify-release.sh --strict` on every PR. `release.yml`
+(`workflow_dispatch` or `v*` tag push) provisions the toolchain, REQUIRES
+the `MINDSIGN_*` secrets (fails with a clear message otherwise), assembles
+and verifies all splits, uploads per-ABI + universal APKs and
+`sha256sums.txt` as artifacts (attached to the GitHub Release on tag
+pushes), and runs an x86_64 emulator smoke job: boot, install, launch
+`MainActivity`, assert the process is alive and focused with an empty
+system crash buffer.
+
 ## Releases
 
 Releases are tagged `v<version>` after the Android version bump
@@ -228,8 +293,5 @@ Releases are tagged `v<version>` after the Android version bump
 verification run, and a `CHANGELOG.md` entry recording the release (with the
 artifact hash in the release report / GitHub release description). Release
 notes are assembled from `CHANGELOG.md`; keep its Unreleased section current
-as features land.
-Local hosts without an NDK produce an APK with the previously built native
-library; the CI-native assembly is the authoritative artifact. The release
-process will be formalized in scripts and a CI release job at 0.2.0 (see
-`ROADMAP.md`).
+as features land. The tag push drives `release.yml`; do not attach artifacts
+manually.

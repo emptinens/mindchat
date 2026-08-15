@@ -28,3 +28,35 @@ cargo ndk \
     --target x86_64 \
     --output-dir "$OUT_DIR" \
     build --release --package mindchat-core --features uniffi
+
+# Strip ONLY the staged jniLibs copy (ROADMAP 6.4). target/ artifacts stay
+# unstripped: bindgen still reads exported symbols from the host dylib, and
+# touching the cross artifacts would invalidate incremental rebuilds.
+# `--strip-all` keeps the dynamic symbol table (.dynsym) by definition, so
+# the exported ffi_mindchat_core_* / uniffi_mindchat_core_* names survive;
+# scripts/verify-release.sh re-checks the count with readelf.
+LLVM_STRIP=""
+if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+    for candidate in "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-strip; do
+        if [ -x "$candidate" ]; then
+            LLVM_STRIP="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -n "$LLVM_STRIP" ]; then
+    STRIPPED=0
+    for so in "$OUT_DIR"/*/libmindchat_core.so; do
+        if [ -f "$so" ]; then
+            "$LLVM_STRIP" --strip-all "$so"
+            STRIPPED=$((STRIPPED + 1))
+        fi
+    done
+    echo "build-rust-android.sh: stripped $STRIPPED staged jniLibs with $LLVM_STRIP"
+else
+    # NDK ships llvm-strip, so this only fires on a broken toolchain setup.
+    # Keep going (the .so is still usable, just bigger); CI always strips and
+    # verify-release.sh enforces the exported-symbol count there.
+    echo "build-rust-android.sh: llvm-strip not found under \$ANDROID_NDK_HOME/toolchains/llvm/prebuilt; staged jniLibs left unstripped (CI strips and verifies)" >&2
+fi

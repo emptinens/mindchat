@@ -1,0 +1,172 @@
+name: Release
+
+# Builds, signs, verifies and publishes the 0.1.8+ release artifacts
+# (ROADMAP 6.4): per-ABI APKs + universal, sha256sums.txt, and an x86_64
+# emulator smoke run of the release APK.
+#
+# Triggered manually (workflow_dispatch) or on any v* tag push. The build
+# REQUIRES the MINDSIGN_* secrets (release signing is v2-only); without
+# them the job fails with a clear message instead of silently producing a
+# debug-signed release. The keystore itself is provisioned from the
+# optional MINDSIGN_KEYSTORE_BASE64 secret, or is expected to already sit
+# at $MINDSIGN_STORE_FILE on the runner; it is never committed or echoed.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - run: yes | sdkmanager --licenses >/dev/null
+      - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
+      - run: cargo install cargo-ndk --version 4.1.2 --locked && cargo install uniffi --version 0.32.0 --features cli --locked
+      - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh scripts/verify-release.sh
+
+      - name: Require release signing secrets
+        env:
+          MINDSIGN_STORE_FILE: ${{ secrets.MINDSIGN_STORE_FILE }}
+          MINDSIGN_STORE_PASSWORD: ${{ secrets.MINDSIGN_STORE_PASSWORD }}
+          MINDSIGN_KEY_ALIAS: ${{ secrets.MINDSIGN_KEY_ALIAS }}
+          MINDSIGN_KEY_PASSWORD: ${{ secrets.MINDSIGN_KEY_PASSWORD }}
+        run: |
+          set -eu
+          for v in MINDSIGN_STORE_FILE MINDSIGN_STORE_PASSWORD MINDSIGN_KEY_ALIAS MINDSIGN_KEY_PASSWORD; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::release.yml: $v is not set. Configure the MINDSIGN_* secrets (and optionally MINDSIGN_KEYSTORE_BASE64) before releasing."
+              exit 1
+            fi
+          done
+
+      - name: Provision keystore from MINDSIGN_KEYSTORE_BASE64 (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.MINDSIGN_KEYSTORE_BASE64 }}
+          STORE_FILE: ${{ secrets.MINDSIGN_STORE_FILE }}
+        run: |
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${STORE_FILE:-}" ]; then
+            mkdir -p "$(dirname "$STORE_FILE")"
+            echo "$KEYSTORE_B64" | base64 -d > "$STORE_FILE"
+            chmod 600 "$STORE_FILE"
+          else
+            echo "MINDSIGN_KEYSTORE_BASE64 not set; expecting the keystore to already exist at \$MINDSIGN_STORE_FILE on the runner"
+          fi
+
+      - name: Assemble release (R8, all ABI splits, signing)
+        env:
+          MINDSIGN_STORE_FILE: ${{ secrets.MINDSIGN_STORE_FILE }}
+          MINDSIGN_STORE_PASSWORD: ${{ secrets.MINDSIGN_STORE_PASSWORD }}
+          MINDSIGN_KEY_ALIAS: ${{ secrets.MINDSIGN_KEY_ALIAS }}
+          MINDSIGN_KEY_PASSWORD: ${{ secrets.MINDSIGN_KEY_PASSWORD }}
+        run: ./gradlew :app:testReleaseUnitTest :app:lintVitalRelease :app:assembleRelease --no-daemon --max-workers=2
+
+      - name: Verify release artifacts
+        run: bash scripts/verify-release.sh --strict
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-apks
+          path: |
+            app/build/outputs/apk/release/*.apk
+            app/build/outputs/apk/release/sha256sums.txt
+          if-no-files-found: error
+
+      - name: Attach APKs to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          TAG="${GITHUB_REF#refs/tags/}"
+          cd app/build/outputs/apk/release
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" ./*.apk sha256sums.txt --title "$TAG"
+          else
+            gh release upload "$TAG" ./*.apk sha256sums.txt --clobber
+          fi
+
+  smoke:
+    # Boot the release x86_64 APK on an emulator: process alive, MainActivity
+    # resumed, and the system crash buffer empty (ROADMAP 6.4). System-level
+    # only, no instrumentation.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: android-actions/setup-android@v3
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-apks
+          path: apks
+      - run: yes | sdkmanager --licenses >/dev/null
+      - run: sdkmanager "platforms;android-36" "emulator" "system-images;android-36;google_apis;x86_64"
+      - run: echo no | avdmanager create avd -n smoke -k "system-images;android-36;google_apis;x86_64" --device "pixel_2" --force
+
+      - name: Boot emulator and wait for sys.boot_completed
+        run: |
+          set -euo pipefail
+          nohup "$ANDROID_HOME/emulator/emulator" -avd smoke -no-window -no-audio \
+            -no-boot-anim -gpu swiftshader_indirect -no-snapshot -no-metrics \
+            >/tmp/emulator.log 2>&1 &
+          adb wait-for-device
+          i=0
+          while [ "$i" -lt 300 ]; do
+            boot=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)
+            if [ "$boot" = "1" ]; then
+              echo "emulator booted after ~$((i * 2))s"
+              exit 0
+            fi
+            sleep 2
+            i=$((i + 1))
+          done
+          echo "::error::emulator did not boot within 600s" >&2
+          tail -50 /tmp/emulator.log >&2 || true
+          exit 1
+
+      - name: Install and launch MainActivity
+        run: |
+          set -euo pipefail
+          adb install -r apks/app-x86_64-release.apk
+          adb shell am start -W -n com.mindchat.app/.MainActivity
+
+      - name: Smoke assertions (process alive, activity resumed, crash buffer empty)
+        run: |
+          set -euo pipefail
+          sleep 15
+          pid=$(adb shell pidof com.mindchat.app | tr -d '\r' || true)
+          if [ -z "$pid" ]; then
+            echo "::error::app process not alive after launch" >&2
+            exit 1
+          fi
+          focus=$(adb shell dumpsys window 2>/dev/null | grep mCurrentFocus | tr -d '\r' || true)
+          resumed=$(adb shell dumpsys activity activities 2>/dev/null | grep mResumedActivity | tr -d '\r' || true)
+          echo "current focus: $focus"
+          echo "resumed: $resumed"
+          case "$focus$resumed" in
+            *com.mindchat.app/.MainActivity*) ;;
+            *)
+              echo "::error::MainActivity is neither focused nor resumed" >&2
+              exit 1
+              ;;
+          esac
+          crash=$(adb logcat -b crash -d 2>/dev/null || true)
+          if [ -n "$crash" ]; then
+            echo "::error::crash buffer is not empty:" >&2
+            echo "$crash" >&2
+            exit 1
+          fi
+          echo "smoke: PASS"

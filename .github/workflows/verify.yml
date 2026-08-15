@@ -38,8 +38,14 @@ jobs:
       - run: yes | sdkmanager --licenses >/dev/null
       - run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865"
       - run: cargo install cargo-ndk --version 4.1.2 --locked && cargo install uniffi --version 0.32.0 --features cli --locked
-      - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh
-      - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug --no-daemon --max-workers=2
+      - run: chmod +x gradlew scripts/build-rust-android.sh scripts/generate-uniffi-kotlin.sh scripts/verify-release.sh
+      # Debug path (unit tests, lint, androidTest compile) plus the release
+      # path (R8 minify on, lintVital, release unit tests) in one pass. The
+      # keep rules in app/proguard-rules.pro are exercised for real here.
+      - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:compileDebugAndroidTestKotlin :app:assembleDebug :app:testReleaseUnitTest :app:lintVitalRelease :app:assembleRelease --no-daemon --max-workers=2
+      # Hard release gates (ROADMAP 6.4): APK size budgets, v2 signature,
+      # keep-rule audit, exported-symbol count after llvm-strip, hashes.
+      - run: bash scripts/verify-release.sh --strict
       # Ship the freshly built native libraries to the zero-log job, which
       # runs `strings` over them. The authoritative .so is built here (the
       # host has the NDK; local hosts without one skip native assembly).

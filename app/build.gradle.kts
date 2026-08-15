@@ -4,8 +4,31 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+import java.io.File
+import java.util.Properties
+
 val nativeJniLibsDir = layout.buildDirectory.dir("generated/jniLibs")
 val uniffiKotlinDir = layout.buildDirectory.dir("generated/source/uniffi/main/kotlin")
+
+// Release signing (ROADMAP 6.4): secret-driven only. Values come from the
+// MINDSIGN_* environment (CI secrets) or the same keys in
+// ~/.gradle/gradle.properties (maintainer machines). The keystore itself is
+// never committed and never echoed by Gradle/CI. When no signing key is
+// configured the release buildType falls back to the debug certificate,
+// exactly like today, so local `assembleRelease` runs stay unblocked on
+// hosts without a keystore.
+val mindSign: Map<String, String?> = run {
+    val props = Properties()
+    val propsFile = File(System.getProperty("user.home"), ".gradle/gradle.properties")
+    if (propsFile.isFile) propsFile.inputStream().use { props.load(it) }
+    listOf(
+        "MINDSIGN_STORE_FILE",
+        "MINDSIGN_STORE_PASSWORD",
+        "MINDSIGN_KEY_ALIAS",
+        "MINDSIGN_KEY_PASSWORD",
+    ).associateWith { name -> System.getenv(name) ?: props.getProperty(name) }
+}
+val releaseSigningConfigured = mindSign.values.all { !it.isNullOrBlank() }
 
 val buildRustAndroid by tasks.registering(Exec::class) {
     group = "build"
@@ -78,15 +101,57 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+
+        // Only the ABIs MindChat ships (ROADMAP 6.4). JNA's AAR carries
+        // legacy mips/x86 jniLibs; filtering them here keeps them out of
+        // every variant (debug included), not just the release APK.
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(mindSign["MINDSIGN_STORE_FILE"]!!)
+                storePassword = mindSign["MINDSIGN_STORE_PASSWORD"]
+                keyAlias = mindSign["MINDSIGN_KEY_ALIAS"]
+                keyPassword = mindSign["MINDSIGN_KEY_PASSWORD"]
+                // v2-only signing (ROADMAP 6.4): apksigner emits no v1 JAR
+                // signature. minSdk 26 never needs v1 and the smaller
+                // signature surface is easier to audit.
+                enableV1Signing = false
+                enableV2Signing = true
+            }
+        }
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 with resource shrinking (ROADMAP 6.4); full mode is
+            // enabled in gradle.properties. Debug stays minify-off.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            // MINDSIGN_* absent: fall back to the debug certificate (ROADMAP
+            // 6.4 "debug-cert signing continues"), so local release assembly
+            // stays verifiable and unblocked. CI requires the release key.
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
+        }
+    }
+
+    // Per-ABI APKs plus a universal one (ROADMAP 6.4). The universal APK is
+    // the single artifact for distribution; per-ABI APKs feed the size
+    // budget gates and the emulator smoke job in CI.
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true
         }
     }
 
