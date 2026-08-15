@@ -84,6 +84,28 @@ pub enum ConnectionState {
     Failed,
 }
 
+/// Typed reason an account left the connected state (ROADMAP 6.5).
+///
+/// This is the single control-flow classification of a disconnect. Prose
+/// details (for example the transport's `detail` string) stay display-only
+/// and are never parsed for decisions; every path that ends a session maps a
+/// typed failure through `xmpp::classify_disconnect` or sets the kind
+/// explicitly (user disconnect, watchdog, timeouts).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DisconnectKind {
+    /// The server rejected the credentials (SASL failure).
+    AuthenticationFailed,
+    /// The server refused the stream or session (for example a stream error).
+    ServerRefused,
+    /// The link was lost: timeout, EOF, suspended stream, or reconnect budget
+    /// exhausted.
+    NetworkLost,
+    /// The user explicitly disconnected the account.
+    Cancelled,
+    /// Anything without a dedicated bucket.
+    Unknown,
+}
+
 /// Presence projected for one roster contact.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ContactPresence {
@@ -195,6 +217,11 @@ pub struct Account {
     pub capabilities: BTreeSet<ProtocolCapability>,
     /// Last connection failure reason, cleared on the next successful connect.
     pub connection_error: Option<String>,
+    /// Typed disconnect classification (ROADMAP 6.5), rendered as the bucket
+    /// label above [`Self::connection_error`]. Session ephemera: never
+    /// persisted and cleared on restore, exactly like the error prose.
+    #[serde(skip)]
+    pub disconnect_kind: Option<DisconnectKind>,
     /// Whether a mid-session network loss is retried automatically (XEP-0198
     /// resume). Non-secret and persisted, so it survives a restore. Defaults
     /// to `true`: a user-requested disconnect is immediate either way.
@@ -487,6 +514,7 @@ impl MindChatCore {
                 connection_state: ConnectionState::Offline,
                 capabilities: BTreeSet::new(),
                 connection_error: None,
+                disconnect_kind: None,
                 auto_reconnect: true,
                 proxies: Vec::new(),
             },
@@ -506,6 +534,8 @@ impl MindChatCore {
         account.connection_state = state;
         if matches!(state, ConnectionState::Connecting | ConnectionState::Online) {
             account.connection_error = None;
+            // A fresh connect makes the previous disconnect reason stale.
+            account.disconnect_kind = None;
         }
         self.events.push(CoreEvent::AccountChanged(account_id));
         Ok(())
@@ -663,16 +693,18 @@ impl MindChatCore {
                 account.connection_state = ConnectionState::Online;
                 account.capabilities = capabilities;
                 account.connection_error = None;
+                account.disconnect_kind = None;
                 self.events.push(CoreEvent::AccountChanged(account_id));
                 Ok(None)
             }
-            TransportEvent::Disconnected { account_id, recoverable, detail } => {
+            TransportEvent::Disconnected { account_id, recoverable, detail, kind } => {
                 let Some(account) = self.accounts.get_mut(&account_id) else {
                     return Ok(None);
                 };
                 account.connection_state =
                     if recoverable { ConnectionState::Offline } else { ConnectionState::Failed };
                 account.connection_error = detail;
+                account.disconnect_kind = Some(kind);
                 self.events.push(CoreEvent::AccountChanged(account_id));
                 Ok(None)
             }
@@ -1433,12 +1465,16 @@ impl<T: XmppTransport> TransportCoordinator<T> {
     }
 
     /// Disconnects an account and projects a local offline state.
+    ///
+    /// This is the explicit user-disconnect path, so the projected state
+    /// carries [`DisconnectKind::Cancelled`].
     pub fn disconnect(&mut self, account_id: AccountId) -> Result<(), TransportCoordinatorError> {
         self.transport.disconnect(account_id)?;
         self.core.apply_transport_event(TransportEvent::Disconnected {
             account_id,
             recoverable: true,
             detail: None,
+            kind: DisconnectKind::Cancelled,
         })?;
         Ok(())
     }
@@ -2080,11 +2116,13 @@ mod tests {
                 account_id,
                 recoverable: false,
                 detail: Some("not authorized".to_owned()),
+                kind: DisconnectKind::AuthenticationFailed,
             }),
             Ok(None)
         );
         assert_eq!(core.accounts()[0].connection_state, ConnectionState::Failed);
         assert_eq!(core.accounts()[0].connection_error.as_deref(), Some("not authorized"));
+        assert_eq!(core.accounts()[0].disconnect_kind, Some(DisconnectKind::AuthenticationFailed));
     }
 
     #[test]
@@ -2288,6 +2326,11 @@ mod tests {
         coordinator.disconnect(account_id).expect("disconnect");
         assert_eq!(coordinator.transport().disconnected_accounts, [account_id]);
         assert_eq!(coordinator.core().accounts()[0].connection_state, ConnectionState::Offline);
+        assert_eq!(
+            coordinator.core().accounts()[0].disconnect_kind,
+            Some(DisconnectKind::Cancelled),
+            "an explicit user disconnect must be classified as Cancelled"
+        );
     }
 
     #[test]
@@ -2355,6 +2398,7 @@ mod tests {
                 account_id: 999,
                 recoverable: true,
                 detail: None,
+                kind: DisconnectKind::Unknown,
             }),
             Ok(None)
         );

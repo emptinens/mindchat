@@ -79,6 +79,9 @@ pub enum TransportEvent {
         recoverable: bool,
         /// Human-readable failure reason for the UI, when the transport has one.
         detail: Option<String>,
+        /// Typed disconnect cause (ROADMAP 6.5). Prose stays display-only;
+        /// this is the only control-flow signal derived from a disconnect.
+        kind: crate::DisconnectKind,
     },
     /// Capabilities received after XEP-0030 service discovery completes.
     CapabilitiesDiscovered {

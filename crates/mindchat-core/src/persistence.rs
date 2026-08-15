@@ -35,6 +35,16 @@ pub struct PersistedState {
     pub snapshot: CoreSnapshot,
 }
 
+/// Non-secret metadata about a persisted state file, safe for the
+/// diagnostics report (ROADMAP 6.5). Contains no snapshot content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateFileMetadata {
+    /// Size of the state file in bytes.
+    pub size_bytes: u64,
+    /// Schema version stored in the file envelope.
+    pub schema_version: u32,
+}
+
 /// Failure while saving or loading a state file.
 ///
 /// All variants render UI-safe messages that contain no secret material.
@@ -132,6 +142,18 @@ pub fn save_state(snapshot: &CoreSnapshot, path: &Path) -> Result<(), Persistenc
 /// Returns the typed [`PersistenceError`] described above for every failure
 /// mode except a missing file.
 pub fn load_state(path: &Path) -> Result<Option<CoreSnapshot>, PersistenceError> {
+    load_state_with_metadata(path).map(|option| option.map(|(snapshot, _)| snapshot))
+}
+
+/// Loads a snapshot like [`load_state`] and also returns the file's
+/// non-secret metadata for the diagnostics report (ROADMAP 6.5).
+///
+/// # Errors
+///
+/// Returns the same typed [`PersistenceError`] as [`load_state`].
+pub fn load_state_with_metadata(
+    path: &Path,
+) -> Result<Option<(CoreSnapshot, StateFileMetadata)>, PersistenceError> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -152,20 +174,24 @@ pub fn load_state(path: &Path) -> Result<Option<CoreSnapshot>, PersistenceError>
     if persisted.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(PersistenceError::UnsupportedVersion(persisted.schema_version));
     }
-    Ok(Some(sanitize_snapshot(persisted.snapshot)))
+    Ok(Some((
+        sanitize_snapshot(persisted.snapshot),
+        StateFileMetadata { size_bytes: byte_count, schema_version: persisted.schema_version },
+    )))
 }
 
 /// Clears session ephemera from a restored snapshot.
 ///
-/// Accounts are forced to `Offline` with no error and no capabilities,
-/// contacts to `Offline` presence with no status, while conversations,
-/// messages, and reactions are kept verbatim because they are durable state.
-/// Pending and failed outgoing messages stay pending for the reconnect retry
-/// path.
+/// Accounts are forced to `Offline` with no error, no capability set, and no
+/// disconnect classification, contacts to `Offline` presence with no status,
+/// while conversations, messages, and reactions are kept verbatim because
+/// they are durable state. Pending and failed outgoing messages stay pending
+/// for the reconnect retry path.
 fn sanitize_snapshot(mut snapshot: CoreSnapshot) -> CoreSnapshot {
     for account in &mut snapshot.accounts {
         account.connection_state = ConnectionState::Offline;
         account.connection_error = None;
+        account.disconnect_kind = None;
         account.capabilities = BTreeSet::new();
     }
     for contact in &mut snapshot.contacts {
@@ -454,6 +480,7 @@ mod tests {
                     connection_state: ConnectionState::Online,
                     capabilities: BTreeSet::from([ProtocolCapability::Receipts]),
                     connection_error: Some("not authorized".to_owned()),
+                    disconnect_kind: Some(crate::DisconnectKind::ServerRefused),
                     auto_reconnect: true,
                     proxies: Vec::new(),
                 },
@@ -465,6 +492,7 @@ mod tests {
                     connection_state: ConnectionState::Connecting,
                     capabilities: BTreeSet::new(),
                     connection_error: None,
+                    disconnect_kind: None,
                     auto_reconnect: true,
                     proxies: Vec::new(),
                 },
@@ -513,6 +541,10 @@ mod tests {
         assert_eq!(loaded.accounts[0].connection_state, ConnectionState::Offline);
         assert!(loaded.accounts[0].capabilities.is_empty());
         assert_eq!(loaded.accounts[0].connection_error, None);
+        assert_eq!(
+            loaded.accounts[0].disconnect_kind, None,
+            "the disconnect classification is session ephemera and must not survive a restore"
+        );
         assert_eq!(loaded.accounts[1].connection_state, ConnectionState::Offline);
         assert_eq!(loaded.contacts[0].presence, ContactPresence::Offline);
         assert_eq!(loaded.contacts[0].status, None);
@@ -523,5 +555,30 @@ mod tests {
         assert_eq!(loaded.messages[0].body, "hello");
         assert_eq!(loaded.messages[0].delivery_state, DeliveryState::Pending);
         assert_eq!(loaded.reactions[0].emoji, "👍");
+    }
+
+    #[test]
+    fn load_state_with_metadata_reports_size_and_version_without_content() {
+        let core = populated_core();
+        let temp = TempState::new("metadata");
+
+        save_state(&core.snapshot(), temp.path()).expect("save succeeds");
+        let (snapshot, metadata) =
+            load_state_with_metadata(temp.path()).expect("load succeeds").expect("file exists");
+
+        assert_eq!(metadata.schema_version, CURRENT_SCHEMA_VERSION);
+        let on_disk = std::fs::metadata(temp.path()).expect("state file metadata");
+        assert_eq!(metadata.size_bytes, on_disk.len());
+        // The metadata carries only counts-relevant envelope data: no account
+        // JIDs, display names, message bodies, or reactions.
+        assert_eq!(snapshot.accounts.len(), 2);
+        assert_eq!(snapshot.messages.len(), 3);
+    }
+
+    #[test]
+    fn load_state_with_metadata_returns_none_for_missing_file() {
+        let temp = TempState::new("metadata-missing");
+        let missing = temp.path().with_extension("never-written.json");
+        assert_eq!(load_state_with_metadata(&missing).expect("missing file is not an error"), None);
     }
 }

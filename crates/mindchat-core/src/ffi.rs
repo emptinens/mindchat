@@ -43,17 +43,21 @@
 //! [`MindChatCoreHandle::register_account`], never stored or returned. Proxy
 //! credentials follow the same hand-off pattern and are never persisted.
 
-use crate::persistence::{PersistenceError, load_state, save_state};
+use crate::persistence::{
+    CURRENT_SCHEMA_VERSION, PersistenceError, StateFileMetadata, load_state_with_metadata,
+    save_state,
+};
 use crate::proxy::{ProxyConfig, ProxyKind, ProxyProbe};
 use crate::{
     AccountSetup, ConnectionState, ContactPresence, ConversationKind, CoreError, CoreEvent,
-    DeliveryState, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
+    DeliveryState, DisconnectKind, MessageDirection, MessageKind, MindChatCore, ProtocolCapability,
     RegisterRequest, RosterSubscription, SecretString, TokioXmppTransport, TransportCoordinator,
     TransportCoordinatorError, TransportError, XmppTransport,
 };
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_TRANSPORT_EVENTS_PER_POLL: u32 = 128;
 
@@ -84,6 +88,48 @@ impl From<FfiConnectionState> for ConnectionState {
             FfiConnectionState::Connecting => Self::Connecting,
             FfiConnectionState::Online => Self::Online,
             FfiConnectionState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// Typed reason an account left the connected state (ROADMAP 6.5), rendered
+/// as the bucket label above the detail prose. Derived by the core from typed
+/// transport failures; prose is never parsed for this.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum FfiDisconnectKind {
+    /// The server rejected the credentials (SASL failure).
+    AuthenticationFailed,
+    /// The server refused the stream or session (for example a stream error).
+    ServerRefused,
+    /// The link was lost: timeout, EOF, suspended stream, or reconnect budget
+    /// exhausted.
+    NetworkLost,
+    /// The user explicitly disconnected the account.
+    Cancelled,
+    /// Anything without a dedicated bucket.
+    Unknown,
+}
+
+impl From<DisconnectKind> for FfiDisconnectKind {
+    fn from(value: DisconnectKind) -> Self {
+        match value {
+            DisconnectKind::AuthenticationFailed => Self::AuthenticationFailed,
+            DisconnectKind::ServerRefused => Self::ServerRefused,
+            DisconnectKind::NetworkLost => Self::NetworkLost,
+            DisconnectKind::Cancelled => Self::Cancelled,
+            DisconnectKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<FfiDisconnectKind> for DisconnectKind {
+    fn from(value: FfiDisconnectKind) -> Self {
+        match value {
+            FfiDisconnectKind::AuthenticationFailed => Self::AuthenticationFailed,
+            FfiDisconnectKind::ServerRefused => Self::ServerRefused,
+            FfiDisconnectKind::NetworkLost => Self::NetworkLost,
+            FfiDisconnectKind::Cancelled => Self::Cancelled,
+            FfiDisconnectKind::Unknown => Self::Unknown,
         }
     }
 }
@@ -367,6 +413,10 @@ pub struct FfiAccount {
     pub capabilities: Vec<FfiProtocolCapability>,
     /// Last connection failure reason, safe to show in the UI.
     pub connection_error: Option<String>,
+    /// Typed disconnect classification (ROADMAP 6.5), rendered as the bucket
+    /// label above [`Self::connection_error`]. `None` while the account is
+    /// connected or has not disconnected yet.
+    pub disconnect_kind: Option<FfiDisconnectKind>,
 }
 
 /// A roster contact record safe for display in the Android UI.
@@ -435,6 +485,39 @@ pub struct FfiCoreSnapshot {
     pub conversations: Vec<FfiConversation>,
     pub messages: Vec<FfiMessage>,
     pub reactions: Vec<FfiReaction>,
+}
+
+/// Opt-in diagnostics export (ROADMAP 6.5), assembled by
+/// [`MindChatCoreHandle::diagnostics_report`].
+///
+/// Structurally excludes every secret and every piece of snapshot content:
+/// there are no password, message-body, avatar, or JID fields, only record
+/// counts and persistence metadata. The state path is the app's own
+/// non-secret state file location.
+#[derive(Clone, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct FfiDiagnosticsReport {
+    /// Number of configured accounts.
+    pub account_count: u64,
+    /// Number of roster contacts.
+    pub contact_count: u64,
+    /// Number of conversations.
+    pub conversation_count: u64,
+    /// Number of messages.
+    pub message_count: u64,
+    /// Number of reactions.
+    pub reaction_count: u64,
+    /// Absolute path of the last state file passed to save/load, if any.
+    pub state_path: Option<String>,
+    /// Size of the state file in bytes, as last observed by save/load.
+    pub state_size_bytes: Option<u64>,
+    /// Schema version of the state file, as last observed by save/load.
+    pub state_schema_version: Option<u32>,
+    /// Whether the last load attempt failed and the file was quarantined.
+    pub state_quarantined: bool,
+    /// Epoch milliseconds of the last successful save.
+    pub state_last_saved_at_epoch_ms: Option<u64>,
+    /// Epoch milliseconds of the last successful load.
+    pub state_last_loaded_at_epoch_ms: Option<u64>,
 }
 
 /// Notification emitted after a state change. The Kotlin layer refetches a
@@ -543,6 +626,27 @@ impl From<PersistenceError> for MindChatBindingError {
 #[derive(uniffi::Object)]
 pub struct MindChatCoreHandle {
     session: Mutex<TransportCoordinator<TokioXmppTransport>>,
+    /// Non-secret persistence observations for the diagnostics report.
+    persistence: Mutex<PersistenceTrack>,
+}
+
+/// Persistence metadata tracked by save/load for [`FfiDiagnosticsReport`]
+/// (ROADMAP 6.5). Contains no snapshot content.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PersistenceTrack {
+    path: Option<PathBuf>,
+    size_bytes: Option<u64>,
+    schema_version: Option<u32>,
+    quarantined: bool,
+    last_saved_at_epoch_ms: Option<u64>,
+    last_loaded_at_epoch_ms: Option<u64>,
+}
+
+/// Current wall clock in epoch milliseconds.
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl MindChatCoreHandle {
@@ -553,6 +657,49 @@ impl MindChatCoreHandle {
         self.session.lock().map_err(|_| MindChatBindingError::Internal {
             detail: "MindChat core lock was poisoned".to_owned(),
         })
+    }
+
+    /// Records a successful save for the diagnostics report.
+    fn record_save(&self, path: &Path) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            track.schema_version = Some(CURRENT_SCHEMA_VERSION);
+            track.last_saved_at_epoch_ms = Some(now_epoch_ms());
+        }
+    }
+
+    /// Records a successful load for the diagnostics report.
+    fn record_load_success(&self, path: &Path, metadata: &StateFileMetadata) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.size_bytes = Some(metadata.size_bytes);
+            track.schema_version = Some(metadata.schema_version);
+            track.last_loaded_at_epoch_ms = Some(now_epoch_ms());
+        }
+    }
+
+    /// Records a missing-file load for the diagnostics report.
+    fn record_load_missing(&self, path: &Path) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.last_loaded_at_epoch_ms = Some(now_epoch_ms());
+        }
+    }
+
+    /// Records a failed load for the diagnostics report. The state file could
+    /// not be restored, so it is flagged as quarantined (the app renames it
+    /// aside and starts clean).
+    fn record_load_failure(&self, path: &Path, error: &PersistenceError) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            if let PersistenceError::UnsupportedVersion(version) = error {
+                track.schema_version = Some(*version);
+            }
+            track.quarantined = true;
+            track.last_loaded_at_epoch_ms = Some(now_epoch_ms());
+        }
     }
 }
 
@@ -570,6 +717,7 @@ impl MindChatCoreHandle {
                 MindChatCore::default(),
                 TokioXmppTransport::new(),
             )),
+            persistence: Mutex::new(PersistenceTrack::default()),
         })
     }
 
@@ -950,10 +1098,12 @@ impl MindChatCoreHandle {
     /// safe: each write stages a unique temporary file and renames it over
     /// `path` atomically, so the last completed save wins with a complete
     /// snapshot. No secrets are written: account passwords never enter the
-    /// core or the snapshot.
+    /// core or the snapshot. The outcome feeds the diagnostics report.
     pub fn save_state(&self, path: String) -> Result<(), MindChatBindingError> {
         let snapshot = self.lock()?.core().snapshot();
-        save_state(&snapshot, Path::new(&path)).map_err(Into::into)
+        save_state(&snapshot, Path::new(&path)).map_err(MindChatBindingError::from)?;
+        self.record_save(Path::new(&path));
+        Ok(())
     }
 
     /// Restores a saved snapshot from `path`, returning whether one was loaded.
@@ -964,7 +1114,9 @@ impl MindChatCoreHandle {
     /// until a real connect happens. The load is refused when the core
     /// already contains accounts or the transport owns connections, because
     /// restore must run exactly once at startup on an empty handle rather
-    /// than merge or clobber live state. The file contains no secrets.
+    /// than merge or clobber live state. The file contains no secrets, and
+    /// load outcomes (including a quarantined file) feed the diagnostics
+    /// report.
     pub fn load_state(&self, path: String) -> Result<bool, MindChatBindingError> {
         let mut session = self.lock()?;
         if !session.core().accounts().is_empty() {
@@ -979,12 +1131,56 @@ impl MindChatCoreHandle {
                     .to_owned(),
             });
         }
-        let Some(snapshot) = load_state(Path::new(&path)).map_err(MindChatBindingError::from)?
-        else {
-            return Ok(false);
+        let path = Path::new(&path);
+        match load_state_with_metadata(path) {
+            Ok(Some((snapshot, metadata))) => {
+                *session.core_mut() = MindChatCore::from_snapshot(snapshot);
+                self.record_load_success(path, &metadata);
+                Ok(true)
+            }
+            Ok(None) => {
+                self.record_load_missing(path);
+                Ok(false)
+            }
+            Err(error) => {
+                self.record_load_failure(path, &error);
+                Err(MindChatBindingError::from(error))
+            }
+        }
+    }
+
+    /// Assembles the opt-in diagnostics export (ROADMAP 6.5).
+    ///
+    /// Snapshot counters come from the current in-memory state; persistence
+    /// metadata comes from the last save/load outcome. The report never reads
+    /// the state file itself, so it cannot fail on I/O, and it structurally
+    /// contains no passwords, message bodies, avatar paths, or JIDs. If the
+    /// session lock is poisoned (the core panicked), counters read zero but
+    /// the persistence metadata is still reported.
+    pub fn diagnostics_report(&self) -> FfiDiagnosticsReport {
+        let snapshot = match self.lock() {
+            Ok(guard) => guard.core().snapshot(),
+            Err(_) => crate::CoreSnapshot::default(),
         };
-        *session.core_mut() = MindChatCore::from_snapshot(snapshot);
-        Ok(true)
+        let track = match self.persistence.lock() {
+            Ok(guard) => guard,
+            // A poisoned track still holds valid metadata; diagnostics must
+            // never fail, so read through the poison error.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        FfiDiagnosticsReport {
+            account_count: u64::try_from(snapshot.accounts.len()).unwrap_or(u64::MAX),
+            contact_count: u64::try_from(snapshot.contacts.len()).unwrap_or(u64::MAX),
+            conversation_count: u64::try_from(snapshot.conversations.len()).unwrap_or(u64::MAX),
+            message_count: u64::try_from(snapshot.messages.len()).unwrap_or(u64::MAX),
+            reaction_count: u64::try_from(snapshot.reactions.len()).unwrap_or(u64::MAX),
+            state_path: track.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            state_size_bytes: track.size_bytes,
+            state_schema_version: track.schema_version,
+            state_quarantined: track.quarantined,
+            state_last_saved_at_epoch_ms: track.last_saved_at_epoch_ms,
+            state_last_loaded_at_epoch_ms: track.last_loaded_at_epoch_ms,
+        }
     }
 }
 
@@ -1017,6 +1213,7 @@ impl From<crate::Account> for FfiAccount {
             connection_state: value.connection_state.into(),
             capabilities: value.capabilities.into_iter().map(Into::into).collect(),
             connection_error: value.connection_error,
+            disconnect_kind: value.disconnect_kind.map(Into::into),
         }
     }
 }
@@ -1664,5 +1861,285 @@ mod tests {
         let probe = core.test_proxy(ffi_proxy("", 1080, FfiProxyKind::Socks5), None);
         assert!(!probe.ok);
         assert!(probe.error.as_deref().is_some_and(|detail| detail.contains("host is required")));
+    }
+
+    #[test]
+    fn ffi_disconnect_kind_maps_all_variants_both_ways() {
+        let domain = [
+            DisconnectKind::AuthenticationFailed,
+            DisconnectKind::ServerRefused,
+            DisconnectKind::NetworkLost,
+            DisconnectKind::Cancelled,
+            DisconnectKind::Unknown,
+        ];
+        let ffi = [
+            FfiDisconnectKind::AuthenticationFailed,
+            FfiDisconnectKind::ServerRefused,
+            FfiDisconnectKind::NetworkLost,
+            FfiDisconnectKind::Cancelled,
+            FfiDisconnectKind::Unknown,
+        ];
+        assert_eq!(domain.len(), ffi.len(), "the domain and FFI enums stay in lockstep");
+        for (domain_kind, ffi_kind) in domain.into_iter().zip(ffi) {
+            assert_eq!(FfiDisconnectKind::from(domain_kind), ffi_kind);
+            assert_eq!(DisconnectKind::from(ffi_kind), domain_kind);
+        }
+    }
+
+    #[test]
+    fn account_projection_carries_the_disconnect_kind() {
+        use std::collections::BTreeSet;
+        let account = crate::Account {
+            id: 7,
+            jid: "alice@example.org".to_owned(),
+            server: "example.org".to_owned(),
+            display_name: "Alice".to_owned(),
+            connection_state: ConnectionState::Failed,
+            capabilities: BTreeSet::new(),
+            connection_error: Some("not authorized".to_owned()),
+            disconnect_kind: Some(DisconnectKind::AuthenticationFailed),
+            auto_reconnect: true,
+            proxies: Vec::new(),
+        };
+        let ffi: FfiAccount = account.into();
+        assert_eq!(ffi.connection_state, FfiConnectionState::Failed);
+        assert_eq!(ffi.connection_error.as_deref(), Some("not authorized"));
+        assert_eq!(ffi.disconnect_kind, Some(FfiDisconnectKind::AuthenticationFailed));
+    }
+
+    #[test]
+    fn diagnostics_report_counts_current_snapshot_records() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        let conversation_id = core
+            .open_conversation(
+                account_id,
+                FfiConversationKind::Direct,
+                "bob@example.org".to_owned(),
+                "Bob".to_owned(),
+                100,
+            )
+            .expect("conversation");
+        let message_id = core
+            .send_text(
+                conversation_id,
+                "alice@example.org".to_owned(),
+                "hello".to_owned(),
+                None,
+                200,
+            )
+            .expect("message");
+        core.set_capabilities(account_id, vec![FfiProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(message_id, "bob@example.org".to_owned(), "👍".to_owned())
+            .expect("reaction");
+        core.upsert_contact(
+            account_id,
+            "bob@example.org".to_owned(),
+            "Bob".to_owned(),
+            FfiContactPresence::Online,
+            Some("Available".to_owned()),
+        )
+        .expect("contact");
+
+        let report = core.diagnostics_report();
+        assert_eq!(report.account_count, 1);
+        assert_eq!(report.contact_count, 1);
+        assert_eq!(report.conversation_count, 1);
+        assert_eq!(report.message_count, 1);
+        assert_eq!(report.reaction_count, 1);
+        // A fresh handle has never saved or loaded: no persistence metadata.
+        assert!(report.state_path.is_none());
+        assert!(report.state_size_bytes.is_none());
+        assert!(report.state_schema_version.is_none());
+        assert!(!report.state_quarantined);
+        assert!(report.state_last_saved_at_epoch_ms.is_none());
+        assert!(report.state_last_loaded_at_epoch_ms.is_none());
+    }
+
+    #[test]
+    fn diagnostics_report_excludes_bodies_avatar_paths_and_jids() {
+        let core = MindChatCoreHandle::new();
+        let account_id = core
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        let conversation_id = core
+            .open_conversation(
+                account_id,
+                FfiConversationKind::Direct,
+                "bob@example.org".to_owned(),
+                "Bob".to_owned(),
+                100,
+            )
+            .expect("conversation");
+        // Secret-looking content injected into every user-supplied string the
+        // snapshot can hold: a message body (which may contain a typed
+        // password), a contact status (avatar path), and JIDs.
+        let body_marker = "hunter2-secret-password-in-body";
+        let avatar_marker = "/data/user/0/com.mindchat/avatars/bob.png";
+        let jid_marker = "bob@example.org";
+        let message_id = core
+            .send_text(
+                conversation_id,
+                "alice@example.org".to_owned(),
+                body_marker.to_owned(),
+                None,
+                200,
+            )
+            .expect("message");
+        core.set_capabilities(account_id, vec![FfiProtocolCapability::MessageReactions])
+            .expect("reactions capability");
+        core.add_reaction(message_id, jid_marker.to_owned(), "👍".to_owned()).expect("reaction");
+        core.upsert_contact(
+            account_id,
+            jid_marker.to_owned(),
+            "Bob".to_owned(),
+            FfiContactPresence::Online,
+            Some(avatar_marker.to_owned()),
+        )
+        .expect("contact");
+
+        // Sanity: the markers really live in the snapshot, so the redaction
+        // assertion below is meaningful rather than vacuously green.
+        let snapshot = core.snapshot().expect("snapshot");
+        let snapshot_debug = format!("{snapshot:?}");
+        assert!(snapshot_debug.contains(body_marker));
+        assert!(snapshot_debug.contains(avatar_marker));
+        assert!(snapshot_debug.contains(jid_marker));
+
+        let rendered = format!("{:?}", core.diagnostics_report());
+        for marker in [body_marker, avatar_marker, jid_marker] {
+            assert!(
+                !rendered.contains(marker),
+                "the diagnostics report must not contain the snapshot marker {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostics_report_type_has_no_secret_fields() {
+        let core = MindChatCoreHandle::new();
+        core.add_account(
+            "alice@example.org".to_owned(),
+            "example.org".to_owned(),
+            "Alice".to_owned(),
+        )
+        .expect("account");
+        let rendered = format!("{:?}", core.diagnostics_report());
+
+        // Field-name audit: the record is counters + persistence metadata
+        // only. No password, body, avatar, or JID field can ever be part of
+        // the report (Rust would reject adding one without updating this).
+        for forbidden in ["password", "body", "avatar", "jid", "secret", "token"] {
+            assert!(!rendered.contains(forbidden), "the report must have no {forbidden} field");
+        }
+        for expected in [
+            "account_count",
+            "contact_count",
+            "conversation_count",
+            "message_count",
+            "reaction_count",
+            "state_path",
+            "state_size_bytes",
+            "state_schema_version",
+            "state_quarantined",
+            "state_last_saved_at_epoch_ms",
+            "state_last_loaded_at_epoch_ms",
+        ] {
+            assert!(rendered.contains(expected), "the report must expose {expected}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_report_tracks_save_and_load_metadata() {
+        let first = MindChatCoreHandle::new();
+        first
+            .add_account(
+                "alice@example.org".to_owned(),
+                "example.org".to_owned(),
+                "Alice".to_owned(),
+            )
+            .expect("account");
+        let temp = TempState::new("diag-persist");
+        first.save_state(temp.path().to_string_lossy().into_owned()).expect("save succeeds");
+
+        let saved = first.diagnostics_report();
+        assert_eq!(
+            saved.state_path.as_deref(),
+            Some(temp.path().to_string_lossy().as_ref()),
+            "the saved path is the file passed to save_state"
+        );
+        let on_disk = std::fs::metadata(temp.path()).expect("state file exists").len();
+        assert_eq!(saved.state_size_bytes, Some(on_disk));
+        assert_eq!(saved.state_schema_version, Some(1));
+        assert!(!saved.state_quarantined);
+        assert!(saved.state_last_saved_at_epoch_ms.is_some());
+        assert!(saved.state_last_loaded_at_epoch_ms.is_none());
+        assert_eq!(saved.account_count, 1);
+
+        let second = MindChatCoreHandle::new();
+        assert!(
+            second.load_state(temp.path().to_string_lossy().into_owned()).expect("load succeeds")
+        );
+        let loaded = second.diagnostics_report();
+        assert_eq!(loaded.state_schema_version, Some(1));
+        assert_eq!(loaded.state_size_bytes, Some(on_disk));
+        assert!(!loaded.state_quarantined);
+        assert!(loaded.state_last_loaded_at_epoch_ms.is_some());
+        assert!(loaded.state_last_saved_at_epoch_ms.is_none());
+        assert_eq!(loaded.account_count, 1);
+    }
+
+    #[test]
+    fn diagnostics_report_flags_quarantined_load_failure() {
+        let core = MindChatCoreHandle::new();
+        let temp = TempState::new("diag-quarantine");
+        std::fs::write(temp.path(), b"this is not json").expect("write corrupt file");
+        assert!(core.load_state(temp.path().to_string_lossy().into_owned()).is_err());
+
+        let report = core.diagnostics_report();
+        assert!(
+            report.state_quarantined,
+            "a failed load must be flagged so the UI can show the quarantine notice"
+        );
+        assert_eq!(report.state_path.as_deref(), Some(temp.path().to_string_lossy().as_ref()));
+        assert!(report.state_last_loaded_at_epoch_ms.is_some());
+        assert_eq!(report.account_count, 0, "no snapshot was restored");
+    }
+
+    #[test]
+    fn diagnostics_report_records_unsupported_version_on_quarantine() {
+        let core = MindChatCoreHandle::new();
+        let temp = TempState::new("diag-version");
+        let json = r#"{
+            "schema_version": 99,
+            "snapshot": {
+                "accounts": [],
+                "contacts": [],
+                "conversations": [],
+                "messages": [],
+                "reactions": []
+            }
+        }"#;
+        std::fs::write(temp.path(), json).expect("write versioned file");
+        assert!(core.load_state(temp.path().to_string_lossy().into_owned()).is_err());
+
+        let report = core.diagnostics_report();
+        assert!(report.state_quarantined);
+        assert_eq!(
+            report.state_schema_version,
+            Some(99),
+            "the refused schema version is the useful diagnostics signal"
+        );
     }
 }

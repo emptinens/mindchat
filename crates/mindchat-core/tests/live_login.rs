@@ -6,8 +6,8 @@
 //! Android device failure mode where DNS configuration is unreliable.
 
 use mindchat_core::{
-    ConnectionRequest, SecretString, TokioXmppTransport, TransportEvent, XmppTransport,
-    xmpp::RegisterRequest,
+    ConnectionRequest, DisconnectKind, SecretString, TokioXmppTransport, TransportEvent,
+    XmppTransport, xmpp::RegisterRequest,
 };
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -198,11 +198,17 @@ fn live_login_chain_reaches_sasl_on_jabber_ru() {
     }
 
     let terminal = terminal.expect("transport must reach a terminal Disconnected event");
-    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail } = terminal
+    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail, kind } =
+        terminal
     else {
         panic!("unexpected terminal event");
     };
     assert_eq!(seen_account, account_id);
+    assert_eq!(
+        kind,
+        DisconnectKind::AuthenticationFailed,
+        "rejected credentials must classify as AuthenticationFailed"
+    );
     // The full chain works when the server rejects the bogus credentials with
     // an authentication failure (non-recoverable) instead of a connection error.
     assert!(
@@ -258,12 +264,17 @@ fn live_blackhole_connect_terminates_within_30_seconds() {
         elapsed <= Duration::from_secs(32),
         "blackhole connect took {elapsed:?}, exceeding the 32 second bound"
     );
-    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail: _ } =
+    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail: _, kind } =
         terminal
     else {
         panic!("unexpected terminal event");
     };
     assert_eq!(seen_account, account_id);
+    assert_eq!(
+        kind,
+        DisconnectKind::NetworkLost,
+        "an unroutable endpoint must classify as NetworkLost"
+    );
     assert!(
         recoverable,
         "an unroutable endpoint is a recoverable connection failure, not an auth failure"
@@ -314,11 +325,17 @@ fn live_wrong_password_fails_fast_without_preflight() {
         elapsed <= Duration::from_secs(20),
         "wrong-password rejection took {elapsed:?}, exceeding the 20 second bound"
     );
-    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail } = terminal
+    let TransportEvent::Disconnected { account_id: seen_account, recoverable, detail, kind } =
+        terminal
     else {
         panic!("unexpected terminal event");
     };
     assert_eq!(seen_account, account_id);
+    assert_eq!(
+        kind,
+        DisconnectKind::AuthenticationFailed,
+        "a wrong password must classify as AuthenticationFailed"
+    );
     assert!(
         !recoverable,
         "rejected credentials must be non-recoverable; got detail: {}",

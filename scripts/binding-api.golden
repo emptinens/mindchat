@@ -6,7 +6,9 @@
 #   scripts/check-ffi-stability.sh --update
 # (add --offline when the local cargo cache must be used instead of the network)
 ATTACHMENT
+AUTHENTICATION_FAILED
 AWAY
+CANCELLED
 CHAT_MARKERS
 CHAT_STATES
 CONNECTING
@@ -26,6 +28,7 @@ MESSAGE_REPLIES
 MULTI_USER_CHAT
 MULTI_USER_CHAT
 MUTUAL
+NETWORK_LOST
 NONE
 OFFLINE
 OFFLINE
@@ -40,10 +43,12 @@ PUSH_NOTIFICATIONS
 READ
 RECEIPTS
 SENT
+SERVER_REFUSED
 SHARED_PINS
 SOCKS5
 STREAM_MANAGEMENT
 TEXT
+UNKNOWN
 VOICE
 class AuthenticationFailed(
 class CapabilityUnavailable(
@@ -58,6 +63,7 @@ data class FfiAttachment(
 data class FfiContact(
 data class FfiConversation(
 data class FfiCoreSnapshot(
+data class FfiDiagnosticsReport(
 data class FfiMessage(
 data class FfiProxyConfig(
 data class FfiProxyProbe(
@@ -69,6 +75,7 @@ enum class FfiConnectionState {
 enum class FfiContactPresence {
 enum class FfiConversationKind {
 enum class FfiDeliveryState {
+enum class FfiDisconnectKind {
 enum class FfiMessageDirection {
 enum class FfiMessageKind {
 enum class FfiProtocolCapability {
@@ -81,6 +88,7 @@ fun connectAccount(accountId: kotlin.ULong, password: kotlin.String)
 fun connectAccountWithProxy(accountId: kotlin.ULong, password: kotlin.String, proxy: FfiProxyConfig?, proxyPassword: kotlin.String?)
 fun deleteAccount(accountId: kotlin.ULong)
 fun deleteConversation(conversationId: kotlin.ULong)
+fun diagnosticsReport(): FfiDiagnosticsReport
 fun disconnectAccount(accountId: kotlin.ULong)
 fun drainEvents(): List<FfiCoreEvent>
 fun flushOutbox(accountId: kotlin.ULong): kotlin.UInt
@@ -103,6 +111,7 @@ open class MindChatCoreHandle: Disposable, AutoCloseable, MindChatCoreHandleInte
 public interface MindChatCoreHandleInterface {
 sealed class FfiCoreEvent {
 sealed class MindChatBindingException: kotlin.Exception() {
+val accountCount: kotlin.ULong
 val accountId: kotlin.ULong
 val accountId: kotlin.ULong
 val accountId: kotlin.ULong
@@ -117,7 +126,9 @@ val capabilities: List<FfiProtocolCapability>
 val capability: FfiProtocolCapability
 val connectionError: kotlin.String?
 val connectionState: FfiConnectionState
+val contactCount: kotlin.ULong
 val contacts: List<FfiContact>
+val conversationCount: kotlin.ULong
 val conversationId: kotlin.ULong
 val conversationId: kotlin.ULong
 val conversations: List<FfiConversation>
@@ -127,6 +138,7 @@ val detail: kotlin.String
 val detail: kotlin.String
 val detail: kotlin.String
 val direction: FfiMessageDirection
+val disconnectKind: FfiDisconnectKind?
 val displayName: kotlin.String
 val displayName: kotlin.String
 val emoji: kotlin.String
@@ -146,6 +158,7 @@ val kind: FfiMessageKind
 val kind: FfiProxyKind
 val lastActivityEpochMs: kotlin.ULong
 val latencyMs: kotlin.ULong
+val messageCount: kotlin.ULong
 val messageId: kotlin.ULong
 val messageId: kotlin.ULong
 val messageId: kotlin.ULong
@@ -154,11 +167,18 @@ val mimeType: kotlin.String
 val ok: kotlin.Boolean
 val port: kotlin.UShort
 val presence: FfiContactPresence
+val reactionCount: kotlin.ULong
 val reactions: List<FfiReaction>
 val remoteUrl: kotlin.String?
 val sender: kotlin.String
 val sentAtEpochMs: kotlin.ULong
 val server: kotlin.String
+val stateLastLoadedAtEpochMs: kotlin.ULong?
+val stateLastSavedAtEpochMs: kotlin.ULong?
+val statePath: kotlin.String?
+val stateQuarantined: kotlin.Boolean
+val stateSchemaVersion: kotlin.UInt?
+val stateSizeBytes: kotlin.ULong?
 val status: kotlin.String?
 val subscription: FfiRosterSubscription
 val title: kotlin.String

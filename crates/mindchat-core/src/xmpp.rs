@@ -5,9 +5,9 @@
 //! rest of the crate receives normalized, account-scoped transport events.
 
 use crate::{
-    AccountId, ConnectionRequest, ContactPresence, ConversationKind, OutgoingMessage,
-    ProtocolCapability, RosterSubscription, SecretString, TransportError, TransportEvent,
-    XmppTransport,
+    AccountId, ConnectionRequest, ContactPresence, ConversationKind, DisconnectKind,
+    OutgoingMessage, ProtocolCapability, RosterSubscription, SecretString, TransportError,
+    TransportEvent, XmppTransport,
     proxy::{ConnectStrategy, ProxyConfig, ProxyTarget},
 };
 use futures::{SinkExt, StreamExt};
@@ -255,6 +255,7 @@ impl XmppTransport for TokioXmppTransport {
                                 account_id,
                                 recoverable: true,
                                 detail: Some("XMPP worker crashed".to_owned()),
+                                kind: DisconnectKind::Unknown,
                             });
                         }
                     }
@@ -348,6 +349,7 @@ impl XmppTransport for TokioXmppTransport {
                         account_id,
                         recoverable: true,
                         detail: Some("XMPP worker stopped unexpectedly".to_owned()),
+                        kind: DisconnectKind::Unknown,
                     }))
                 } else {
                     Ok(None)
@@ -448,7 +450,11 @@ async fn run_worker(
             ConnectStrategy::Direct => {
                 let attempts = resolve_endpoints_with(&connection.server, &mut srv_resolver)
                     .await
-                    .map_err(|detail| ConnectFailure { detail, recoverable: true })?;
+                    .map_err(|detail| ConnectFailure {
+                        detail,
+                        recoverable: true,
+                        kind: DisconnectKind::NetworkLost,
+                    })?;
                 connect_attempt(&connection, attempts).await
             }
             ConnectStrategy::HttpConnect | ConnectStrategy::Socks5 => {
@@ -482,6 +488,7 @@ async fn run_worker(
                     account_id,
                     recoverable: failure.recoverable,
                     detail: Some(failure.detail),
+                    kind: failure.kind,
                 },
             );
             return;
@@ -493,6 +500,7 @@ async fn run_worker(
                     account_id,
                     recoverable: true,
                     detail: Some("connection attempt exceeded 30 seconds".to_owned()),
+                    kind: DisconnectKind::NetworkLost,
                 },
             );
             return;
@@ -582,6 +590,7 @@ async fn run_worker(
                             detail: Some(
                                 "no inbound data from the server for 3 minutes".to_owned(),
                             ),
+                            kind: DisconnectKind::NetworkLost,
                         },
                     );
                     if auto_reconnect {
@@ -619,7 +628,12 @@ async fn run_worker(
                     // An EOF has no server-supplied terminal cause. Treat it
                     // as retryable so an ordinary network loss never becomes
                     // a permanent credential failure in the UI.
-                    TransportEvent::Disconnected { account_id, recoverable: true, detail: None },
+                    TransportEvent::Disconnected {
+                        account_id,
+                        recoverable: true,
+                        detail: None,
+                        kind: DisconnectKind::NetworkLost,
+                    },
                 );
                 break;
             },
@@ -640,6 +654,8 @@ struct ConnectFailure {
     /// False when the server rejected the credentials, so the account is
     /// projected as `Failed` instead of silently returning to `Offline`.
     recoverable: bool,
+    /// Diagnostics classification (ROADMAP 6.5).
+    kind: DisconnectKind,
 }
 
 /// Candidates for one connection attempt grouped by `(port, use_direct_tls)`.
@@ -698,8 +714,11 @@ async fn connect_attempt(
     {
         return Err(failure);
     }
-    let mut last_failure =
-        ConnectFailure { detail: String::from("no connection candidates"), recoverable: true };
+    let mut last_failure = ConnectFailure {
+        detail: String::from("no connection candidates"),
+        recoverable: true,
+        kind: DisconnectKind::NetworkLost,
+    };
     for group in group_attempts(attempts) {
         match try_group(connection, group).await {
             Ok(ready) => return Ok(ready),
@@ -746,6 +765,8 @@ fn strategy_connect_failure(
             Some(ConnectFailure {
                 detail: format!("{strategy} connect strategy has no proxy configuration"),
                 recoverable: true,
+                // Local configuration problem: no dedicated bucket yet.
+                kind: DisconnectKind::Unknown,
             })
         }
     }
@@ -768,8 +789,12 @@ async fn connect_attempt_proxy(
         return Err(failure);
     }
     let proxy = connection.proxy.as_ref().expect("strategy_connect_failure guarantees a proxy");
-    let target = ProxyTarget::from_server(&connection.server)
-        .map_err(|error| ConnectFailure { detail: error.to_string(), recoverable: true })?;
+    let target = ProxyTarget::from_server(&connection.server).map_err(|error| ConnectFailure {
+        detail: error.to_string(),
+        recoverable: true,
+        // Invalid proxy target is a local configuration problem.
+        kind: DisconnectKind::Unknown,
+    })?;
     let connector =
         ProxyServerConnector::new(proxy.clone(), connection.proxy_password.clone(), target);
     let mut client = Client::new_with_connector(
@@ -783,6 +808,7 @@ async fn connect_attempt_proxy(
         Ok(None) => Err(ConnectFailure {
             detail: "the proxy tunnel closed during the XMPP handshake".to_owned(),
             recoverable: true,
+            kind: DisconnectKind::NetworkLost,
         }),
         Err(_) => Err(ConnectFailure {
             detail: format!(
@@ -790,6 +816,7 @@ async fn connect_attempt_proxy(
                 CONNECT_ATTEMPT_TIMEOUT.as_secs()
             ),
             recoverable: true,
+            kind: DisconnectKind::NetworkLost,
         }),
     }
 }
@@ -858,6 +885,7 @@ async fn try_group(
             return Err(ConnectFailure {
                 detail: format!("connection to {first_address} closed during handshake"),
                 recoverable: true,
+                kind: DisconnectKind::NetworkLost,
             });
         }
         // Head start elapsed (or the first client errored) without a usable
@@ -907,6 +935,7 @@ async fn try_group(
         Ok(Err(())) => Err(ConnectFailure {
             detail: format!("connection to port {} closed during handshake", group.port),
             recoverable: true,
+            kind: DisconnectKind::NetworkLost,
         }),
         Err(_) => Err(ConnectFailure {
             detail: format!(
@@ -915,6 +944,7 @@ async fn try_group(
                 CONNECT_ATTEMPT_TIMEOUT.as_secs()
             ),
             recoverable: true,
+            kind: DisconnectKind::NetworkLost,
         }),
     }
 }
@@ -1230,6 +1260,41 @@ fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
     )
 }
 
+/// Classifies a typed transport failure into the diagnostics disconnect kind
+/// (ROADMAP 6.5).
+///
+/// This is the single place that derives control-flow meaning from a
+/// disconnect cause, and it reads typed error variants, never prose. Display
+/// strings (for example the connect failure detail) stay display-only.
+/// Mapping:
+///
+/// - SASL failure → [`DisconnectKind::AuthenticationFailed`];
+/// - server stream error (the server ends the stream with `<stream:error>`)
+///   → [`DisconnectKind::ServerRefused`];
+/// - I/O error, closed stream, connector/tunnel failure, wrong address, or
+///   reconnect-budget exhaustion → [`DisconnectKind::NetworkLost`];
+/// - anything else (JID/protocol/format/state) → [`DisconnectKind::Unknown`].
+#[must_use]
+fn classify_disconnect(error: &tokio_xmpp::Error) -> DisconnectKind {
+    match error {
+        tokio_xmpp::Error::Auth(_) => DisconnectKind::AuthenticationFailed,
+        tokio_xmpp::Error::StreamError(_) => DisconnectKind::ServerRefused,
+        tokio_xmpp::Error::Io(_)
+        | tokio_xmpp::Error::Disconnected
+        | tokio_xmpp::Error::Connection(_)
+        | tokio_xmpp::Error::Addr(_)
+        | tokio_xmpp::Error::DnsProto(_)
+        | tokio_xmpp::Error::DnsNet(_)
+        | tokio_xmpp::Error::Idna
+        | tokio_xmpp::Error::ReconnectBudgetExhausted => DisconnectKind::NetworkLost,
+        tokio_xmpp::Error::JidParse(_)
+        | tokio_xmpp::Error::Protocol(_)
+        | tokio_xmpp::Error::InvalidState
+        | tokio_xmpp::Error::Fmt(_)
+        | tokio_xmpp::Error::Utf8(_) => DisconnectKind::Unknown,
+    }
+}
+
 /// Maps the first client event to a terminal connect failure, if it is one.
 ///
 /// The only terminal first event is `Disconnected`; it carries the precise
@@ -1239,9 +1304,11 @@ fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
 #[must_use]
 fn terminal_failure_for_event(event: &TokioXmppEvent) -> Option<ConnectFailure> {
     match event {
-        TokioXmppEvent::Disconnected(error) => {
-            Some(ConnectFailure { detail: error.to_string(), recoverable: !is_auth_error(error) })
-        }
+        TokioXmppEvent::Disconnected(error) => Some(ConnectFailure {
+            detail: error.to_string(),
+            recoverable: !is_auth_error(error),
+            kind: classify_disconnect(error),
+        }),
         _ => None,
     }
 }
@@ -1352,6 +1419,7 @@ async fn handle_client_event(
                     account_id,
                     recoverable: disconnected_is_recoverable(&error),
                     detail: Some(error.to_string()),
+                    kind: classify_disconnect(&error),
                 },
             );
             reconnect_decision(&TokioXmppEvent::Disconnected(error), auto_reconnect)
@@ -2188,6 +2256,124 @@ mod tests {
         assert!(!failure.recoverable, "rejected credentials must be non-recoverable");
         assert!(!failure.detail.is_empty(), "auth failures must carry precise detail");
         assert!(failure.detail.contains("authentication"));
+        assert_eq!(
+            failure.kind,
+            DisconnectKind::AuthenticationFailed,
+            "a rejected SASL exchange must classify as AuthenticationFailed"
+        );
+    }
+
+    /// Marker error type for exercising the connector-error classification
+    /// without a network.
+    #[derive(Debug)]
+    struct TestConnectorError;
+
+    impl fmt::Display for TestConnectorError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("test connector error")
+        }
+    }
+
+    impl std::error::Error for TestConnectorError {}
+
+    impl tokio_xmpp::connect::ServerConnectorError for TestConnectorError {}
+
+    /// One typed failure per [`DisconnectKind`] variant, proving the
+    /// classifier covers every bucket with a real error value.
+    #[test]
+    fn classify_disconnect_maps_typed_failures_to_every_kind() {
+        use xmpp_parsers::stream_error::{
+            DefinedCondition as StreamCondition, ReceivedStreamError, StreamError,
+        };
+
+        let utf8_error = String::from_utf8(vec![0xFF])
+            .expect_err("an invalid UTF-8 sequence is an error")
+            .utf8_error();
+        let addr_error =
+            "not-an-address".parse::<std::net::SocketAddr>().expect_err("invalid addr");
+
+        let cases: Vec<(tokio_xmpp::Error, DisconnectKind)> = vec![
+            // SASL rejection → AuthenticationFailed.
+            (
+                tokio_xmpp::Error::Auth(tokio_xmpp::error::AuthError::Fail(
+                    tokio_xmpp::parsers::sasl::DefinedCondition::NotAuthorized,
+                )),
+                DisconnectKind::AuthenticationFailed,
+            ),
+            // Server stream error (the server ends the stream with a
+            // <stream:error>) → ServerRefused.
+            (
+                tokio_xmpp::Error::StreamError(ReceivedStreamError(StreamError::new(
+                    StreamCondition::PolicyViolation,
+                    "en",
+                    "policy violation",
+                ))),
+                DisconnectKind::ServerRefused,
+            ),
+            // Timeout/EOF/suspended/connector/budget → NetworkLost.
+            (
+                tokio_xmpp::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "read timed out",
+                )),
+                DisconnectKind::NetworkLost,
+            ),
+            (tokio_xmpp::Error::Disconnected, DisconnectKind::NetworkLost),
+            (
+                tokio_xmpp::Error::Connection(Box::new(TestConnectorError)),
+                DisconnectKind::NetworkLost,
+            ),
+            (tokio_xmpp::Error::Addr(addr_error), DisconnectKind::NetworkLost),
+            (tokio_xmpp::Error::ReconnectBudgetExhausted, DisconnectKind::NetworkLost),
+            // Everything else → Unknown.
+            (tokio_xmpp::Error::InvalidState, DisconnectKind::Unknown),
+            (tokio_xmpp::Error::Fmt(fmt::Error), DisconnectKind::Unknown),
+            (tokio_xmpp::Error::Utf8(utf8_error), DisconnectKind::Unknown),
+            (
+                tokio_xmpp::Error::Protocol(tokio_xmpp::error::ProtocolError::NoTls),
+                DisconnectKind::Unknown,
+            ),
+        ];
+
+        let covered: std::collections::BTreeSet<DisconnectKind> =
+            cases.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(
+            covered,
+            std::collections::BTreeSet::from([
+                DisconnectKind::AuthenticationFailed,
+                DisconnectKind::ServerRefused,
+                DisconnectKind::NetworkLost,
+                DisconnectKind::Unknown,
+            ]),
+            "the classifier must cover every transport-derived bucket"
+        );
+
+        for (error, expected) in cases {
+            assert_eq!(classify_disconnect(&error), expected, "classify_disconnect({error:?})");
+        }
+    }
+
+    /// Cancelled is a coordinator-side classification (explicit user
+    /// disconnect) and is not produced from a transport failure; the FFI
+    /// mapping test in `ffi.rs` covers its variant. This test pins the
+    /// domain-side enum completeness instead.
+    #[test]
+    fn disconnect_kind_variant_set_is_stable() {
+        let all = [
+            DisconnectKind::AuthenticationFailed,
+            DisconnectKind::ServerRefused,
+            DisconnectKind::NetworkLost,
+            DisconnectKind::Cancelled,
+            DisconnectKind::Unknown,
+        ];
+        for (index, kind) in all.iter().enumerate() {
+            assert!(
+                all.iter()
+                    .enumerate()
+                    .all(|(other_index, other)| { index == other_index || kind != other }),
+                "every disconnect kind must be distinct"
+            );
+        }
     }
 
     #[test]
@@ -2211,7 +2397,12 @@ mod tests {
             .insert(42, WorkerHandle { command_sender, join: std::thread::spawn(|| {}) });
         transport
             .event_sender
-            .send(TransportEvent::Disconnected { account_id: 42, recoverable: true, detail: None })
+            .send(TransportEvent::Disconnected {
+                account_id: 42,
+                recoverable: true,
+                detail: None,
+                kind: DisconnectKind::Unknown,
+            })
             .expect("event receiver is alive");
 
         assert!(matches!(
@@ -2220,6 +2411,7 @@ mod tests {
                 account_id: 42,
                 recoverable: true,
                 detail: None,
+                kind: DisconnectKind::Unknown,
             }))
         ));
         assert!(transport.connected_accounts().is_empty());
@@ -2245,6 +2437,7 @@ mod tests {
                 account_id: 42,
                 recoverable: true,
                 detail: Some(_),
+                kind: DisconnectKind::Unknown,
             }))
         ));
         assert!(transport.connected_accounts().is_empty(), "the dead worker must be retired");
@@ -2533,9 +2726,16 @@ mod tests {
         // Regression guard: the connect phase must surface rejected
         // credentials as non-recoverable (Failed in the UI) instead of
         // degrading them to a generic recoverable connection failure.
-        let auth = ConnectFailure { detail: "authentication error".to_owned(), recoverable: false };
-        let network =
-            ConnectFailure { detail: "connection to x timed out".to_owned(), recoverable: true };
+        let auth = ConnectFailure {
+            detail: "authentication error".to_owned(),
+            recoverable: false,
+            kind: DisconnectKind::AuthenticationFailed,
+        };
+        let network = ConnectFailure {
+            detail: "connection to x timed out".to_owned(),
+            recoverable: true,
+            kind: DisconnectKind::NetworkLost,
+        };
         assert!(
             matches!(terminal_if_auth(auth.clone()), Some(failure) if !failure.recoverable),
             "an auth failure must be returned as terminal"
