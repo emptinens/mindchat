@@ -321,6 +321,13 @@ locally is forbidden.
 
 ## 6. Release 0.1.8: Network and build hardening
 
+> **Status: SHIPPED in `v0.1.8` (2026-08-15).** Implementation notes below
+> stay as the historical plan; deltas are recorded in `CHANGELOG.md`.
+> Known deferrals: P1-2 DNS-over-HTTPS (h2 not in the offline cargo
+> cache); release-APK device smoke, `.so` strings gate, reconnect live
+> timing and proxy real-device flow run in CI/device passes (no local
+> NDK/emulator).
+
 Character: zero-log purge, network robustness, proxy, R8 release build,
 diagnostics contract. FFI additive only.
 

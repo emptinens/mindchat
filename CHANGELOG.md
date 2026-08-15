@@ -25,6 +25,64 @@ the roadmap cleanup commit; their content lives in git history.
   removed; README rewritten; CONTRIBUTING extended with security invariants
   and the native build; vendor patch rationale added to `Cargo.toml`.
 
+## [0.1.8] - 2026-08-15
+
+### Added
+
+- Zero-log purge: raw-stanza capture path deleted from the vendored
+  `tokio-xmpp` (the only code able to serialize message bodies), 72
+  `log::` sites and 6 example binaries removed, live tests made silent,
+  and a compile-time kill switch (direct `log`/`tracing` deps with
+  `max_level_off` + `release_max_level_off`) that compiles every
+  transitive log macro to nothing. `scripts/check-zero-log.sh` (grep gate
+  + `.so` strings check) and a CI job enforce it.
+- Network robustness: jittered, budgeted reconnect with XEP-0198 stream
+  resume (full jitter, 1s doubling to 30s, 5-min budget, seeded PRNG);
+  `auto_reconnect` per account (user disconnect stays immediate); idle
+  watchdog + XEP-0199 keep-alive bounding stale-Online to ~3 minutes;
+  resolution quality (all addresses capped at 4/port, SRV sorted by
+  priority then weight, worker-cached resolver, Happy Eyeballs-lite v4/v6
+  race); event batching (4x128, cap 512/cycle) and flush tuning
+  (4s/16, worst-case lock ~14s).
+- Proxy support: hand-written SOCKS5 (RFC 1928/1929) and HTTP CONNECT
+  clients (no new dependencies), DNS resolved only at the proxy (SRV
+  skipped, no local leaks), credentials runtime-only and never persisted,
+  TLS unchanged against the real hostname via the vendored
+  PreconnectedServerConnector. Additive FFI: `FfiProxyKind`,
+  `FfiProxyConfig`, `FfiProxyProbe`, `setAccountProxies`,
+  `accountProxies`, `testProxy`, `connectAccountWithProxy` (158→178
+  signatures). UI: Connection settings with proxy library
+  (add/edit/delete/ping, latency chip), per-account assignment, masked
+  password fields, AES-256-GCM keystore-backed credential store.
+- Release build: R8 minification + resource shrinking (DEX 22.8MB raw →
+  3.18MB), ABI splits (arm64-v8a, armeabi-v7a, x86_64; JNA legacy ABIs
+  gone), staged `llvm-strip`, `scripts/verify-release.sh` (size budgets,
+  v2 signature, keep-rule audit, symbol counts, sha256sums), secret-driven
+  signing with debug-cert fallback, `release.yml` workflow with per-ABI
+  artifacts and an emulator smoke job.
+- Diagnostics contract: `FfiDisconnectKind` classification
+  (AuthenticationFailed / ServerRefused / NetworkLost / Cancelled /
+  Unknown) with 100% variant coverage, kind-aware bucket labels
+  (terminal / configuration / retryable / internal) above display-only
+  prose, one-time dismissible quarantine notice, and an opt-in
+  user-triggered `FfiDiagnosticsReport` export via `ACTION_CREATE_DOCUMENT`
+  (structurally redacted: no passwords, bodies or avatars; redaction
+  tests).
+
+### Changed
+
+- Poll loop drains up to 512 events/cycle; `FLUSH_SEND_TIMEOUT` 10s→4s,
+  `FLUSH_OUTBOX_MAX_BATCH` 32→16.
+- DNS-over-HTTPS (P1-2) deferred: `h2` is not in the offline cargo cache;
+  re-evaluated when the cache allows.
+
+### Fixed
+
+- Mid-session loss was terminal (worker broke on `Disconnected`, vendored
+  reconnector never ran); stale "Online" could persist up to ~10 minutes;
+  both bounded now.
+- Version bumped to 8 / 0.1.8.
+
 ## [0.1.7] - 2026-08-15
 
 ### Added
@@ -169,7 +227,8 @@ the roadmap cleanup commit; their content lives in git history.
 Foundational commits (Android app shell, Rust core, UniFFI boundary,
 extension policy, roster projections). No tagged releases.
 
-[Unreleased]: https://github.com/emptinens/mindchat/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/emptinens/mindchat/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/emptinens/mindchat/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/emptinens/mindchat/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/emptinens/mindchat/compare/v0.1.4...v0.1.6
 [0.1.4]: https://github.com/emptinens/mindchat/compare/v0.1.3...v0.1.4
