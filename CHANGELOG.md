@@ -10,6 +10,11 @@ the roadmap cleanup commit; their content lives in git history.
 
 ## [Unreleased]
 
+### Fixed
+
+- Post-release `check-zero-log.sh` accepts `--so-dir DIR` in addition to the
+  existing `--so-dir=DIR` form.
+
 ### Added
 
 - `ROADMAP.md`: four-release plan (0.1.7 through 0.2.0) synthesized from 20

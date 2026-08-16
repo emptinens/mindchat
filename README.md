@@ -91,9 +91,8 @@ for the full developer procedure, including the opt-in live test suites.
 
 ## Roadmap
 
-Current release: 0.1.6. The plan for 0.1.7 through 0.2.0 (customization and
-QoL polish, network and build hardening, security and privacy, donations and
-release engineering) lives in [ROADMAP.md](ROADMAP.md).
+Current release: 0.1.8. The plan for 0.1.9 through 0.2.0 (security and
+privacy, then release engineering) lives in [ROADMAP.md](ROADMAP.md).
 
 ## Contributing
 

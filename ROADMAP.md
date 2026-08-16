@@ -5,7 +5,7 @@ This document is the single source of truth for MindChat's direction from
 into this roadmap, `CHANGELOG.md`, `CONTRIBUTING.md`, and the code itself.
 Git history preserves everything that was removed.
 
-- Current release: **0.1.6** (`v0.1.6`, versionCode 6)
+- Current release: **0.1.8** (`v0.1.8`, versionCode 8)
 - Target: **0.2.0**
 - Repository: <https://github.com/emptinens/mindchat>
 
@@ -40,8 +40,8 @@ is short and non-negotiable:
 
 | Item | Value | File |
 | --- | --- | --- |
-| Android versionName | `0.1.6` (bump per release) | `app/build.gradle.kts` |
-| Android versionCode | `6` (monotonic) | `app/build.gradle.kts` |
+| Android versionName | `0.1.8` (bump per release) | `app/build.gradle.kts` |
+| Android versionCode | `8` (monotonic) | `app/build.gradle.kts` |
 | Rust crate version | `0.1.4` (**drifted; re-sync at 0.2.0**) | `crates/mindchat-core/Cargo.toml` |
 | App ID | `com.mindchat.app` | `app/build.gradle.kts` |
 | Min / target SDK | 26 / 36 | `app/build.gradle.kts` |
@@ -524,6 +524,12 @@ Character: storage encryption, transport hardening, credential vault,
 OMEMO, privacy controls. FFI additive only. Phase A (storage, transport,
 credentials) precedes Phase B (OMEMO, privacy controls).
 
+> **Status: IN PROGRESS.** The release starts with the transport-security
+> vertical slice: remove anonymous SASL fallback from credentialed accounts,
+> then classify TLS certificate-validation failures as terminal typed errors.
+> Storage encryption and credential-vault work follow only after these two
+> transport invariants are covered by tests.
+
 ### 7.1 Storage encryption (phase A, blocks OMEMO) (`persistence.rs`, `ffi.rs`, `StateKeyManager.kt`)
 
 - **Decision: ring AEAD sealed envelope.** `ring 0.17.14` and `zeroize
@@ -792,10 +798,13 @@ One atomic commit migrated the previous documentation set:
 ## 11. Current status
 
 Delivered and verified: 0.1.5 (registration, management, profiles, M3E
-theme; 64/64 tests) and 0.1.6 (floating M3E dock, detailed settings,
-snapshot diffing ~53µs/poll, reaction mapping O(m+n); 70/70 tests, 8
-suites). Release APK `mindchat-0.1.6.apk` (38.6MB, debug-signed,
-SHA-256 `a26d5a18…`) shipped as tag `v0.1.6`.
+theme; 64/64 tests), 0.1.6 (floating M3E dock, detailed settings,
+snapshot diffing ~53µs/poll, reaction mapping O(m+n)), 0.1.7 (appearance,
+settings architecture, motion, gateway policy/mapping and FFI stability),
+and 0.1.8 (zero-log enforcement, reconnect/resume/watchdog, resolution,
+proxy support, release shrinking and typed diagnostics). Release `v0.1.8`
+uses versionCode 8; the latest post-release fix is the space-form
+`--so-dir DIR` handling in `scripts/check-zero-log.sh`.
 
 Known limitations (real gaps, not regressions):
 
@@ -810,9 +819,11 @@ Known limitations (real gaps, not regressions):
 - **`ConversationUi.encrypted` is a stub** (always false) until 0.1.9
   fills it from FFI.
 - **`attach()` is unexported** and deliberately out of 0.1.7-0.2.0.
-- **Mid-session network loss requires manual reconnect** (0.1.8 fixes);
-  **stale Online can reach ~10 minutes** (0.1.8 fixes); **state file is
-  plaintext JSON** (0.1.9 fixes).
+- **State file is plaintext JSON** until the 0.1.9 storage-encryption slice
+  lands.
+- **TLS certificate failures and credentialed anonymous fallback** are the
+  first 0.1.9 transport-security gaps; both are being addressed before
+  storage encryption or OMEMO.
 - **Release signing uses the debug certificate** until the 0.1.8/0.1.9
   secret-driven pipeline lands.
 
