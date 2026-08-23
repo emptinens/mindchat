@@ -28,8 +28,7 @@ behind a single generated FFI boundary.
   beyond the XMPP connection you configure.
 
 In development, in priority order: OMEMO encryption first, then MUC group
-chats, MAM history sync, and UnifiedPush push. A plugin runtime is planned
-after 0.2.0. See [ROADMAP.md](ROADMAP.md).
+chats, MAM history sync, and UnifiedPush push. See [ROADMAP.md](ROADMAP.md).
 
 ## Privacy by design
 
