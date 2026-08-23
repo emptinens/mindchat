@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub mod extension;
 pub mod persistence;
 pub mod proxy;
 pub mod transport;
@@ -27,11 +26,6 @@ pub mod ffi;
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
-pub use extension::{
-    EXTENSION_API_VERSION, ExtensionCommandError, ExtensionEvent, ExtensionManifest,
-    ExtensionManifestError, ExtensionPermission, ExtensionPolicy, ExtensionPolicyError,
-    required_permission,
-};
 pub use transport::{
     ConnectionRequest, OutgoingMessage, SecretString, TransportError, TransportEvent, XmppTransport,
 };
@@ -321,10 +315,7 @@ pub enum CoreEvent {
     MessageChanged(MessageId),
 }
 
-/// Operations available to first-party UI and the controlled extension/automation boundary.
-///
-/// The base app does not execute third-party commands. Keeping the vocabulary
-/// internal now makes its later permission model explicit and auditable.
+/// Operations available to the first-party UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CoreCommand {
     SendText { conversation_id: ConversationId, body: String, in_reply_to: Option<MessageId> },
@@ -819,42 +810,6 @@ impl MindChatCore {
         }
     }
 
-    /// Executes a permissioned extension command as the owning local account.
-    ///
-    /// The extension supplies neither a sender identity nor raw transport data.
-    /// Its manifest policy is checked before mutation, and message/reaction
-    /// attribution always uses the JID of the account that owns the target
-    /// conversation.
-    pub fn execute_extension_command(
-        &mut self,
-        policy: &ExtensionPolicy,
-        command: CoreCommand,
-        now_epoch_ms: u64,
-    ) -> Result<Option<MessageId>, ExtensionCommandError> {
-        policy.authorize_command(&command)?;
-        match command {
-            CoreCommand::SendText { conversation_id, body, in_reply_to } => {
-                let sender = self.local_sender_for_conversation(conversation_id)?;
-                self.send_text(conversation_id, sender, body, in_reply_to, now_epoch_ms)
-                    .map(Some)
-                    .map_err(Into::into)
-            }
-            CoreCommand::MarkConversationRead { conversation_id } => {
-                self.mark_conversation_read(conversation_id)?;
-                Ok(None)
-            }
-            CoreCommand::AddReaction { message_id, emoji } => {
-                let conversation_id = self
-                    .messages
-                    .get(&message_id)
-                    .ok_or(CoreError::UnknownMessage(message_id))?
-                    .conversation_id;
-                let actor = self.local_sender_for_conversation(conversation_id)?;
-                self.add_reaction(message_id, actor, emoji).map(|_| None).map_err(Into::into)
-            }
-        }
-    }
-
     /// Adds an outgoing text message to the pending queue projection.
     pub fn send_text(
         &mut self,
@@ -1319,20 +1274,6 @@ impl MindChatCore {
             id
         };
         self.receive_text(conversation_id, sender, body, received_at_epoch_ms).map(Some)
-    }
-
-    fn local_sender_for_conversation(
-        &self,
-        conversation_id: ConversationId,
-    ) -> Result<String, CoreError> {
-        let conversation = self
-            .conversations
-            .get(&conversation_id)
-            .ok_or(CoreError::UnknownConversation(conversation_id))?;
-        self.accounts
-            .get(&conversation.account_id)
-            .map(|account| account.jid.clone())
-            .ok_or(CoreError::UnknownAccount(conversation.account_id))
     }
 
     fn ensure_conversation_capability(
@@ -2159,101 +2100,6 @@ mod tests {
         assert_eq!(queued[0].in_reply_to, Some(first));
         assert_eq!(restored.pending_outgoing_messages(bob).expect("mila outbox").len(), 1);
         assert_eq!(restored.pending_outgoing_messages(99), Err(CoreError::UnknownAccount(99)));
-    }
-
-    #[test]
-    fn extension_commands_are_permissioned_and_attributed_to_the_owning_account() {
-        let mut core = MindChatCore::default();
-        let account_id = account(&mut core);
-        let conversation_id = core
-            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
-            .expect("conversation");
-        let denied_policy = ExtensionPolicy::new(
-            ExtensionManifest::new(
-                "org.mindchat.read-marker",
-                "Read marker",
-                "1.0.0",
-                [ExtensionPermission::SendMessages],
-            ),
-            [],
-        )
-        .expect("manifest");
-
-        assert_eq!(
-            core.execute_extension_command(
-                &denied_policy,
-                CoreCommand::SendText {
-                    conversation_id,
-                    body: "blocked".to_owned(),
-                    in_reply_to: None,
-                },
-                2,
-            ),
-            Err(ExtensionCommandError::PermissionDenied {
-                extension_id: "org.mindchat.read-marker".to_owned(),
-                permission: ExtensionPermission::SendMessages,
-            })
-        );
-        assert!(core.messages(conversation_id).is_empty());
-
-        let allowed_policy = ExtensionPolicy::new(
-            ExtensionManifest::new(
-                "org.mindchat.quick-replies",
-                "Quick replies",
-                "1.0.0",
-                [ExtensionPermission::SendMessages],
-            ),
-            [ExtensionPermission::SendMessages],
-        )
-        .expect("manifest");
-        let message_id = core
-            .execute_extension_command(
-                &allowed_policy,
-                CoreCommand::SendText {
-                    conversation_id,
-                    body: "hello from an extension".to_owned(),
-                    in_reply_to: None,
-                },
-                3,
-            )
-            .expect("command")
-            .expect("message id");
-
-        assert_eq!(core.messages(conversation_id)[0].id, message_id);
-        assert_eq!(core.messages(conversation_id)[0].sender, "alice@example.org");
-    }
-
-    #[test]
-    fn extension_commands_still_obey_server_capability_gates() {
-        let mut core = MindChatCore::default();
-        let account_id = account(&mut core);
-        let conversation_id = core
-            .open_conversation(account_id, ConversationKind::Direct, "bob@example.org", "Bob", 1)
-            .expect("conversation");
-        let message_id = core
-            .send_text(conversation_id, "alice@example.org", "hello", None, 2)
-            .expect("message");
-        let policy = ExtensionPolicy::new(
-            ExtensionManifest::new(
-                "org.mindchat.reactor",
-                "Reactor",
-                "1.0.0",
-                [ExtensionPermission::AddReactions],
-            ),
-            [ExtensionPermission::AddReactions],
-        )
-        .expect("manifest");
-
-        assert_eq!(
-            core.execute_extension_command(
-                &policy,
-                CoreCommand::AddReaction { message_id, emoji: "👍".to_owned() },
-                3,
-            ),
-            Err(ExtensionCommandError::Core(CoreError::CapabilityUnavailable(
-                ProtocolCapability::MessageReactions,
-            )))
-        );
     }
 
     #[test]
