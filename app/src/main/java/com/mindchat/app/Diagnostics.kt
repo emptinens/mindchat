@@ -60,6 +60,7 @@ internal enum class DisconnectBucket {
  */
 internal fun disconnectBucket(kind: FfiDisconnectKind): DisconnectBucket = when (kind) {
     FfiDisconnectKind.AUTHENTICATION_FAILED -> DisconnectBucket.TERMINAL
+    FfiDisconnectKind.TLS_VERIFICATION_FAILED -> DisconnectBucket.TERMINAL
     FfiDisconnectKind.SERVER_REFUSED -> DisconnectBucket.CONFIGURATION
     FfiDisconnectKind.NETWORK_LOST -> DisconnectBucket.RETRYABLE
     FfiDisconnectKind.CANCELLED -> DisconnectBucket.NEUTRAL
@@ -72,12 +73,13 @@ internal fun disconnectBucket(kind: FfiDisconnectKind): DisconnectBucket = when 
  * Returns `null` for [DisconnectBucket.NEUTRAL] so a user-initiated
  * disconnect never surfaces as an error.
  */
-internal fun disconnectLabelRes(kind: FfiDisconnectKind): Int? = when (disconnectBucket(kind)) {
-    DisconnectBucket.TERMINAL -> R.string.disconnect_kind_authentication_failed
-    DisconnectBucket.CONFIGURATION -> R.string.disconnect_kind_server_refused
-    DisconnectBucket.RETRYABLE -> R.string.disconnect_kind_network_lost
-    DisconnectBucket.INTERNAL_PERSISTENCE -> R.string.disconnect_kind_unknown
-    DisconnectBucket.NEUTRAL -> null
+internal fun disconnectLabelRes(kind: FfiDisconnectKind): Int? = when (kind) {
+    FfiDisconnectKind.AUTHENTICATION_FAILED -> R.string.disconnect_kind_authentication_failed
+    FfiDisconnectKind.TLS_VERIFICATION_FAILED -> R.string.disconnect_kind_tls_verification_failed
+    FfiDisconnectKind.SERVER_REFUSED -> R.string.disconnect_kind_server_refused
+    FfiDisconnectKind.NETWORK_LOST -> R.string.disconnect_kind_network_lost
+    FfiDisconnectKind.UNKNOWN -> R.string.disconnect_kind_unknown
+    FfiDisconnectKind.CANCELLED -> null
 }
 
 /**

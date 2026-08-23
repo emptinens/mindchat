@@ -99,6 +99,8 @@ impl From<FfiConnectionState> for ConnectionState {
 pub enum FfiDisconnectKind {
     /// The server rejected the credentials (SASL failure).
     AuthenticationFailed,
+    /// TLS certificate validation failed (invalid, expired, unknown CA, hostname mismatch).
+    TlsVerificationFailed,
     /// The server refused the stream or session (for example a stream error).
     ServerRefused,
     /// The link was lost: timeout, EOF, suspended stream, or reconnect budget
@@ -114,6 +116,7 @@ impl From<DisconnectKind> for FfiDisconnectKind {
     fn from(value: DisconnectKind) -> Self {
         match value {
             DisconnectKind::AuthenticationFailed => Self::AuthenticationFailed,
+            DisconnectKind::TlsVerificationFailed => Self::TlsVerificationFailed,
             DisconnectKind::ServerRefused => Self::ServerRefused,
             DisconnectKind::NetworkLost => Self::NetworkLost,
             DisconnectKind::Cancelled => Self::Cancelled,
@@ -126,6 +129,7 @@ impl From<FfiDisconnectKind> for DisconnectKind {
     fn from(value: FfiDisconnectKind) -> Self {
         match value {
             FfiDisconnectKind::AuthenticationFailed => Self::AuthenticationFailed,
+            FfiDisconnectKind::TlsVerificationFailed => Self::TlsVerificationFailed,
             FfiDisconnectKind::ServerRefused => Self::ServerRefused,
             FfiDisconnectKind::NetworkLost => Self::NetworkLost,
             FfiDisconnectKind::Cancelled => Self::Cancelled,
@@ -584,6 +588,7 @@ impl From<TransportError> for MindChatBindingError {
     fn from(value: TransportError) -> Self {
         match value {
             TransportError::AuthenticationFailed => Self::AuthenticationFailed,
+            TransportError::TlsVerification(detail) => Self::ConnectionFailed { detail },
             TransportError::ConnectionFailed(detail) => Self::ConnectionFailed { detail },
             TransportError::ProtocolViolation(detail) => Self::InvalidInput { detail },
             TransportError::Unsupported(detail) => Self::Internal { detail },
@@ -1867,6 +1872,7 @@ mod tests {
     fn ffi_disconnect_kind_maps_all_variants_both_ways() {
         let domain = [
             DisconnectKind::AuthenticationFailed,
+            DisconnectKind::TlsVerificationFailed,
             DisconnectKind::ServerRefused,
             DisconnectKind::NetworkLost,
             DisconnectKind::Cancelled,
@@ -1874,6 +1880,7 @@ mod tests {
         ];
         let ffi = [
             FfiDisconnectKind::AuthenticationFailed,
+            FfiDisconnectKind::TlsVerificationFailed,
             FfiDisconnectKind::ServerRefused,
             FfiDisconnectKind::NetworkLost,
             FfiDisconnectKind::Cancelled,

@@ -1021,6 +1021,10 @@ async fn run_registration(request: RegisterRequest) -> Result<(), TransportError
             .await
         {
             Ok(()) => return Ok(()),
+            Err(RegistrationAttemptError::TlsVerification(detail)) => {
+                // TLS verification failed: fail fast without trying remaining candidates.
+                return Err(TransportError::TlsVerification(detail));
+            }
             Err(RegistrationAttemptError::Protocol(detail)) => {
                 // The server decided (refused, requires a form, or the
                 // username is taken); retrying another candidate cannot help.
@@ -1036,6 +1040,8 @@ async fn run_registration(request: RegisterRequest) -> Result<(), TransportError
 
 /// A failure within one registration candidate attempt.
 enum RegistrationAttemptError {
+    /// TLS certificate verification failure (fail fast).
+    TlsVerification(String),
     /// Transport-level failure (DNS, TCP, TLS, stream setup). Another
     /// candidate may still succeed.
     Connection(String),
@@ -1076,10 +1082,17 @@ async fn registration_attempt<C: ServerConnector>(
     jid: &Jid,
     connector: C,
 ) -> Result<(), RegistrationAttemptError> {
-    let (pending, _channel_binding) = connector
-        .connect(jid, ns::JABBER_CLIENT, STREAM_TIMEOUTS)
-        .await
-        .map_err(|error| RegistrationAttemptError::Connection(error.to_string()))?;
+    let (pending, _channel_binding) =
+        connector.connect(jid, ns::JABBER_CLIENT, STREAM_TIMEOUTS).await.map_err(|error| {
+            if is_tls_verification_error(&error) {
+                RegistrationAttemptError::TlsVerification(format!(
+                    "TLS certificate verification failed for {}: {error}",
+                    jid.domain()
+                ))
+            } else {
+                RegistrationAttemptError::Connection(error.to_string())
+            }
+        })?;
     let (features, mut stream) = pending
         .recv_features::<FallibleStreamElement>()
         .await
@@ -1260,6 +1273,16 @@ fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
     )
 }
 
+/// True when the error represents a TLS certificate verification failure.
+///
+/// TLS certificate validation failures (invalid, expired, untrusted CA, domain mismatch)
+/// are terminal like authentication failures: retrying the same server endpoint cannot
+/// succeed and retrying indefinitely would leave the UI in connecting loops.
+#[must_use]
+fn is_tls_verification_error(error: &tokio_xmpp::Error) -> bool {
+    error.is_tls_verification_error()
+}
+
 /// Classifies a typed transport failure into the diagnostics disconnect kind
 /// (ROADMAP 6.5).
 ///
@@ -1268,6 +1291,7 @@ fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
 /// strings (for example the connect failure detail) stay display-only.
 /// Mapping:
 ///
+/// - TLS certificate failure → [`DisconnectKind::TlsVerificationFailed`];
 /// - SASL failure → [`DisconnectKind::AuthenticationFailed`];
 /// - server stream error (the server ends the stream with `<stream:error>`)
 ///   → [`DisconnectKind::ServerRefused`];
@@ -1276,6 +1300,9 @@ fn is_auth_error(error: &tokio_xmpp::Error) -> bool {
 /// - anything else (JID/protocol/format/state) → [`DisconnectKind::Unknown`].
 #[must_use]
 fn classify_disconnect(error: &tokio_xmpp::Error) -> DisconnectKind {
+    if is_tls_verification_error(error) {
+        return DisconnectKind::TlsVerificationFailed;
+    }
     match error {
         tokio_xmpp::Error::Auth(_) => DisconnectKind::AuthenticationFailed,
         tokio_xmpp::Error::StreamError(_) => DisconnectKind::ServerRefused,
@@ -1286,7 +1313,8 @@ fn classify_disconnect(error: &tokio_xmpp::Error) -> DisconnectKind {
         | tokio_xmpp::Error::DnsProto(_)
         | tokio_xmpp::Error::DnsNet(_)
         | tokio_xmpp::Error::Idna
-        | tokio_xmpp::Error::ReconnectBudgetExhausted => DisconnectKind::NetworkLost,
+        | tokio_xmpp::Error::ReconnectBudgetExhausted
+        | tokio_xmpp::Error::Tls(_) => DisconnectKind::NetworkLost,
         tokio_xmpp::Error::JidParse(_)
         | tokio_xmpp::Error::Protocol(_)
         | tokio_xmpp::Error::InvalidState
@@ -1298,15 +1326,15 @@ fn classify_disconnect(error: &tokio_xmpp::Error) -> DisconnectKind {
 /// Maps the first client event to a terminal connect failure, if it is one.
 ///
 /// The only terminal first event is `Disconnected`; it carries the precise
-/// reason (for example a rejected SASL exchange) and its recoverability. This
-/// is the single place that replaces the old authentication preflight's
-/// detection of rejected credentials.
+/// reason (for example a rejected SASL exchange or TLS certificate failure) and
+/// its recoverability. This is the single place that replaces the old
+/// authentication preflight's detection of rejected credentials.
 #[must_use]
 fn terminal_failure_for_event(event: &TokioXmppEvent) -> Option<ConnectFailure> {
     match event {
         TokioXmppEvent::Disconnected(error) => Some(ConnectFailure {
             detail: error.to_string(),
-            recoverable: !is_auth_error(error),
+            recoverable: disconnected_is_recoverable(error),
             kind: classify_disconnect(error),
         }),
         _ => None,
@@ -1322,12 +1350,12 @@ async fn send_stanza_bounded(client: &mut Client, stanza: Stanza) {
 }
 
 /// Recoverability of a mid-session disconnect, mirroring the connect path:
-/// only a hard authentication failure (for example rejected credentials) is
-/// non-recoverable; a transient `TemporaryAuthFailure` or any network/IO
+/// only a hard authentication failure or TLS certificate validation failure
+/// is non-recoverable; a transient `TemporaryAuthFailure` or any network/IO
 /// failure keeps the account retryable.
 #[must_use]
 fn disconnected_is_recoverable(error: &tokio_xmpp::Error) -> bool {
-    !is_auth_error(error)
+    !is_auth_error(error) && !is_tls_verification_error(error)
 }
 
 /// What the worker loop should do after handling one client event.
@@ -2300,6 +2328,24 @@ mod tests {
                 )),
                 DisconnectKind::AuthenticationFailed,
             ),
+            // TLS certificate validation failure → TlsVerificationFailed.
+            (
+                tokio_xmpp::Error::Tls(tokio_xmpp::connect::tls_common::TlsConnectorError::Tls(
+                    tokio_xmpp::connect::tls_common::rustls::Error::InvalidCertificate(
+                        tokio_xmpp::connect::tls_common::rustls::CertificateError::Expired,
+                    ),
+                )),
+                DisconnectKind::TlsVerificationFailed,
+            ),
+            // Non-cert TLS failure (e.g. transient alert/general) → NetworkLost.
+            (
+                tokio_xmpp::Error::Tls(tokio_xmpp::connect::tls_common::TlsConnectorError::Tls(
+                    tokio_xmpp::connect::tls_common::rustls::Error::General(
+                        "handshake alert".to_owned(),
+                    ),
+                )),
+                DisconnectKind::NetworkLost,
+            ),
             // Server stream error (the server ends the stream with a
             // <stream:error>) → ServerRefused.
             (
@@ -2341,6 +2387,7 @@ mod tests {
             covered,
             std::collections::BTreeSet::from([
                 DisconnectKind::AuthenticationFailed,
+                DisconnectKind::TlsVerificationFailed,
                 DisconnectKind::ServerRefused,
                 DisconnectKind::NetworkLost,
                 DisconnectKind::Unknown,
@@ -2353,6 +2400,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_failure_for_event_marks_tls_verification_non_recoverable() {
+        let tls_err =
+            tokio_xmpp::Error::Tls(tokio_xmpp::connect::tls_common::TlsConnectorError::Tls(
+                tokio_xmpp::connect::tls_common::rustls::Error::InvalidCertificate(
+                    tokio_xmpp::connect::tls_common::rustls::CertificateError::UnknownIssuer,
+                ),
+            ));
+        let failure = terminal_failure_for_event(&TokioXmppEvent::Disconnected(tls_err))
+            .expect("a disconnected first event is a terminal failure");
+        assert!(!failure.recoverable, "TLS certificate failure must be non-recoverable");
+        assert_eq!(
+            failure.kind,
+            DisconnectKind::TlsVerificationFailed,
+            "invalid cert must classify as TlsVerificationFailed"
+        );
+    }
+
     /// Cancelled is a coordinator-side classification (explicit user
     /// disconnect) and is not produced from a transport failure; the FFI
     /// mapping test in `ffi.rs` covers its variant. This test pins the
@@ -2361,6 +2426,7 @@ mod tests {
     fn disconnect_kind_variant_set_is_stable() {
         let all = [
             DisconnectKind::AuthenticationFailed,
+            DisconnectKind::TlsVerificationFailed,
             DisconnectKind::ServerRefused,
             DisconnectKind::NetworkLost,
             DisconnectKind::Cancelled,

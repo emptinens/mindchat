@@ -15,8 +15,20 @@ the roadmap cleanup commit; their content lives in git history.
 - Post-release `check-zero-log.sh` accepts `--so-dir DIR` in addition to the
   existing `--so-dir=DIR` form.
 
+### Security
+
+- Transport hardening (0.1.9 T1): Classified TLS certificate validation
+  failures (expired, unknown issuer, wrong domain name) as terminal,
+  non-recoverable errors across the Rust core and UniFFI boundary
+  (`DisconnectKind::TlsVerificationFailed` / `FfiDisconnectKind.TLS_VERIFICATION_FAILED`).
+  Stops infinite retry loops on untrusted certificates and fails fast on candidate
+  handshakes and in-band registration.
+
 ### Added
 
+- UI localization: `disconnect_kind_tls_verification_failed` in English
+  ("Certificate verification failed") and Russian ("Ошибка проверки сертификата"),
+  mapped to the `TERMINAL` disconnect bucket.
 - `ROADMAP.md`: four-release plan (0.1.7 through 0.2.0) synthesized from 20
   domain advisor reports: customization and QoL polish (0.1.7), network and
   release-build hardening with a zero-log purge (0.1.8), storage encryption,

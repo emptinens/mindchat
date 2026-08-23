@@ -201,6 +201,7 @@
     <string name="proxy_no_library">Прокси пока нет. Добавьте их в настройках.</string>
     <!-- Диагностика 0.1.8 (ROADMAP 6.5) -->
     <string name="disconnect_kind_authentication_failed">Ошибка аутентификации</string>
+    <string name="disconnect_kind_tls_verification_failed">Ошибка проверки сертификата</string>
     <string name="disconnect_kind_server_refused">Сервер отклонил подключение</string>
     <string name="disconnect_kind_network_lost">Соединение потеряно</string>
     <string name="disconnect_kind_unknown">Внутренняя проблема</string>

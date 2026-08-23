@@ -24,6 +24,7 @@ class DiagnosticsTest {
     fun disconnectBucket_coversEveryVariant() {
         val expected = mapOf(
             FfiDisconnectKind.AUTHENTICATION_FAILED to DisconnectBucket.TERMINAL,
+            FfiDisconnectKind.TLS_VERIFICATION_FAILED to DisconnectBucket.TERMINAL,
             FfiDisconnectKind.SERVER_REFUSED to DisconnectBucket.CONFIGURATION,
             FfiDisconnectKind.NETWORK_LOST to DisconnectBucket.RETRYABLE,
             FfiDisconnectKind.CANCELLED to DisconnectBucket.NEUTRAL,
@@ -40,6 +41,7 @@ class DiagnosticsTest {
     fun disconnectLabelRes_coversEveryVariant() {
         val expected = mapOf(
             FfiDisconnectKind.AUTHENTICATION_FAILED to R.string.disconnect_kind_authentication_failed,
+            FfiDisconnectKind.TLS_VERIFICATION_FAILED to R.string.disconnect_kind_tls_verification_failed,
             FfiDisconnectKind.SERVER_REFUSED to R.string.disconnect_kind_server_refused,
             FfiDisconnectKind.NETWORK_LOST to R.string.disconnect_kind_network_lost,
             FfiDisconnectKind.UNKNOWN to R.string.disconnect_kind_unknown,

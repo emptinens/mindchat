@@ -62,12 +62,30 @@ pub enum Error {
     #[error("{0}")]
     StreamError(ReceivedStreamError),
 
+    #[cfg(any(feature = "direct-tls", feature = "starttls"))]
+    /// TLS error
+    #[error("TLS error: {0}")]
+    Tls(#[from] crate::connect::tls_common::TlsConnectorError),
+
     /// MindChat patch: the jittered reconnect loop exhausted its total retry
     /// budget (~5 minutes) without re-establishing the stream. The stream is
     /// still considered recoverable (a later manual connect can succeed), but
     /// this worker will not retry again on its own.
     #[error("reconnect attempts exceeded the retry budget")]
     ReconnectBudgetExhausted,
+}
+
+impl Error {
+    /// True when this error represents a TLS certificate verification failure
+    /// (invalid/expired certificate, untrusted issuer, wrong domain name).
+    #[must_use]
+    pub fn is_tls_verification_error(&self) -> bool {
+        #[cfg(any(feature = "direct-tls", feature = "starttls"))]
+        if let Self::Tls(tls_err) = self {
+            return tls_err.is_tls_verification_error();
+        }
+        false
+    }
 }
 
 impl<T: ServerConnectorError + 'static> From<T> for Error {

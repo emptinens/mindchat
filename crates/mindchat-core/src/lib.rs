@@ -95,6 +95,8 @@ pub enum ConnectionState {
 pub enum DisconnectKind {
     /// The server rejected the credentials (SASL failure).
     AuthenticationFailed,
+    /// TLS certificate validation failed (invalid, expired, unknown CA, hostname mismatch).
+    TlsVerificationFailed,
     /// The server refused the stream or session (for example a stream error).
     ServerRefused,
     /// The link was lost: timeout, EOF, suspended stream, or reconnect budget

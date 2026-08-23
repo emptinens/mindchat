@@ -58,7 +58,7 @@ pub use tokio_native_tls::TlsStream;
 #[cfg(feature = "native-tls")]
 use {native_tls::TlsConnector as NativeTlsConnector, tokio_native_tls::TlsConnector};
 
-use crate::{connect::ServerConnectorError, error::Error};
+use crate::error::Error;
 use sasl::common::ChannelBinding;
 
 /// Common TLS error type used by both direct_tls and starttls
@@ -74,8 +74,6 @@ pub enum TlsConnectorError {
     KtlsError(ktls::Error),
 }
 
-impl ServerConnectorError for TlsConnectorError {}
-
 impl fmt::Display for TlsConnectorError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -84,6 +82,28 @@ impl fmt::Display for TlsConnectorError {
             Self::DnsNameError(e) => write!(fmt, "DNS name error: {}", e),
             #[cfg(feature = "ktls")]
             Self::KtlsError(e) => write!(fmt, "Kernel TLS error: {}", e),
+        }
+    }
+}
+
+#[cfg(all(feature = "rustls-any-backend", not(feature = "native-tls")))]
+pub use tokio_rustls::rustls;
+
+impl TlsConnectorError {
+    /// True when this error represents a TLS certificate verification failure
+    /// (invalid/expired certificate, untrusted issuer, wrong domain name).
+    #[must_use]
+    pub fn is_tls_verification_error(&self) -> bool {
+        match self {
+            #[cfg(all(feature = "rustls-any-backend", not(feature = "native-tls")))]
+            Self::Tls(
+                tokio_rustls::rustls::Error::InvalidCertificate(_)
+                | tokio_rustls::rustls::Error::NoCertificatesPresented
+                | tokio_rustls::rustls::Error::UnsupportedNameType,
+            ) => true,
+            #[cfg(feature = "rustls-any-backend")]
+            Self::DnsNameError(_) => true,
+            _ => false,
         }
     }
 }
@@ -113,7 +133,7 @@ pub async fn establish_tls_connection<S: TlsAsyncStream>(
     let tls_stream = TlsConnector::from(NativeTlsConnector::builder().build().unwrap())
         .connect(&domain, stream)
         .await
-        .map_err(|e| TlsConnectorError::Tls(e))?;
+        .map_err(|e| Error::Tls(TlsConnectorError::Tls(e)))?;
     Ok((tls_stream, ChannelBinding::None))
 }
 
@@ -148,10 +168,17 @@ pub async fn establish_tls_connection<S: TlsAsyncStream>(
         ktls::CorkStream::new(stream)
     };
 
-    let tls_stream = TlsConnector::from(Arc::new(config))
-        .connect(domain, stream)
-        .await
-        .map_err(crate::Error::Io)?;
+    let tls_stream = match TlsConnector::from(Arc::new(config)).connect(domain, stream).await {
+        Ok(tls_stream) => tls_stream,
+        Err(io_err) => {
+            if let Some(rustls_err) =
+                io_err.get_ref().and_then(|e| e.downcast_ref::<tokio_rustls::rustls::Error>())
+            {
+                return Err(TlsConnectorError::Tls(rustls_err.clone()).into());
+            }
+            return Err(crate::Error::Io(io_err));
+        }
+    };
 
     // Extract the channel-binding information before we hand the stream over to ktls.
     let (_, connection) = tls_stream.get_ref();

@@ -129,6 +129,7 @@ pub enum TransportEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransportError {
     AuthenticationFailed,
+    TlsVerification(String),
     ConnectionFailed(String),
     ProtocolViolation(String),
     Unsupported(String),
@@ -138,6 +139,7 @@ impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AuthenticationFailed => formatter.write_str("authentication failed"),
+            Self::TlsVerification(detail) => write!(formatter, "TLS verification failed: {detail}"),
             Self::ConnectionFailed(detail) => write!(formatter, "connection failed: {detail}"),
             Self::ProtocolViolation(detail) => write!(formatter, "protocol violation: {detail}"),
             Self::Unsupported(detail) => write!(formatter, "unsupported by transport: {detail}"),
