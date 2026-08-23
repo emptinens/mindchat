@@ -69,9 +69,6 @@ interface MindChatPreferences {
 
     /** Remembers that the user dismissed the quarantine notice. */
     fun writeQuarantineNoticeDismissed(dismissed: Boolean)
-
-}
-    }
 }
 
 // --- 0.1.7 appearance storage keys (stable ASCII, never localized) -----------
