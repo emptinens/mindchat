@@ -32,3 +32,6 @@ app/src/main/jniLibs/
 
 # Scratch screenshots
 .scratch_screen.png
+
+# Private working roadmap (never published)
+/plan.md

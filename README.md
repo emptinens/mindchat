@@ -18,6 +18,8 @@ behind a single generated FFI boundary.
 - XEP-0077 in-band registration where the server supports it.
 - StartTLS and direct TLS, SRV or explicit-host resolution, XEP-0030 service
   discovery.
+- Optional SOCKS5 or HTTP CONNECT proxies, with real connection probes and
+  per-account assignment.
 - Material 3 Expressive adaptive UI with dynamic color and a floating dock.
 - Optional biometric or device-credential app lock.
 - English and Russian, with strict 1:1 string parity.
@@ -25,8 +27,9 @@ behind a single generated FFI boundary.
 - Zero logs, zero analytics, zero crash reporting, zero network traffic
   beyond the XMPP connection you configure.
 
-In development: MUC, MAM, OMEMO, UnifiedPush, plugins. See
-[ROADMAP.md](ROADMAP.md).
+In development, in priority order: OMEMO encryption first, then MUC group
+chats, MAM history sync, and UnifiedPush push. A plugin runtime is planned
+after 0.2.0. See [ROADMAP.md](ROADMAP.md).
 
 ## Privacy by design
 
@@ -41,8 +44,9 @@ permissions requested are the ones the feature set needs (`INTERNET`), and
 backups of app data are disabled.
 
 One honest caveat: the local state file (non-secret message history and
-settings) is not yet encrypted at rest. Storage encryption is planned for
-0.1.9; see [ROADMAP.md](ROADMAP.md).
+settings) is not yet encrypted at rest. Storage encryption is planned;
+sequencing against other security work is under review. See
+[ROADMAP.md](ROADMAP.md).
 
 ## Screenshots
 
@@ -52,15 +56,13 @@ settings) is not yet encrypted at rest. Storage encryption is planned for
 
 ## Install
 
-### F-Droid
-
-An F-Droid listing is in preparation for 0.2.0. The project builds
-reproducibly from source, and F-Droid rebuilds will use its own signing key.
-
 ### APK
 
 Release APKs are attached to GitHub Releases. Locally built APKs are signed
 with the debug certificate; install them only on your own devices.
+
+F-Droid is deferred: no listing is currently targeted. The project builds
+reproducibly from source if that changes.
 
 ## Build from source
 
@@ -93,6 +95,17 @@ for the full developer procedure, including the opt-in live test suites.
 
 Current release: 0.1.8. The plan for 0.1.9 through 0.2.0 (security and
 privacy, then release engineering) lives in [ROADMAP.md](ROADMAP.md).
+
+## Repository structure
+
+- `app/` — the Android app: Kotlin + Jetpack Compose, Material 3 Expressive
+  only.
+- `crates/mindchat-core/` — the Rust domain core: XMPP transport, proxy
+  tunnels, persistence, and the UniFFI `ffi` boundary consumed by Kotlin.
+- `vendor/tokio-xmpp/` — a deliberately patched copy of tokio-xmpp,
+  selected via `[patch.crates-io]`; vendor diffs stay minimal and marked.
+- `scripts/` — native build, binding generation, and verification helpers.
+- `.github/workflows/` — CI for verification and release assembly.
 
 ## Contributing
 
