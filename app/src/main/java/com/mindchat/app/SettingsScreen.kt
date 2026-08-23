@@ -304,10 +304,6 @@ private fun SettingsCategoryScreen(
                         onClick = { onAction(row.action) },
                     )
 
-                    is SettingInfoRowSpec -> SettingsStaticRow(
-                        title = stringResource(row.labelRes),
-                        supportingText = row.supportingRes?.let { stringResource(it) },
-                    )
                 }
             }
         }
@@ -507,9 +503,6 @@ private fun SettingsAccountSettingsScreen(
                 onClick = { showDelete = true },
             )
         }
-        // Per-account toggle slots arrive with 0.1.8: rows for
-        // SettingsSchema keys with scope == PER_ACCOUNT render here via
-        // catalogRows, with zero changes to this screen.
     }
 }
 

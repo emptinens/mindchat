@@ -5,11 +5,9 @@ import java.util.Locale
 /**
  * Shared decision logic behind the [MindChatGateway] contract.
  *
- * Both implementations of the public interface (`NativeMindChatGateway` and
- * `PreviewMindChatGateway`) run exactly the same normalization and validation
- * rules here, so the preview cannot drift from the native behavior: the same
- * validation that guards the FFI registration call also guards the
- * JVM-runnable preview used in debug builds and tests. State-transition and
+ * The same normalization and validation rules run here as at every call site,
+ * so behavior cannot drift between callers: the same validation that guards
+ * the FFI registration call is JVM-testable without a device. State-transition and
  * fallback rules (account selection after deletion, stall thresholds) live in
  * [GatewayPolicy] and snapshot-to-UI mapping in [GatewayMapping].
  *
@@ -78,14 +76,6 @@ internal fun validateRegistration(
 // --- Settings decision logic ------------------------------------------------
 
 /**
- * Resolves the on-disk key for [key]: per-account keys are namespaced under
- * `account_<id>_<storageKey>` (mirroring today's `profile_<id>_<field>`);
- * global keys keep their flat, immutable storage key.
- */
-internal fun settingKeyFor(accountId: Long, key: SettingKey<*>): String =
-    MindChatPreferences.accountKey(accountId, key)
-
-/**
  * Clamps/coerces a raw value to the key's declared type before persisting.
  * Garbage or a wrong type falls back to the key's default, so a store write
  * can never carry a value the schema does not understand.
@@ -93,8 +83,6 @@ internal fun settingKeyFor(accountId: Long, key: SettingKey<*>): String =
 @Suppress("UNCHECKED_CAST")
 internal fun <T> sanitizeSetting(key: SettingKey<T>, raw: T): T = when (key) {
     is BooleanKey -> (raw as? Boolean ?: key.default) as T
-    is StringKey -> (raw as? String ?: key.default) as T
-    is EnumKey<*> -> (if (key.enumClass.isInstance(raw)) raw else key.default) as T
 }
 
 /** True when the two snapshots differ; the fast-path diff for the settings store. */
@@ -131,14 +119,6 @@ internal data class SettingActionRowSpec(
     override val enabled: Boolean = true,
 ) : SettingRowSpec
 
-/** A read-only row. */
-internal data class SettingInfoRowSpec(
-    override val labelRes: Int,
-    override val supportingRes: Int? = null,
-) : SettingRowSpec {
-    override val enabled: Boolean = true
-}
-
 /** Screen-owned flows an action row can trigger. */
 internal enum class SettingRowAction {
     /** Opens the active account's profile editor (Appearance accent row). */
@@ -162,7 +142,7 @@ internal fun catalogRows(
     keys: List<SettingKey<*>> = SettingsSchema.all,
 ): List<SettingRowSpec> {
     val rows = keys
-        .filter { it.category == category && it.scope == SettingScope.GLOBAL }
+        .filter { it.category == category }
         .map { key -> key.toRow(snapshot, appLockAvailable) }
     return when (category) {
         SettingCategory.APPEARANCE -> rows + SettingActionRowSpec(
@@ -192,17 +172,6 @@ private fun SettingKey<*>.toRow(snapshot: SettingsSnapshot, appLockAvailable: Bo
             notImplemented = availability == SettingAvailability.PENDING_CORE,
         )
     }
-
-    // Non-boolean keys arrive with the 0.1.8 core-backed controls; until then
-    // every schema key is a boolean and this branch is unreachable.
-    is StringKey, is EnumKey<*> -> SettingInfoRowSpec(
-        labelRes = labelRes,
-        supportingRes = if (availability == SettingAvailability.PENDING_CORE) {
-            R.string.not_implemented_yet
-        } else {
-            null
-        },
-    )
 }
 
 private fun supportingResFor(key: BooleanKey, appLockAvailable: Boolean): Int? = when (key) {

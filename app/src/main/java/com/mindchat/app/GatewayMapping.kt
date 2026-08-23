@@ -17,10 +17,8 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Shared snapshot-to-UI mapping behind the [MindChatGateway] contract.
  *
- * Both implementations of the public interface (`NativeMindChatGateway` and
- * `PreviewMindChatGateway`) derive UI-visible values from the raw FFI snapshot
- * with exactly the same pure functions here, so the preview cannot drift from
- * the native behavior. [now] and [timestampFormatter] are injected to keep the
+ * The gateway derives UI-visible values from the raw FFI snapshot through the
+ * pure functions here, keeping mapping deterministic and JVM-testable. [now] and [timestampFormatter] are injected to keep the
  * mapping deterministic; the gateway instance feeds wall-clock time and the
  * locale formatter.
  */
@@ -46,7 +44,6 @@ internal fun mapSnapshotToUiState(
     activeAccountId: Long,
     connectingSince: Map<Long, Long>,
     settings: SettingsSnapshot,
-    accountSettings: Map<Long, SettingsSnapshot>,
     appearance: AppearanceProfile = AppearanceProfile(),
     proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     proxyAssignments: Map<Long, String> = emptyMap(),
@@ -160,7 +157,6 @@ internal fun mapSnapshotToUiState(
             messagesByConversation = messagesByConversation,
             profiles = profiles,
             settings = settings,
-            accountSettings = accountSettings,
             appearance = appearance,
             proxyLibrary = proxyLibrary,
             proxyAssignments = proxyAssignments,
@@ -233,8 +229,6 @@ internal fun shouldSkipUiRebuild(
     lastSettings: SettingsSnapshot,
     profiles: Map<Long, AccountProfile>,
     lastProfiles: Map<Long, AccountProfile>,
-    accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
-    lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     appearance: AppearanceProfile = AppearanceProfile(),
     lastAppearance: AppearanceProfile = AppearanceProfile(),
     proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
@@ -252,7 +246,6 @@ internal fun shouldSkipUiRebuild(
     if (activeAccountId != publishedActiveAccountId) return false
     if (settings != lastSettings) return false
     if (profiles != lastProfiles) return false
-    if (accountSettings != lastAccountSettings) return false
     if (appearance != lastAppearance) return false
     if (proxyLibrary != lastProxyLibrary) return false
     if (proxyAssignments != lastProxyAssignments) return false

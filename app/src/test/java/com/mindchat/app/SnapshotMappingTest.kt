@@ -45,7 +45,6 @@ class SnapshotMappingTest {
         activeAccountId: Long = 1L,
         connectingSince: Map<Long, Long> = emptyMap(),
         settings: SettingsSnapshot = SettingsSnapshot(),
-        accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
         appearance: AppearanceProfile = AppearanceProfile(),
         now: Long = 100_000L,
     ) = mapSnapshotToUiState(
@@ -54,7 +53,6 @@ class SnapshotMappingTest {
         activeAccountId = activeAccountId,
         connectingSince = connectingSince,
         settings = settings,
-        accountSettings = accountSettings,
         appearance = appearance,
         now = now,
         timestampFormatter = formatter,
@@ -284,17 +282,6 @@ class SnapshotMappingTest {
     fun appearanceDefaultsFlowIntoTheState() {
         val mapping = map()
         assertEquals(AppearanceProfile(), mapping.state.appearance)
-    }
-
-    @Test
-    fun accountSettingsFlowIntoTheState() {
-        val mapping = map(
-            accountSettings = mapOf(
-                1L to SettingsSnapshot(mapOf(SettingsSchema.appLockEnabled to true)),
-            ),
-        )
-
-        assertEquals(true, mapping.state.accountSettings[1L]?.get(SettingsSchema.appLockEnabled))
     }
 
     // --- Timestamp formatting (P0-2) -----------------------------------------

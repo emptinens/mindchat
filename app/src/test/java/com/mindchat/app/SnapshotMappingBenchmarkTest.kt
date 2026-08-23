@@ -163,7 +163,6 @@ class SnapshotMappingBenchmarkTest {
         activeAccountId = 1L,
         connectingSince = emptyMap(),
         settings = SettingsSnapshot(),
-        accountSettings = emptyMap(),
         appearance = AppearanceProfile(),
         now = 1_000_000L,
         timestampFormatter = ::formatTimestamp,
@@ -178,8 +177,6 @@ class SnapshotMappingBenchmarkTest {
         lastSettings = SettingsSnapshot(),
         profiles = emptyMap(),
         lastProfiles = emptyMap(),
-        accountSettings = emptyMap(),
-        lastAccountSettings = emptyMap(),
         appearance = AppearanceProfile(),
         lastAppearance = AppearanceProfile(),
     )

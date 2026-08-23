@@ -4,7 +4,7 @@ package com.mindchat.app
  * Typed settings schema (0.1.7 settings platform).
  *
  * Every user-facing setting is a first-class [SettingKey] object carrying its
- * type, default, category, scope, storage key, label resources and
+ * type, default, category, storage key, label resources and
  * availability. The UI derives its rows from [SettingsSchema.all] via
  * `GatewayInput.catalogRows`, the store persists by key, and the gateway
  * mutates by key, so adding a setting in 0.1.8 is one new key object plus one
@@ -33,9 +33,6 @@ enum class SettingCategory {
     ABOUT,
 }
 
-/** Where a setting applies: device-wide or per account. */
-enum class SettingScope { GLOBAL, PER_ACCOUNT }
-
 /**
  * Whether the feature behind a key is actually backed by the domain core.
  * [SettingAvailability.PENDING_CORE] keys render as honest disabled rows with
@@ -58,8 +55,6 @@ sealed interface SettingKey<out T> {
 
     val category: SettingCategory
 
-    val scope: SettingScope
-
     val availability: SettingAvailability
 
     /** Label resource; the EN and RU pair must exist in strings.xml. */
@@ -81,7 +76,6 @@ data class BooleanKey(
     override val storageKey: String,
     override val default: Boolean,
     override val category: SettingCategory,
-    override val scope: SettingScope,
     override val availability: SettingAvailability,
     override val labelRes: Int,
     override val keywords: List<Int> = emptyList(),
@@ -95,40 +89,6 @@ data class BooleanKey(
     }
 }
 
-/** Free-form string setting stored verbatim. */
-data class StringKey(
-    override val storageKey: String,
-    override val default: String,
-    override val category: SettingCategory,
-    override val scope: SettingScope,
-    override val availability: SettingAvailability,
-    override val labelRes: Int,
-    override val keywords: List<Int> = emptyList(),
-) : SettingKey<String> {
-    override fun encode(value: String): String = value
-
-    override fun decode(raw: String): String = raw
-}
-
-/** Enum setting stored by [Enum.name]. */
-data class EnumKey<E : Enum<E>>(
-    override val storageKey: String,
-    override val default: E,
-    override val category: SettingCategory,
-    override val scope: SettingScope,
-    override val availability: SettingAvailability,
-    override val labelRes: Int,
-    val enumClass: Class<E>,
-    override val keywords: List<Int> = emptyList(),
-) : SettingKey<E> {
-    override fun encode(value: E): String = value.name
-
-    override fun decode(raw: String): E {
-        val match = enumClass.enumConstants?.firstOrNull { it.name == raw }
-        return match ?: default
-    }
-}
-
 /**
  * The complete settings catalog. `all` is the single list the store, the
  * gateway, the catalog renderer and the search function all iterate, so every
@@ -139,7 +99,6 @@ object SettingsSchema {
         storageKey = "dynamic_color",
         default = true,
         category = SettingCategory.APPEARANCE,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.IMPLEMENTED,
         labelRes = R.string.use_dynamic_colors,
     )
@@ -148,7 +107,6 @@ object SettingsSchema {
         storageKey = "comfortable_layout",
         default = true,
         category = SettingCategory.APPEARANCE,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.IMPLEMENTED,
         labelRes = R.string.comfortable_layout,
     )
@@ -157,7 +115,6 @@ object SettingsSchema {
         storageKey = "app_lock_enabled",
         default = false,
         category = SettingCategory.PRIVACY_SECURITY,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.IMPLEMENTED,
         labelRes = R.string.app_lock,
     )
@@ -168,7 +125,6 @@ object SettingsSchema {
         storageKey = "message_search",
         default = false,
         category = SettingCategory.PRIVACY_SECURITY,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.PENDING_CORE,
         labelRes = R.string.message_search,
     )
@@ -178,7 +134,6 @@ object SettingsSchema {
         storageKey = "encryption",
         default = false,
         category = SettingCategory.PRIVACY_SECURITY,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.PENDING_CORE,
         labelRes = R.string.encryption,
     )
@@ -188,7 +143,6 @@ object SettingsSchema {
         storageKey = "message_notifications",
         default = false,
         category = SettingCategory.NOTIFICATIONS,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.PENDING_CORE,
         labelRes = R.string.message_notifications,
     )
@@ -197,7 +151,6 @@ object SettingsSchema {
         storageKey = "group_notifications",
         default = false,
         category = SettingCategory.NOTIFICATIONS,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.PENDING_CORE,
         labelRes = R.string.group_notifications,
     )

@@ -115,9 +115,9 @@ class KeystoreProxyCredentialStore(context: Context) : ProxyCredentialStore {
 }
 
 /**
- * Preview and JVM-test fake with the same contract: plain in-memory map,
- * deliberately never persisted to disk. Used by [PreviewMindChatGateway] and
- * the credential-store contract tests.
+ * JVM-test fake with the same contract: plain in-memory map,
+ * deliberately never persisted to disk. Used by the credential-store
+ * contract tests.
  */
 class InMemoryProxyCredentialStore : ProxyCredentialStore {
     private val values = mutableMapOf<String, String>()

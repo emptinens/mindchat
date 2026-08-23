@@ -4,11 +4,8 @@ package com.mindchat.app
  * Shared state-transition and fallback rules behind the [MindChatGateway]
  * contract.
  *
- * Both implementations of the public interface (`NativeMindChatGateway` and
- * `PreviewMindChatGateway`) run exactly the same policy decisions here, so the
- * preview cannot drift from the native behavior: account fallback after
- * deletion and the thresholds that surface stalled connections are decided once
- * and shared.
+ * Account fallback after deletion and the thresholds that surface stalled
+ * connections are decided once here and shared by every caller.
  */
 
 /**

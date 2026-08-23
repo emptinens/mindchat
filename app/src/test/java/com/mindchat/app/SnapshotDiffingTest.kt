@@ -116,18 +116,6 @@ class SnapshotDiffingTest {
     }
 
     @Test
-    fun changedAccountSettingsForcesRebuild() {
-        assertFalse(
-            skipDecision(
-                snapshot(),
-                snapshot(),
-                accountSettings = mapOf(1L to SettingsSnapshot(mapOf(SettingsSchema.appLockEnabled to true))),
-                lastAccountSettings = emptyMap(),
-            ),
-        )
-    }
-
-    @Test
     fun changedProfilesForcesRebuild() {
         assertFalse(
             skipDecision(
@@ -247,8 +235,6 @@ class SnapshotDiffingTest {
         lastSettings: SettingsSnapshot = SettingsSnapshot(),
         profiles: Map<Long, AccountProfile> = emptyMap(),
         lastProfiles: Map<Long, AccountProfile> = emptyMap(),
-        accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
-        lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
         appearance: AppearanceProfile = AppearanceProfile(),
         lastAppearance: AppearanceProfile = AppearanceProfile(),
     ): Boolean = shouldSkipUiRebuild(
@@ -260,8 +246,6 @@ class SnapshotDiffingTest {
         lastSettings = lastSettings,
         profiles = profiles,
         lastProfiles = lastProfiles,
-        accountSettings = accountSettings,
-        lastAccountSettings = lastAccountSettings,
         appearance = appearance,
         lastAppearance = lastAppearance,
     )

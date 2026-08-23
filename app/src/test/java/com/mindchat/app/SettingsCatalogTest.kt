@@ -8,7 +8,7 @@ import org.junit.Test
 /**
  * Pins the pure settings decision logic in [GatewayInput] (T5/T8): catalog row
  * derivation (categories, PENDING_CORE honesty, app lock capability), search
- * matching, scope resolution, sanitizing, and snapshot diffing. Everything
+ * matching, sanitizing, and snapshot diffing. Everything
  * here is JVM-runnable and shared by both gateway implementations.
  */
 class SettingsCatalogTest {
@@ -140,7 +140,6 @@ class SettingsCatalogTest {
             storageKey = "test_presence_visibility",
             default = false,
             category = SettingCategory.PRIVACY_SECURITY,
-            scope = SettingScope.GLOBAL,
             availability = SettingAvailability.PENDING_CORE,
             labelRes = R.string.encryption,
         )
@@ -158,14 +157,12 @@ class SettingsCatalogTest {
 
     // --- searchSettings ------------------------------------------------------
 
-    private val accentSearchKey = EnumKey(
+    private val accentSearchKey = BooleanKey(
         storageKey = "test_accent_search",
-        default = TestVisibility.DEFAULT,
+        default = false,
         category = SettingCategory.APPEARANCE,
-        scope = SettingScope.GLOBAL,
         availability = SettingAvailability.IMPLEMENTED,
         labelRes = R.string.accent_color,
-        enumClass = TestVisibility::class.java,
         keywords = listOf(R.string.accent_default),
     )
 
@@ -218,24 +215,7 @@ class SettingsCatalogTest {
         else -> ""
     }
 
-    private enum class TestVisibility { DEFAULT }
-
-    // --- settingKeyFor / sanitizeSetting / settingsChanged -------------------
-
-    private val testPerAccountKey = BooleanKey(
-        storageKey = "presence_visibility_test",
-        default = false,
-        category = SettingCategory.PRIVACY_SECURITY,
-        scope = SettingScope.PER_ACCOUNT,
-        availability = SettingAvailability.IMPLEMENTED,
-        labelRes = R.string.encryption,
-    )
-
-    @Test
-    fun settingKeyForNamespacesPerAccountKeys() {
-        assertEquals("account_42_${testPerAccountKey.storageKey}", settingKeyFor(42L, testPerAccountKey))
-        assertEquals("dynamic_color", settingKeyFor(42L, SettingsSchema.dynamicColor))
-    }
+    // --- sanitizeSetting / settingsChanged ---
 
     @Test
     fun sanitizeSettingPassesValidValuesThrough() {
@@ -249,25 +229,6 @@ class SettingsCatalogTest {
         assertEquals(true, sanitizeSetting(SettingsSchema.dynamicColor as SettingKey<Any>, "garbage"))
         @Suppress("UNCHECKED_CAST")
         assertEquals(false, sanitizeSetting(SettingsSchema.appLockEnabled as SettingKey<Any>, 42))
-    }
-
-    @Test
-    fun sanitizeSettingCoercesEnumGarbage() {
-        val key = EnumKey<TestVisibility>(
-            storageKey = "test_enum_sanitize",
-            default = TestVisibility.DEFAULT,
-            category = SettingCategory.APPEARANCE,
-            scope = SettingScope.GLOBAL,
-            availability = SettingAvailability.IMPLEMENTED,
-            labelRes = R.string.appearance,
-            enumClass = TestVisibility::class.java,
-        )
-        assertEquals(TestVisibility.DEFAULT, sanitizeSetting(key, TestVisibility.DEFAULT))
-        @Suppress("UNCHECKED_CAST")
-        assertEquals(
-            TestVisibility.DEFAULT,
-            sanitizeSetting(key as SettingKey<Any>, "not-an-enum"),
-        )
     }
 
     @Test

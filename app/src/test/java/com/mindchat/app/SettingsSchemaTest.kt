@@ -41,36 +41,6 @@ class SettingsSchemaTest {
         assertFalse(SettingsSchema.appLockEnabled.decode("garbage"))
     }
 
-    @Test
-    fun enumKeysRoundTripAndFallBackToDefault() {
-        val key = EnumKey(
-            storageKey = "test_enum",
-            default = TestEnum.ONE,
-            category = SettingCategory.APPEARANCE,
-            scope = SettingScope.GLOBAL,
-            availability = SettingAvailability.IMPLEMENTED,
-            labelRes = R.string.appearance,
-            enumClass = TestEnum::class.java,
-        )
-        assertEquals("TWO", key.encode(TestEnum.TWO))
-        assertEquals(TestEnum.TWO, key.decode("TWO"))
-        assertEquals(TestEnum.ONE, key.decode("NOT_A_VALUE"))
-    }
-
-    @Test
-    fun stringKeysRoundTrip() {
-        val key = StringKey(
-            storageKey = "test_string",
-            default = "default",
-            category = SettingCategory.ABOUT,
-            scope = SettingScope.GLOBAL,
-            availability = SettingAvailability.IMPLEMENTED,
-            labelRes = R.string.version,
-        )
-        assertEquals("raw", key.encode("raw"))
-        assertEquals("raw", key.decode("raw"))
-    }
-
     // --- defaults and snapshot ----------------------------------------------
 
     @Test
@@ -124,7 +94,6 @@ class SettingsSchemaTest {
         SettingsSchema.all.forEach { key ->
             assertTrue("labelRes for ${key.storageKey} must be set", key.labelRes != 0)
             assertTrue("category for ${key.storageKey}", SettingCategory.entries.contains(key.category))
-            assertTrue("scope for ${key.storageKey}", SettingScope.entries.contains(key.scope))
             assertTrue("availability for ${key.storageKey}", SettingAvailability.entries.contains(key.availability))
         }
     }
@@ -163,8 +132,6 @@ class SettingsSchemaTest {
     }
 
     // --- helpers -------------------------------------------------------------
-
-    private enum class TestEnum { ONE, TWO }
 
     private fun stringsXml(folder: String): String {
         val candidates = listOf(

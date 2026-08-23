@@ -70,7 +70,6 @@ class PollLifecycleGatingTest {
         override fun setAppearance(appearance: AppearanceProfile) = Unit
         override fun toggleAppLock() = Unit
         override fun <T> setSetting(key: SettingKey<T>, value: T) = Unit
-        override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) = Unit
         override fun addProxy(config: ProxyConfig, password: String?): Boolean = false
         override fun updateProxy(proxyId: String, config: ProxyConfig, password: String?): Boolean = false
         override fun deleteProxy(proxyId: String) = Unit

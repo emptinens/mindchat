@@ -84,7 +84,6 @@ data class MindChatUiState(
     val messagesByConversation: Map<Long, List<MessageUi>>,
     val profiles: Map<Long, AccountProfile> = emptyMap(),
     val settings: SettingsSnapshot = SettingsSnapshot(),
-    val accountSettings: Map<Long, SettingsSnapshot> = emptyMap(),
     val appearance: AppearanceProfile = AppearanceProfile(),
     val proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
     val proxyAssignments: Map<Long, String> = emptyMap(),
@@ -189,9 +188,6 @@ interface MindChatGateway {
      */
     fun <T> setSetting(key: SettingKey<T>, value: T)
 
-    /** Writes one account-scoped setting; persisted and reflected in state. */
-    fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any)
-
     // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
 
     /**
@@ -268,31 +264,14 @@ interface MindChatGateway {
     fun dismissDiagnosticsNotice()
 }
 
-/**
- * Chooses the generated Rust binding for packaged builds. The preview fallback
- * keeps Compose previews and isolated debug UI tests available when an Android
- * ABI library is intentionally absent.
- */
+/** Chooses the generated Rust binding for packaged builds. */
 object MindChatGatewayFactory {
-    fun create(context: Context): MindChatGateway {
-        val preferences = SharedPreferencesMindChatPreferences(context)
-        val proxyLibraryStore = SharedPreferencesProxyLibraryStore(context)
-        val credentialStore = KeystoreProxyCredentialStore(context)
-        return try {
-            NativeMindChatGateway(
-                stateFile = File(context.filesDir, "mindchat_state.json"),
-                preferences = preferences,
-                proxyLibraryStore = proxyLibraryStore,
-                credentialStore = credentialStore,
-            )
-        } catch (error: LinkageError) {
-            if (BuildConfig.DEBUG) {
-                PreviewMindChatGateway(preferences, proxyLibraryStore, credentialStore)
-            } else {
-                throw error
-            }
-        }
-    }
+    fun create(context: Context): MindChatGateway = NativeMindChatGateway(
+        stateFile = File(context.filesDir, "mindchat_state.json"),
+        preferences = SharedPreferencesMindChatPreferences(context),
+        proxyLibraryStore = SharedPreferencesProxyLibraryStore(context),
+        credentialStore = KeystoreProxyCredentialStore(context),
+    )
 }
 
 /** Presentation adapter over the generated UniFFI contract. */
@@ -311,13 +290,6 @@ class NativeMindChatGateway(
 
     /** Global appearance backing [MindChatUiState.appearance]; [setAppearance] is the only writer. */
     private var appearanceCache: AppearanceProfile = preferences.readCustomization().appearance
-
-    /**
-     * Per-account settings backing [MindChatUiState.accountSettings]. 0.1.7 has
-     * no PER_ACCOUNT keys yet, so this starts empty; 0.1.8 populates it when
-     * accounts load and [setAccountSetting] updates it.
-     */
-    private var accountSettingsCache: Map<Long, SettingsSnapshot> = emptyMap()
 
     /**
      * The non-secret proxy library backing [MindChatUiState.proxyLibrary] and
@@ -355,7 +327,6 @@ class NativeMindChatGateway(
     private var lastSnapshot: FfiCoreSnapshot? = null
     private var lastProfiles: Map<Long, AccountProfile> = emptyMap()
     private var lastSettings: SettingsSnapshot = settingsCache
-    private var lastAccountSettings: Map<Long, SettingsSnapshot> = emptyMap()
     private var lastAppearance: AppearanceProfile = appearanceCache
     private var lastProxyLibrary: List<ProxyLibraryEntry> = proxyLibraryCache
     private var lastProxyAssignments: Map<Long, String> = proxyAssignmentsCache
@@ -506,9 +477,7 @@ class NativeMindChatGateway(
         try {
             core.deleteAccount(accountId.toULong())
             preferences.removeProfile(accountId)
-            preferences.removeAccountSettings(accountId)
             profilesCache = preferences.readProfiles()
-            accountSettingsCache = accountSettingsCache - accountId
             // The account's proxy assignment dies with it; the library entry
             // and its stored password stay (they belong to the proxy).
             proxyAssignmentsCache = proxyAssignmentsCache - accountId
@@ -734,15 +703,6 @@ class NativeMindChatGateway(
         refresh()
     }
 
-    override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) {
-        @Suppress("UNCHECKED_CAST")
-        val sanitized = sanitizeSetting(key as SettingKey<Any>, value)
-        preferences.writeAccountSetting(accountId, key, sanitized)
-        settingsCache = SettingsSnapshot(preferences.readAll())
-        accountSettingsCache = accountSettingsCache + (accountId to SettingsSnapshot(preferences.readAccountSettings(accountId)))
-        refresh()
-    }
-
     // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
 
     override fun addProxy(config: ProxyConfig, password: String?): Boolean {
@@ -918,8 +878,6 @@ class NativeMindChatGateway(
                 lastSettings = lastSettings,
                 profiles = profilesCache,
                 lastProfiles = lastProfiles,
-                accountSettings = accountSettingsCache,
-                lastAccountSettings = lastAccountSettings,
                 appearance = appearanceCache,
                 lastAppearance = lastAppearance,
                 proxyLibrary = proxyLibraryCache,
@@ -938,7 +896,6 @@ class NativeMindChatGateway(
         lastSnapshot = snapshot
         lastProfiles = profilesCache
         lastSettings = settingsCache
-        lastAccountSettings = accountSettingsCache
         lastAppearance = appearanceCache
         lastProxyLibrary = proxyLibraryCache
         lastProxyAssignments = proxyAssignmentsCache
@@ -990,7 +947,6 @@ class NativeMindChatGateway(
             activeAccountId = activeAccountId,
             connectingSince = connectingSince,
             settings = settingsCache,
-            accountSettings = accountSettingsCache,
             appearance = appearanceCache,
             proxyLibrary = proxyLibraryCache,
             proxyAssignments = proxyAssignmentsCache,
@@ -1004,510 +960,4 @@ class NativeMindChatGateway(
         connectingSince.putAll(mapping.connectingSince)
         return mapping.state
     }
-}
-
-/** Compose-previewable fallback for design previews and native-free debug tests. */
-@Stable
-class PreviewMindChatGateway(
-    private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
-    private val proxyLibraryStore: ProxyLibraryStore = InMemoryProxyLibraryStore(),
-    private val credentialStore: ProxyCredentialStore = InMemoryProxyCredentialStore(),
-    /**
-     * Honest diagnostics seed: the preview has no native core, so its report
-     * is an all-default (zero counts, not quarantined) report unless a test or
-     * preview seeds one. Never contains secrets; the contract test uses this
-     * to drive the quarantine notice state.
-     */
-    seedDiagnosticsReport: FfiDiagnosticsReport? = null,
-) : MindChatGateway {
-    override var state by mutableStateOf(
-        seedPreviewState(
-            preferences,
-            proxyLibraryStore.readEntries(),
-            proxyLibraryStore.readAssignments(),
-            seedDiagnosticsReport,
-        ),
-    )
-        private set
-
-    /** The report [diagnosticsReport] returns; fixed at construction (no native core to re-read). */
-    private val previewDiagnosticsReport: FfiDiagnosticsReport =
-        seedDiagnosticsReport ?: zeroDiagnosticsReport()
-
-    override fun selectAccount(accountId: Long) {
-        if (state.accounts.any { it.id == accountId }) {
-            state = state.copy(activeAccountId = accountId)
-        }
-    }
-
-    override fun addAccount(
-        jid: String,
-        server: String,
-        displayName: String,
-        password: String,
-    ): Boolean {
-        if ('@' !in jid || server.isBlank() || password.isBlank()) return false
-        val nextId = (state.accounts.maxOfOrNull { it.id } ?: 0) + 1
-        val account = AccountUi(
-            id = nextId,
-            jid = jid.trim(),
-            displayName = displayName.trim().ifBlank { jid.substringBefore('@') },
-            presence = Presence.OFFLINE,
-            connectionState = AccountConnectionState.OFFLINE,
-            supportsGroupChats = true,
-        )
-        state = state.copy(
-            accounts = state.accounts + account,
-            activeAccountId = nextId,
-        )
-        return true
-    }
-
-    override fun registerAccount(
-        jid: String,
-        server: String,
-        displayName: String,
-        password: String,
-    ): String? {
-        val input = when (val validation = validateRegistration(jid, server, displayName, password)) {
-            is RegistrationValidation.Refused -> return validation.refusal.toUiDetail()
-            is RegistrationValidation.Valid -> validation.input
-        }
-        val nextId = (state.accounts.maxOfOrNull { it.id } ?: 0) + 1
-        val account = AccountUi(
-            id = nextId,
-            jid = input.fullJid,
-            displayName = input.displayName,
-            presence = Presence.OFFLINE,
-            connectionState = AccountConnectionState.CONNECTING,
-            supportsGroupChats = true,
-        )
-        state = state.copy(
-            accounts = state.accounts + account,
-            activeAccountId = nextId,
-        )
-        return null
-    }
-
-    override fun reconnectAccount(accountId: Long, password: String): Boolean {
-        if (password.isEmpty() || state.accounts.none { it.id == accountId }) return false
-        state = state.copy(
-            accounts = state.accounts.map {
-                if (it.id == accountId) {
-                    it.copy(connectionState = AccountConnectionState.CONNECTING, connectionError = null)
-                } else {
-                    it
-                }
-            },
-        )
-        return true
-    }
-
-    override fun disconnectAccount(accountId: Long) {
-        state = state.copy(
-            accounts = state.accounts.map {
-                if (it.id == accountId) {
-                    it.copy(
-                        connectionState = AccountConnectionState.OFFLINE,
-                        connectionError = null,
-                    )
-                } else {
-                    it
-                }
-            },
-        )
-    }
-
-    override fun markConversationRead(conversationId: Long) {
-        state = state.copy(
-            conversations = state.conversations.map {
-                if (it.id == conversationId) it.copy(unreadCount = 0) else it
-            },
-        )
-    }
-
-    override fun updateProfile(accountId: Long, profile: AccountProfile) {
-        preferences.writeProfile(accountId, profile)
-        // Mirror InMemoryMindChatPreferences.writeProfile: an all-default
-        // profile removes the stored entry (and the state projection).
-        val emptyProfile = profile.avatarUri == null && profile.statusMessage == null &&
-            profile.accentKey == null && profile.bubbleStyle == null && profile.chatBackground == null
-        state = state.copy(
-            profiles = if (emptyProfile) state.profiles - accountId else state.profiles + (accountId to profile),
-        )
-    }
-
-    /** Preview-only in-memory implementation of the gateway contract. */
-    override fun deleteAccount(accountId: Long) {
-        val remainingAccounts = state.accounts.filterNot { it.id == accountId }
-        val remainingConversationIds = state.conversations
-            .filterNot { it.accountId == accountId }
-            .map(ConversationUi::id)
-            .toSet()
-        preferences.removeProfile(accountId)
-        preferences.removeAccountSettings(accountId)
-        state = state.copy(
-            accounts = remainingAccounts,
-            activeAccountId = nextActiveAccountId(state.accounts, accountId, state.activeAccountId),
-            conversations = state.conversations.filterNot { it.accountId == accountId },
-            contacts = state.contacts.filterNot { it.accountId == accountId },
-            messagesByConversation = state.messagesByConversation.filterKeys { it in remainingConversationIds },
-            profiles = state.profiles - accountId,
-            accountSettings = state.accountSettings - accountId,
-        )
-    }
-
-    /** Preview-only in-memory implementation of the gateway contract. */
-    override fun renameAccount(accountId: Long, displayName: String) {
-        val trimmed = displayName.trim()
-        if (trimmed.isEmpty()) return
-        state = state.copy(
-            accounts = state.accounts.map {
-                if (it.id == accountId) it.copy(displayName = trimmed) else it
-            },
-        )
-    }
-
-    /** Preview-only in-memory implementation of the gateway contract. */
-    override fun deleteConversation(conversationId: Long) {
-        state = state.copy(
-            conversations = state.conversations.filterNot { it.id == conversationId },
-            messagesByConversation = state.messagesByConversation - conversationId,
-        )
-    }
-
-    override fun addContact(jid: String, displayName: String) {
-        val address = jid.trim()
-        if ('@' !in address || state.activeAccountId == 0L) return
-        val contact = ContactUi(
-            accountId = state.activeAccountId,
-            jid = address,
-            displayName = displayName.trim().ifBlank { address.substringBefore('@') },
-            presence = Presence.OFFLINE,
-        )
-        state = state.copy(
-            contacts = state.contacts
-                .filterNot { it.accountId == contact.accountId && it.jid == contact.jid }
-                .plus(contact)
-                .sortedWith(compareBy(ContactUi::accountId, ContactUi::jid)),
-        )
-    }
-
-    override fun sendText(conversationId: Long, text: String) {
-        val trimmed = text.trim()
-        if (trimmed.isEmpty()) return
-        val messages = state.messagesByConversation[conversationId].orEmpty()
-        val message = MessageUi(
-            id = (messages.maxOfOrNull { it.id } ?: 0) + 1,
-            sender = "You",
-            body = trimmed,
-            timestamp = "now",
-            mine = true,
-            delivery = MessageDelivery.PENDING,
-        )
-        state = state.copy(
-            messagesByConversation = state.messagesByConversation + (conversationId to (messages + message)),
-            conversations = state.conversations.map {
-                if (it.id == conversationId) {
-                    it.copy(
-                        preview = trimmed,
-                        timestamp = "now",
-                        lastActivityEpochMs = System.currentTimeMillis(),
-                    )
-                } else {
-                    it
-                }
-            },
-        )
-    }
-
-    override suspend fun pollTransport() = Unit
-
-    override suspend fun persistNow() = Unit
-
-    override fun openConversation(address: String, title: String, group: Boolean): Long? {
-        val addressValue = address.trim()
-        if (addressValue.isEmpty() || state.activeAccountId == 0L) return null
-        state.conversations
-            .firstOrNull {
-                it.accountId == state.activeAccountId &&
-                    it.address == addressValue &&
-                    it.isGroup == group
-            }
-            ?.let { return it.id }
-        val conversationId = (state.conversations.maxOfOrNull { it.id } ?: 0) + 1
-        val conversation = ConversationUi(
-            id = conversationId,
-            accountId = state.activeAccountId,
-            title = title.trim().ifBlank { addressValue.substringBefore('@') },
-            address = addressValue,
-            preview = "",
-            timestamp = "now",
-            isGroup = group,
-            lastActivityEpochMs = System.currentTimeMillis(),
-        )
-        state = state.copy(
-            conversations = state.conversations + conversation,
-            messagesByConversation = state.messagesByConversation + (conversationId to emptyList()),
-        )
-        return conversationId
-    }
-
-    override fun toggleDynamicColor() {
-        setSetting(SettingsSchema.dynamicColor, !state.settings.dynamicColor)
-    }
-
-    override fun setAppearance(appearance: AppearanceProfile) {
-        val current = preferences.readCustomization()
-        preferences.writeCustomization(current.copy(appearance = appearance))
-        state = state.copy(appearance = appearance)
-    }
-
-    override fun toggleAppLock() {
-        setSetting(SettingsSchema.appLockEnabled, !state.settings.appLockEnabled)
-    }
-
-    override fun <T> setSetting(key: SettingKey<T>, value: T) {
-        val sanitized = sanitizeSetting(key, value)
-        preferences.write(key, sanitized)
-        state = state.copy(settings = SettingsSnapshot(preferences.readAll()))
-    }
-
-    override fun setAccountSetting(accountId: Long, key: SettingKey<*>, value: Any) {
-        @Suppress("UNCHECKED_CAST")
-        val sanitized = sanitizeSetting(key as SettingKey<Any>, value)
-        preferences.writeAccountSetting(accountId, key, sanitized)
-        state = state.copy(
-            settings = SettingsSnapshot(preferences.readAll()),
-            accountSettings = state.accountSettings +
-                (accountId to SettingsSnapshot(preferences.readAccountSettings(accountId))),
-        )
-    }
-
-    // --- Proxy library and per-account assignment (ROADMAP 6.3) ---------------
-    // The preview mirrors the native behavior over the same stores without a
-    // core: the library and assignment map are the same device-local state,
-    // and probes honestly fail (there is no tunnel to ping in a JVM preview),
-    // so the preview never fabricates latency.
-
-    override fun addProxy(config: ProxyConfig, password: String?): Boolean {
-        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
-        val id = nextProxyId(state.proxyLibrary)
-        if (password != null) credentialStore.store(id, password)
-        proxyLibraryStore.writeEntries(
-            state.proxyLibrary + ProxyLibraryEntry(id = id, host = config.host, port = config.port, kind = config.kind),
-        )
-        state = state.copy(proxyLibrary = proxyLibraryStore.readEntries())
-        return true
-    }
-
-    override fun updateProxy(proxyId: String, config: ProxyConfig, password: String?): Boolean {
-        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
-        if (state.proxyLibrary.none { it.id == proxyId }) return false
-        if (password != null) credentialStore.store(proxyId, password)
-        val updated = state.proxyLibrary.map {
-            if (it.id == proxyId) {
-                ProxyLibraryEntry(id = proxyId, host = config.host, port = config.port, kind = config.kind)
-            } else {
-                it
-            }
-        }
-        proxyLibraryStore.writeEntries(updated)
-        state = state.copy(proxyLibrary = proxyLibraryStore.readEntries())
-        return true
-    }
-
-    override fun deleteProxy(proxyId: String) {
-        if (state.proxyLibrary.none { it.id == proxyId }) return
-        val remaining = state.proxyLibrary.filterNot { it.id == proxyId }
-        proxyLibraryStore.writeEntries(remaining)
-        credentialStore.delete(proxyId)
-        val assignments = state.proxyAssignments.filterValues { it != proxyId }
-        proxyLibraryStore.writeAssignments(assignments)
-        state = state.copy(proxyLibrary = remaining, proxyAssignments = assignments)
-    }
-
-    override fun pingProxy(proxyId: String, password: String?): ProxyProbeResult {
-        val entry = state.proxyLibrary.firstOrNull { it.id == proxyId }
-            ?: return ProxyProbeResult(ok = false, latencyMs = null, error = "unknown proxy")
-        if (password != null) credentialStore.store(proxyId, password)
-        val result = testProxy(entry.toConfig(), credentialStore.load(proxyId))
-        val updated = state.proxyLibrary.map {
-            if (it.id == proxyId) {
-                it.copy(
-                    status = ProxyStatus(
-                        latencyMs = if (result.ok) result.latencyMs else null,
-                        error = result.error,
-                    ),
-                )
-            } else {
-                it
-            }
-        }
-        proxyLibraryStore.writeEntries(updated)
-        state = state.copy(proxyLibrary = updated)
-        return result
-    }
-
-    override fun setAccountProxy(accountId: Long, config: ProxyConfig?, password: String?): Boolean {
-        if (config == null) {
-            val assignments = state.proxyAssignments - accountId
-            proxyLibraryStore.writeAssignments(assignments)
-            state = state.copy(proxyAssignments = assignments)
-            return true
-        }
-        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) return false
-        val entry = state.proxyLibrary.findByConfig(config) ?: return false
-        if (password != null) credentialStore.store(entry.id, password)
-        val assignments = state.proxyAssignments + (accountId to entry.id)
-        proxyLibraryStore.writeAssignments(assignments)
-        state = state.copy(proxyAssignments = assignments)
-        return true
-    }
-
-    override fun accountProxy(accountId: Long): ProxyConfig? =
-        state.assignedProxy(accountId)?.toConfig()
-
-    override fun testProxy(config: ProxyConfig, password: String?): ProxyProbeResult {
-        if (validateProxyConfig(config.host, config.port, config.kind) is ProxyValidation.Refused) {
-            return ProxyProbeResult(ok = false, latencyMs = null, error = "invalid proxy configuration")
-        }
-        // No native core in the preview: a probe cannot open a tunnel, and a
-        // fake latency is forbidden, so the honest result is a failure.
-        return ProxyProbeResult(ok = false, latencyMs = null, error = "proxy probes require the native core")
-    }
-
-    // --- Diagnostics (ROADMAP 6.5) ------------------------------------------
-
-    override fun diagnosticsReport(): FfiDiagnosticsReport = previewDiagnosticsReport
-
-    override fun dismissDiagnosticsNotice() {
-        if (state.diagnosticsNoticeDismissed) return
-        preferences.writeQuarantineNoticeDismissed(true)
-        state = state.copy(diagnosticsNoticeDismissed = true)
-    }
-}
-
-/**
- * The honest preview report: all counts zero, no persistence metadata, never
- * quarantined. The preview has no native core and no state file, so any other
- * value would be fabricated; secrets are structurally impossible (the report
- * type carries none).
- */
-private fun zeroDiagnosticsReport(): FfiDiagnosticsReport = FfiDiagnosticsReport(
-    accountCount = 0uL,
-    contactCount = 0uL,
-    conversationCount = 0uL,
-    messageCount = 0uL,
-    reactionCount = 0uL,
-    statePath = null,
-    stateSizeBytes = null,
-    stateSchemaVersion = null,
-    stateQuarantined = false,
-    stateLastSavedAtEpochMs = null,
-    stateLastLoadedAtEpochMs = null,
-)
-
-/**
- * Seeds the preview state: the demo accounts plus any persisted settings,
- * profiles, account settings, proxy library and proxy assignments, so a
- * gateway instance created over the same stores restores everything the
- * previous instance wrote.
- */
-private fun seedPreviewState(
-    preferences: MindChatPreferences,
-    proxyLibrary: List<ProxyLibraryEntry> = emptyList(),
-    proxyAssignments: Map<Long, String> = emptyMap(),
-    seedDiagnosticsReport: FfiDiagnosticsReport? = null,
-): MindChatUiState {
-    val seed = seedState()
-    return seed.copy(
-        settings = SettingsSnapshot(preferences.readAll()),
-        profiles = preferences.readProfiles(),
-        appearance = preferences.readCustomization().appearance,
-        accountSettings = seed.accounts.associate { account ->
-            account.id to SettingsSnapshot(preferences.readAccountSettings(account.id))
-        },
-        proxyLibrary = proxyLibrary,
-        proxyAssignments = proxyAssignments,
-        diagnosticsQuarantined = seedDiagnosticsReport?.stateQuarantined ?: false,
-        diagnosticsNoticeDismissed = preferences.readQuarantineNoticeDismissed(),
-    )
-}
-
-private fun seedState(): MindChatUiState {
-    val account = AccountUi(
-        id = 1,
-        jid = "alice@mindchat.example",
-        displayName = "Alice",
-        presence = Presence.ONLINE,
-        connectionState = AccountConnectionState.ONLINE,
-        supportsGroupChats = true,
-    )
-    val conversations = listOf(
-        ConversationUi(
-            id = 1,
-            accountId = account.id,
-            title = "Bob",
-            address = "bob@example.org",
-            preview = "See you at 19:00!",
-            timestamp = "18:42",
-            unreadCount = 2,
-            encrypted = true,
-            lastActivityEpochMs = 2,
-        ),
-        ConversationUi(
-            id = 2,
-            accountId = account.id,
-            title = "MindChat community",
-            address = "community@conference.example.org",
-            preview = "Mila: Material 3 samples are ready",
-            timestamp = "16:08",
-            isGroup = true,
-            lastActivityEpochMs = 1,
-        ),
-    )
-    return MindChatUiState(
-        accounts = listOf(account),
-        contacts = listOf(
-            ContactUi(
-                accountId = account.id,
-                jid = "bob@example.org",
-                displayName = "Bob",
-                presence = Presence.ONLINE,
-                status = "Available",
-            ),
-            ContactUi(
-                accountId = account.id,
-                jid = "mila@example.org",
-                displayName = "Mila",
-                presence = Presence.OFFLINE,
-            ),
-            ContactUi(
-                accountId = account.id,
-                jid = "community@conference.example.org",
-                displayName = "MindChat community",
-                presence = Presence.ONLINE,
-            ),
-        ),
-        activeAccountId = account.id,
-        conversations = conversations,
-        messagesByConversation = mapOf(
-            1L to listOf(
-                MessageUi(1, "Bob", "Hi! Is the prototype ready?", "18:37", mine = false),
-                MessageUi(
-                    2,
-                    "You",
-                    "Almost. I am polishing the chat screen.",
-                    "18:39",
-                    mine = true,
-                    delivery = MessageDelivery.DELIVERED,
-                ),
-                MessageUi(3, "Bob", "See you at 19:00!", "18:42", mine = false, reactions = listOf("👍 1")),
-            ),
-            2L to listOf(
-                MessageUi(1, "Mila", "Material 3 samples are ready", "16:08", mine = false),
-            ),
-        ),
-    )
 }
