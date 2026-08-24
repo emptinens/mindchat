@@ -15,6 +15,14 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     if [ -z "$SDK_ROOT" ] && [ "$(uname -s)" = "Darwin" ]; then
         SDK_ROOT="$HOME/Library/Android/sdk"
     fi
+    if [ -z "$SDK_ROOT" ]; then
+        # Fall back to the SDK location Gradle itself uses: sdk.dir in the
+        # repo-root local.properties (never committed).
+        REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+        if [ -f "$REPO_ROOT/local.properties" ]; then
+            SDK_ROOT=$(sed -n 's/^sdk\.dir=//p' "$REPO_ROOT/local.properties")
+        fi
+    fi
     PINNED_NDK="$SDK_ROOT/ndk/29.0.14206865"
     if [ -d "$PINNED_NDK" ]; then
         export ANDROID_NDK_HOME="$PINNED_NDK"
