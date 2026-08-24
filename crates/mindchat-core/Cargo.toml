@@ -35,6 +35,10 @@ serde_json = "1"
 # RFC 7617 Basic scheme for HTTP CONNECT proxy authentication (ROADMAP 6.3).
 # Cached 0.22.1.
 base64 = "0.22.1"
+# AES-256-GCM for encrypted-at-rest state files (ROADMAP 0.1.9 T1). Already
+# resolved via tokio-xmpp's "ring" feature, so this direct dependency adds
+# zero new vendored code and guarantees feature unification for our own calls.
+ring = { version = "0.17", default-features = false }
 futures = { version = "0.3.31", optional = true }
 hickory-resolver = { version = "0.26.1", optional = true }
 # io-util provides AsyncReadExt/AsyncWriteExt/AsyncBufReadExt for the proxy

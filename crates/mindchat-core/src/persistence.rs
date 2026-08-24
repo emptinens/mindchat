@@ -58,6 +58,13 @@ pub enum PersistenceError {
     UnsupportedVersion(u32),
     /// The file exceeded [`MAX_STATE_FILE_BYTES`].
     TooLarge(u64),
+    /// The file does not carry the encrypted-state magic header.
+    NotEncrypted,
+    /// The file claimed encryption but failed authentication under this key
+    /// (wrong key or tampered content).
+    Decryption,
+    /// Encrypting the snapshot failed inside the crypto backend.
+    Encryption(String),
 }
 
 impl fmt::Display for PersistenceError {
@@ -69,6 +76,11 @@ impl fmt::Display for PersistenceError {
                 write!(formatter, "unsupported state schema version {version}")
             }
             Self::TooLarge(bytes) => write!(formatter, "state file too large: {bytes} bytes"),
+            Self::NotEncrypted => formatter.write_str("state file is not an encrypted state file"),
+            Self::Decryption => {
+                formatter.write_str("state file decryption failed (wrong key or corrupt file)")
+            }
+            Self::Encryption(detail) => write!(formatter, "state encryption failed: {detail}"),
         }
     }
 }
@@ -77,7 +89,12 @@ impl std::error::Error for PersistenceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Corrupt(_) | Self::UnsupportedVersion(_) | Self::TooLarge(_) => None,
+            Self::Corrupt(_)
+            | Self::UnsupportedVersion(_)
+            | Self::TooLarge(_)
+            | Self::NotEncrypted
+            | Self::Decryption
+            | Self::Encryption(_) => None,
         }
     }
 }
@@ -111,11 +128,28 @@ pub fn save_state(snapshot: &CoreSnapshot, path: &Path) -> Result<(), Persistenc
     if byte_count > MAX_STATE_FILE_BYTES {
         return Err(PersistenceError::TooLarge(byte_count));
     }
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_count > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceError::TooLarge(byte_count));
+    }
+    write_atomic(path, &bytes)
+}
+
+/// Writes `bytes` to `path` atomically via a unique staging file and rename.
+///
+/// Bytes are written to a unique `<path>.<pid>.<counter>.tmp` staging file,
+/// flushed to disk with `sync_all`, and finally renamed over `path`. A crash
+/// mid-write leaves the previous file intact and only a stale staging file
+/// behind, which a later save leaves untouched and the OS eventually
+/// reclaims. Concurrent saves from other threads each write their own
+/// staging file, so the last `rename` always installs one complete snapshot.
+/// On error the staging file is removed best-effort.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
     let tmp_path = tmp_path_for(path);
 
     let write_result = std::fs::File::create(&tmp_path)
         .and_then(|mut file| {
-            file.write_all(&bytes)?;
+            file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
             std::fs::rename(&tmp_path, path)
@@ -169,15 +203,109 @@ pub fn load_state_with_metadata(
         return Err(PersistenceError::TooLarge(byte_count));
     }
 
-    let persisted: PersistedState = serde_json::from_slice(&bytes)
+    parse_state_bytes(&bytes).map(Some)
+}
+
+/// Parses and sanitizes serialized [`PersistedState`] JSON bytes.
+fn parse_state_bytes(bytes: &[u8]) -> Result<(CoreSnapshot, StateFileMetadata), PersistenceError> {
+    let persisted: PersistedState = serde_json::from_slice(bytes)
         .map_err(|error| PersistenceError::Corrupt(error.to_string()))?;
     if persisted.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(PersistenceError::UnsupportedVersion(persisted.schema_version));
     }
-    Ok(Some((
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    Ok((
         sanitize_snapshot(persisted.snapshot),
         StateFileMetadata { size_bytes: byte_count, schema_version: persisted.schema_version },
-    )))
+    ))
+}
+
+/// What [`load_state_encrypted`] found on disk.
+#[derive(Debug)]
+pub enum LoadOutcome {
+    /// No state file exists yet.
+    Missing,
+    /// A legacy plaintext JSON state file; migrate by saving encrypted.
+    PlaintextLegacy(CoreSnapshot, StateFileMetadata),
+    /// An encrypted state file opened under the given key.
+    Encrypted(CoreSnapshot, StateFileMetadata),
+}
+
+/// Writes `snapshot` to `path` atomically as an AES-256-GCM encrypted file
+/// (see [`state_cipher`](crate::state_cipher) for the on-disk layout).
+///
+/// The plaintext bound of [`MAX_STATE_FILE_BYTES`] is checked before
+/// encryption so the app never writes a file it would refuse on next launch.
+/// The plaintext is serialized exactly like [`save_state`]; only the bytes on
+/// disk differ.
+///
+/// # Errors
+///
+/// Returns the same typed errors as [`save_state`], plus
+/// [`PersistenceError::Encryption`] if the crypto backend fails.
+pub fn save_state_encrypted(
+    snapshot: &CoreSnapshot,
+    path: &Path,
+    key: &[u8; 32],
+) -> Result<StateFileMetadata, PersistenceError> {
+    let persisted =
+        PersistedState { schema_version: CURRENT_SCHEMA_VERSION, snapshot: snapshot.clone() };
+    let bytes = serde_json::to_vec_pretty(&persisted)
+        .map_err(|error| PersistenceError::Corrupt(error.to_string()))?;
+    let plain_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if plain_len > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceError::TooLarge(plain_len));
+    }
+    let blob = crate::state_cipher::encrypt_state(&bytes, key)?;
+    write_atomic(path, &blob)?;
+    let blob_len = u64::try_from(blob.len()).unwrap_or(u64::MAX);
+    Ok(StateFileMetadata { size_bytes: blob_len, schema_version: CURRENT_SCHEMA_VERSION })
+}
+
+/// Loads a snapshot from `path`, accepting both legacy plaintext and
+/// encrypted files (ROADMAP 0.1.9 T1).
+///
+/// A missing file returns [`LoadOutcome::Missing`]. A file without the
+/// encrypted magic header parses through the exact legacy path used by
+/// [`load_state_with_metadata`] and returns [`LoadOutcome::PlaintextLegacy`],
+/// which lets callers transparently re-save as encrypted. Encrypted files are
+/// authenticated under `key`; a wrong key or tampered content surfaces as
+/// [`PersistenceError::Decryption`]. Loaded snapshots are sanitized exactly
+/// like [`load_state`].
+///
+/// # Errors
+///
+/// Returns the typed [`PersistenceError`] for every failure mode except a
+/// missing file.
+pub fn load_state_encrypted(path: &Path, key: &[u8; 32]) -> Result<LoadOutcome, PersistenceError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadOutcome::Missing);
+        }
+        Err(error) => return Err(PersistenceError::Io(error)),
+    };
+    if metadata.len() > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceError::TooLarge(metadata.len()));
+    }
+
+    let bytes = std::fs::read(path).map_err(PersistenceError::Io)?;
+    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if byte_count > MAX_STATE_FILE_BYTES {
+        return Err(PersistenceError::TooLarge(byte_count));
+    }
+
+    if crate::state_cipher::is_encrypted_blob(&bytes) {
+        let plain = crate::state_cipher::decrypt_state(&bytes, key)?;
+        let (snapshot, mut meta) = parse_state_bytes(&plain)?;
+        // The diagnostics report describes the file on disk, not the larger
+        // plaintext that produced it.
+        meta.size_bytes = byte_count;
+        Ok(LoadOutcome::Encrypted(snapshot, meta))
+    } else {
+        parse_state_bytes(&bytes)
+            .map(|(snapshot, meta)| LoadOutcome::PlaintextLegacy(snapshot, meta))
+    }
 }
 
 /// Clears session ephemera from a restored snapshot.
@@ -580,5 +708,82 @@ mod tests {
         let temp = TempState::new("metadata-missing");
         let missing = temp.path().with_extension("never-written.json");
         assert_eq!(load_state_with_metadata(&missing).expect("missing file is not an error"), None);
+    }
+
+    fn test_key(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    #[test]
+    fn encrypted_round_trip_preserves_records_and_metadata() {
+        let core = populated_core();
+        let temp = TempState::new("encrypted-round-trip");
+
+        let saved = save_state_encrypted(&core.snapshot(), temp.path(), &test_key(9))
+            .expect("encrypted save succeeds");
+        assert_eq!(saved.schema_version, CURRENT_SCHEMA_VERSION);
+        let on_disk = std::fs::metadata(temp.path()).expect("state file metadata");
+        assert_eq!(saved.size_bytes, on_disk.len());
+
+        match load_state_encrypted(temp.path(), &test_key(9)).expect("load succeeds") {
+            LoadOutcome::Encrypted(snapshot, metadata) => {
+                assert_eq!(snapshot, sanitize_snapshot(core.snapshot()));
+                assert_eq!(snapshot.accounts.len(), 2);
+                assert_eq!(snapshot.messages.len(), 3);
+                assert_eq!(metadata.schema_version, CURRENT_SCHEMA_VERSION);
+                assert_eq!(metadata.size_bytes, saved.size_bytes);
+            }
+            other => panic!("expected Encrypted outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_key_yields_decryption_error() {
+        let core = populated_core();
+        let temp = TempState::new("wrong-key");
+
+        save_state_encrypted(&core.snapshot(), temp.path(), &test_key(1))
+            .expect("encrypted save succeeds");
+        assert!(matches!(
+            load_state_encrypted(temp.path(), &test_key(2)),
+            Err(PersistenceError::Decryption)
+        ));
+    }
+
+    #[test]
+    fn legacy_plaintext_file_loads_as_plaintext_legacy_outcome() {
+        let core = populated_core();
+        let temp = TempState::new("legacy-plaintext");
+
+        save_state(&core.snapshot(), temp.path()).expect("legacy save succeeds");
+        match load_state_encrypted(temp.path(), &test_key(5)).expect("load succeeds") {
+            LoadOutcome::PlaintextLegacy(snapshot, metadata) => {
+                assert_eq!(snapshot, sanitize_snapshot(core.snapshot()));
+                assert_eq!(metadata.schema_version, CURRENT_SCHEMA_VERSION);
+            }
+            other => panic!("expected PlaintextLegacy outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encrypted_load_reports_missing_for_absent_file() {
+        let temp = TempState::new("encrypted-missing");
+        let missing = temp.path().with_extension("never-written.json");
+        assert!(matches!(
+            load_state_encrypted(&missing, &test_key(1)).expect("missing is not an error"),
+            LoadOutcome::Missing
+        ));
+    }
+
+    #[test]
+    fn encrypted_file_is_not_parseable_json_on_disk() {
+        let core = populated_core();
+        let temp = TempState::new("not-json");
+
+        save_state_encrypted(&core.snapshot(), temp.path(), &test_key(6))
+            .expect("encrypted save succeeds");
+        let content = std::fs::read(temp.path()).expect("read saved file");
+        assert!(!content.starts_with(b"{"), "ciphertext must not leak JSON structure");
+        assert!(serde_json::from_slice::<serde_json::Value>(&content).is_err());
     }
 }

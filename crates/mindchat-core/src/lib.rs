@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod persistence;
 pub mod proxy;
+pub mod state_cipher;
 pub mod transport;
 
 #[cfg(feature = "xmpp-transport")]

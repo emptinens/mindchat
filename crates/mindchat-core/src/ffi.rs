@@ -620,6 +620,15 @@ impl From<PersistenceError> for MindChatBindingError {
             PersistenceError::TooLarge(bytes) => {
                 Self::Internal { detail: format!("state file too large: {bytes} bytes") }
             }
+            PersistenceError::NotEncrypted => {
+                Self::Internal { detail: "state file is not an encrypted state file".to_owned() }
+            }
+            PersistenceError::Decryption => Self::Internal {
+                detail: "state file decryption failed (wrong key or corrupt file)".to_owned(),
+            },
+            PersistenceError::Encryption(detail) => {
+                Self::Internal { detail: format!("state encryption failed: {detail}") }
+            }
         }
     }
 }

@@ -822,6 +822,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "log",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
