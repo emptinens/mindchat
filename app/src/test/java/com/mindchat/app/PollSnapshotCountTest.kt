@@ -8,8 +8,10 @@ import com.mindchat.core.FfiConversation
 import com.mindchat.core.FfiConversationKind
 import com.mindchat.core.FfiCoreEvent
 import com.mindchat.core.FfiCoreSnapshot
+import com.mindchat.core.FfiPersistenceOutcome
 import com.mindchat.core.FfiProtocolCapability
 import com.mindchat.core.FfiRosterSubscription
+import com.mindchat.core.LoadSecuredResult
 import com.mindchat.core.MindChatCoreHandle
 import com.mindchat.core.NoHandle
 import java.io.File
@@ -95,6 +97,9 @@ class PollSnapshotCountTest {
 
         override fun loadState(path: String): Boolean = false
 
+        override fun loadStateSecured(path: String, key: ByteArray): LoadSecuredResult =
+            LoadSecuredResult(FfiPersistenceOutcome.MISSING, false)
+
         override fun drainEvents(): List<FfiCoreEvent> = emptyList()
 
         override fun pollTransportEvents(maxEvents: UInt): UInt = eventsPerPoll
@@ -105,6 +110,10 @@ class PollSnapshotCountTest {
         }
 
         override fun saveState(path: String) {
+            saveCalls++
+        }
+
+        override fun saveStateSecured(path: String, key: ByteArray) {
             saveCalls++
         }
 

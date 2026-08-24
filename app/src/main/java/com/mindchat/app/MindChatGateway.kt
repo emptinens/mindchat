@@ -11,6 +11,7 @@ import com.mindchat.core.FfiConversationKind
 import com.mindchat.core.FfiCoreSnapshot
 import com.mindchat.core.FfiDiagnosticsReport
 import com.mindchat.core.FfiDisconnectKind
+import com.mindchat.core.FfiPersistenceOutcome
 import com.mindchat.core.MindChatBindingException
 import com.mindchat.core.MindChatCoreHandle
 import java.io.File
@@ -125,6 +126,15 @@ private data class TransportPollResult(
  * concurrent later mutation therefore remains dirty even if an older writer
  * completes after it.
  */
+/**
+ * Whether a secured load outcome requires an immediate encrypted re-save.
+ * Only a legacy plaintext file does: it loaded under the old unsecured
+ * format, so the transparent migration is to re-save it encrypted right
+ * after the load (0.1.9 storage encryption at rest).
+ */
+internal fun shouldResaveAfterLoad(outcome: FfiPersistenceOutcome): Boolean =
+    outcome == FfiPersistenceOutcome.PLAINTEXT_LEGACY
+
 internal class PersistenceStateTracker {
     private val mutationEpoch = AtomicLong(0)
     private val persistedEpoch = AtomicLong(0)
@@ -271,6 +281,7 @@ object MindChatGatewayFactory {
         preferences = SharedPreferencesMindChatPreferences(context),
         proxyLibraryStore = SharedPreferencesProxyLibraryStore(context),
         credentialStore = KeystoreProxyCredentialStore(context),
+        stateKeyProvider = AndroidStateKeyProvider(context),
     )
 }
 
@@ -282,6 +293,7 @@ class NativeMindChatGateway(
     private val preferences: MindChatPreferences = InMemoryMindChatPreferences(),
     private val proxyLibraryStore: ProxyLibraryStore = InMemoryProxyLibraryStore(),
     private val credentialStore: ProxyCredentialStore = InMemoryProxyCredentialStore(),
+    private val stateKeyProvider: StateEncryptionKeyProvider = InMemoryStateKeyProvider(),
 ) : MindChatGateway {
     private var activeAccountId = 0L
 
@@ -908,7 +920,18 @@ class NativeMindChatGateway(
     }
 
     private fun restoreState() {
-        runCatching { core.loadState(stateFile.absolutePath) }
+        runCatching {
+                core.loadStateSecured(stateFile.absolutePath, stateKeyProvider.stateKey())
+            }
+            .onSuccess { result ->
+                // Transparent migration: a legacy plaintext file is re-saved
+                // encrypted immediately after it loads.
+                if (shouldResaveAfterLoad(result.outcome)) {
+                    runCatching {
+                        core.saveStateSecured(stateFile.absolutePath, stateKeyProvider.stateKey())
+                    }
+                }
+            }
             .onFailure {
                 if (stateFile.exists()) {
                     stateFile.renameTo(File(stateFile.path + ".corrupt-" + System.currentTimeMillis()))
@@ -930,7 +953,9 @@ class NativeMindChatGateway(
      */
     private suspend fun saveSnapshot(snapshot: FfiCoreSnapshot? = null): Boolean = persistenceMutex.withLock {
         val epochAtSave = persistenceTracker.captureSaveEpoch()
-        val saved = runCatching { core.saveState(stateFile.absolutePath) }.isSuccess
+        val saved =
+            runCatching { core.saveStateSecured(stateFile.absolutePath, stateKeyProvider.stateKey()) }
+                .isSuccess
         if (saved) {
             persistenceTracker.markPersisted(epochAtSave)
         }
