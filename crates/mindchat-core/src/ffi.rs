@@ -44,8 +44,8 @@
 //! credentials follow the same hand-off pattern and are never persisted.
 
 use crate::persistence::{
-    CURRENT_SCHEMA_VERSION, PersistenceError, StateFileMetadata, load_state_with_metadata,
-    save_state,
+    CURRENT_SCHEMA_VERSION, LoadOutcome, PersistenceError, StateFileMetadata, load_state_encrypted,
+    load_state_with_metadata, save_state, save_state_encrypted,
 };
 use crate::proxy::{ProxyConfig, ProxyKind, ProxyProbe};
 use crate::{
@@ -524,6 +524,28 @@ pub struct FfiDiagnosticsReport {
     pub state_last_loaded_at_epoch_ms: Option<u64>,
 }
 
+/// What [`MindChatCoreHandle::load_state_secured`] found on disk.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
+pub enum FfiPersistenceOutcome {
+    /// No state file exists at the requested path.
+    Missing,
+    /// A legacy plaintext JSON state file was loaded; re-save secured to
+    /// migrate it.
+    PlaintextLegacy,
+    /// An encrypted state file was opened under the given key.
+    Encrypted,
+}
+
+/// Result of a secured state-file load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Record)]
+pub struct LoadSecuredResult {
+    /// What was found on disk.
+    pub outcome: FfiPersistenceOutcome,
+    /// Whether a snapshot was applied to this handle (`false` only when no
+    /// file existed).
+    pub loaded: bool,
+}
+
 /// Notification emitted after a state change. The Kotlin layer refetches a
 /// snapshot to render the resulting state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, uniffi::Enum)]
@@ -588,8 +610,11 @@ impl From<TransportError> for MindChatBindingError {
     fn from(value: TransportError) -> Self {
         match value {
             TransportError::AuthenticationFailed => Self::AuthenticationFailed,
-            TransportError::TlsVerification(detail) => Self::ConnectionFailed { detail },
-            TransportError::ConnectionFailed(detail) => Self::ConnectionFailed { detail },
+            // TLS verification failures surface as connection failures with
+            // the typed detail; the UI classifies them via DisconnectKind.
+            TransportError::TlsVerification(detail) | TransportError::ConnectionFailed(detail) => {
+                Self::ConnectionFailed { detail }
+            }
             TransportError::ProtocolViolation(detail) => Self::InvalidInput { detail },
             TransportError::Unsupported(detail) => Self::Internal { detail },
         }
@@ -654,6 +679,20 @@ struct PersistenceTrack {
     quarantined: bool,
     last_saved_at_epoch_ms: Option<u64>,
     last_loaded_at_epoch_ms: Option<u64>,
+    /// Encryption status of the last secured operation: `Some(true)` after an
+    /// encrypted save or an encrypted load, `Some(false)` when a legacy
+    /// plaintext file was loaded and still needs migration, `None` for
+    /// legacy unsecured operations.
+    encrypted: Option<bool>,
+}
+
+/// Copies the caller's state-encryption key after length validation so a
+/// malformed key fails before any lock is taken or I/O is attempted.
+fn validated_state_key(key: Vec<u8>) -> Result<[u8; 32], MindChatBindingError> {
+    let bytes: [u8; 32] = key.try_into().map_err(|_| MindChatBindingError::Internal {
+        detail: "state key must be 32 bytes".to_owned(),
+    })?;
+    Ok(bytes)
 }
 
 /// Current wall clock in epoch milliseconds.
@@ -680,6 +719,28 @@ impl MindChatCoreHandle {
             track.size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
             track.schema_version = Some(CURRENT_SCHEMA_VERSION);
             track.last_saved_at_epoch_ms = Some(now_epoch_ms());
+        }
+    }
+
+    /// Records a successful secured save for the diagnostics report.
+    fn record_save_secured(&self, path: &Path) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+            track.schema_version = Some(CURRENT_SCHEMA_VERSION);
+            track.last_saved_at_epoch_ms = Some(now_epoch_ms());
+            track.encrypted = Some(true);
+        }
+    }
+
+    /// Records a secured load outcome (encrypted or pending-migration).
+    fn record_load_secured(&self, path: &Path, metadata: &StateFileMetadata, encrypted: bool) {
+        if let Ok(mut track) = self.persistence.lock() {
+            track.path = Some(path.to_path_buf());
+            track.size_bytes = Some(metadata.size_bytes);
+            track.schema_version = Some(metadata.schema_version);
+            track.last_loaded_at_epoch_ms = Some(now_epoch_ms());
+            track.encrypted = Some(encrypted);
         }
     }
 
@@ -1163,6 +1224,80 @@ impl MindChatCoreHandle {
         }
     }
 
+    /// Writes the current snapshot to `path` atomically as an AES-256-GCM
+    /// encrypted state file (see `state_cipher` for the on-disk layout).
+    ///
+    /// The snapshot is captured under the session lock and written outside
+    /// it, exactly like [`Self::save_state`]; no secrets are written: account
+    /// passwords never enter the core or the snapshot. The 32-byte `key`
+    /// comes from Android's Keystore surface and is used only for this call.
+    pub fn save_state_secured(
+        &self,
+        path: String,
+        key: Vec<u8>,
+    ) -> Result<(), MindChatBindingError> {
+        let key = validated_state_key(key)?;
+        let snapshot = self.lock()?.core().snapshot();
+        save_state_encrypted(&snapshot, Path::new(&path), &key)
+            .map_err(MindChatBindingError::from)?;
+        self.record_save_secured(Path::new(&path));
+        Ok(())
+    }
+
+    /// Restores a saved snapshot from `path`, accepting encrypted files and
+    /// legacy plaintext files.
+    ///
+    /// Runs under the same once-at-startup guards as [`Self::load_state`].
+    /// A legacy plaintext file is loaded and reported as
+    /// [`FfiPersistenceOutcome::PlaintextLegacy`] so the caller can migrate
+    /// it by immediately calling [`Self::save_state_secured`]. A wrong key or
+    /// tampered encrypted file fails like any other load failure and marks
+    /// the file quarantined in the diagnostics report.
+    pub fn load_state_secured(
+        &self,
+        path: String,
+        key: Vec<u8>,
+    ) -> Result<LoadSecuredResult, MindChatBindingError> {
+        let key = validated_state_key(key)?;
+        let mut session = self.lock()?;
+        if !session.core().accounts().is_empty() {
+            return Err(MindChatBindingError::Internal {
+                detail: "core already contains accounts; load_state must run before any mutation"
+                    .to_owned(),
+            });
+        }
+        if !session.transport().connected_accounts().is_empty() {
+            return Err(MindChatBindingError::Internal {
+                detail: "transport already has connected accounts; load_state must run before any connection"
+                    .to_owned(),
+            });
+        }
+        let path = Path::new(&path);
+        match load_state_encrypted(path, &key) {
+            Ok(LoadOutcome::Encrypted(snapshot, metadata)) => {
+                *session.core_mut() = MindChatCore::from_snapshot(snapshot);
+                self.record_load_secured(path, &metadata, true);
+                Ok(LoadSecuredResult { outcome: FfiPersistenceOutcome::Encrypted, loaded: true })
+            }
+            Ok(LoadOutcome::PlaintextLegacy(snapshot, metadata)) => {
+                *session.core_mut() = MindChatCore::from_snapshot(snapshot);
+                self.record_load_secured(path, &metadata, false);
+                Ok(LoadSecuredResult {
+                    outcome: FfiPersistenceOutcome::PlaintextLegacy,
+                    loaded: true,
+                })
+            }
+            Ok(LoadOutcome::Missing) => {
+                self.record_load_missing(path);
+                Ok(LoadSecuredResult { outcome: FfiPersistenceOutcome::Missing, loaded: false })
+            }
+            Err(error) => {
+                self.record_load_failure(path, &error);
+                Err(MindChatBindingError::from(error))
+            }
+        }
+    }
+
     /// Assembles the opt-in diagnostics export (ROADMAP 6.5).
     ///
     /// Snapshot counters come from the current in-memory state; persistence
@@ -1533,6 +1668,80 @@ mod tests {
                 .load_state(missing.to_string_lossy().into_owned())
                 .expect("missing file loads as false")
         );
+    }
+
+    #[test]
+    fn secured_save_rejects_malformed_keys_before_any_work() {
+        let core = MindChatCoreHandle::new();
+        let temp = TempState::new("bad-key");
+        for length in [0usize, 16, 31, 33, 64] {
+            assert_eq!(
+                core.save_state_secured(
+                    temp.path().to_string_lossy().into_owned(),
+                    vec![0u8; length],
+                ),
+                Err(MindChatBindingError::Internal {
+                    detail: "state key must be 32 bytes".to_owned(),
+                }),
+                "key of {length} bytes must be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn secured_save_and_load_round_trip() {
+        let first = MindChatCoreHandle::new();
+        populate_handle(&first);
+        let temp = TempState::new("secured-round-trip");
+        let path = temp.path().to_string_lossy().into_owned();
+
+        first.save_state_secured(path.clone(), vec![7u8; 32]).expect("save succeeds");
+
+        let second = MindChatCoreHandle::new();
+        let result = second.load_state_secured(path.clone(), vec![7u8; 32]).expect("load succeeds");
+        assert_eq!(result.outcome, FfiPersistenceOutcome::Encrypted);
+        assert!(result.loaded);
+        assert_eq!(second.snapshot().expect("snapshot").accounts.len(), 1);
+
+        // A wrong key is an authenticated failure, not a corrupt-file guess.
+        let third = MindChatCoreHandle::new();
+        assert!(third.load_state_secured(path, vec![9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn secured_load_reports_legacy_plaintext_for_migration() {
+        let first = MindChatCoreHandle::new();
+        populate_handle(&first);
+        let temp = TempState::new("legacy-migration");
+        let path = temp.path().to_string_lossy().into_owned();
+
+        // A file written by the legacy unsecured path loads through the
+        // secured loader and is reported as pending migration.
+        first.save_state(path.clone()).expect("save succeeds");
+        let second = MindChatCoreHandle::new();
+        let result = second.load_state_secured(path.clone(), vec![7u8; 32]).expect("load");
+        assert_eq!(result.outcome, FfiPersistenceOutcome::PlaintextLegacy);
+        assert!(result.loaded);
+        assert_eq!(second.snapshot().expect("snapshot").accounts.len(), 1);
+
+        // The migration re-save produces an Encrypted outcome on next load.
+        second.save_state_secured(path.clone(), vec![7u8; 32]).expect("migrate");
+        let third = MindChatCoreHandle::new();
+        let result = third.load_state_secured(path, vec![7u8; 32]).expect("reload");
+        assert_eq!(result.outcome, FfiPersistenceOutcome::Encrypted);
+    }
+
+    #[test]
+    fn secured_load_missing_file_reports_missing() {
+        let core = MindChatCoreHandle::new();
+        let temp = TempState::new("secured-missing");
+        let missing = temp.path().with_extension("never-written.json");
+
+        let result = core
+            .load_state_secured(missing.to_string_lossy().into_owned(), vec![7u8; 32])
+            .expect("missing file loads as not-loaded");
+        assert_eq!(result.outcome, FfiPersistenceOutcome::Missing);
+        assert!(!result.loaded);
     }
 
     #[test]
